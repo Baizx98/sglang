@@ -48,6 +48,7 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_xpu = is_xpu()
+_use_sm80_dsa = get_bool_env_var("KEYE_SM80_DSA") and _is_cuda
 _flashinfer_layernorm_available = False
 
 if _is_cuda or _is_xpu or _is_musa:
@@ -207,6 +208,11 @@ class RMSNorm(MultiPlatformOp):
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        # The CUDA 13 FlashInfer wheels used by this Keye branch do not ship
+        # CuTe RMSNorm images for SM86/SM89.  Keep the compatibility mode on
+        # PyTorch operators instead of failing at the first model forward.
+        if _use_sm80_dsa:
+            return self.forward_native(x, residual, post_residual_addition)
         if x.numel() == 0:
             if residual is not None:
                 if post_residual_addition is not None:
@@ -494,6 +500,8 @@ class LayerNorm(MultiPlatformOp):
         self,
         x: torch.Tensor,
     ) -> torch.Tensor:
+        if _use_sm80_dsa:
+            return self.forward_native(x)
         if (
             _flashinfer_layernorm_available
             and x.dtype == torch.bfloat16
@@ -623,6 +631,8 @@ class GemmaRMSNorm(MultiPlatformOp):
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if _use_sm80_dsa:
+            return self.forward_native(x, residual, post_residual_addition)
         return self._forward_impl(x, residual, post_residual_addition)
 
     def forward_hip(
@@ -807,6 +817,8 @@ class Gemma4RMSNorm(MultiPlatformOp):
         return self.forward_native(x)
 
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
+        if _use_sm80_dsa:
+            return self.forward_native(x)
         if x.numel() == 0:
             return x
         needs_reshape = x.dim() != 2
