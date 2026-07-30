@@ -29,6 +29,7 @@ CUDA Graph pattern:
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, Literal, Optional
 
@@ -50,14 +51,19 @@ try:
 except ImportError:
     _has_flash_attn = False
 
-from effective_kernels.ops import sparse_attention_forward, topk_block_unique
-
 from sglang.srt.layers.attention.nsa.transform_index import (
     transform_index_page_table_decode,
     transform_index_page_table_prefill,
 )
 
 logger = logging.getLogger(__name__)
+_use_sm80_dsa = os.getenv("KEYE_SM80_DSA", "0") == "1"
+
+if _use_sm80_dsa:
+    from sglang.srt.layers.attention.keye_dsa_sm80 import (
+        KeyeDSAWorkspace,
+        keye_dsa_paged_attention,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -323,6 +329,19 @@ class KeyeSparseAttnBackend(AttentionBackend):
             ragged_offsets_size = chunked_prefill_size if chunked_prefill_size is not None else 16384
             self.zero_ragged_offset = torch.zeros((ragged_offsets_size,), device=self.device, dtype=torch.int32)
 
+        self.use_sm80_dsa = _use_sm80_dsa
+        self.sm80_workspace = KeyeDSAWorkspace() if self.use_sm80_dsa else None
+        if self.use_sm80_dsa:
+            capability = torch.cuda.get_device_capability(self.device)
+            if capability[0] != 8:
+                raise RuntimeError(
+                    "KEYE_SM80_DSA is intended for NVIDIA Ampere (SM80/SM86), "
+                    f"but the selected device has capability {capability}"
+                )
+            logger.info(
+                "Keye sparse attention: using exact-token Triton SM80 backend"
+            )
+
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
@@ -442,7 +461,7 @@ class KeyeSparseAttnBackend(AttentionBackend):
         page_table_1 = page_table
 
         paged_mqa_schedule_metadata = None
-        if forward_batch.forward_mode.is_decode_or_idle():
+        if forward_batch.forward_mode.is_decode_or_idle() and not self.use_sm80_dsa:
             try:
                 import deep_gemm
 
@@ -544,14 +563,15 @@ class KeyeSparseAttnBackend(AttentionBackend):
         )
 
         paged_mqa_schedule_metadata = None
-        try:
-            import deep_gemm
+        if not self.use_sm80_dsa:
+            try:
+                import deep_gemm
 
-            paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-                cache_seqlens_buf, 64, deep_gemm.get_num_sms(),
-            )
-        except (ImportError, ModuleNotFoundError):
-            paged_mqa_schedule_metadata = None
+                paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
+                    cache_seqlens_buf, 64, deep_gemm.get_num_sms(),
+                )
+            except (ImportError, ModuleNotFoundError):
+                paged_mqa_schedule_metadata = None
 
         metadata = KeyeSAAttnMetadata(
             page_size=self.page_size,
@@ -627,18 +647,21 @@ class KeyeSparseAttnBackend(AttentionBackend):
             torch.cumsum(sa_cache_seqlens, dim=0, dtype=torch.int32)
         )
 
-        try:
-            import deep_gemm
-
-            new_schedule = deep_gemm.get_paged_mqa_logits_metadata(
-                metadata.cache_seqlens_int32, 64, deep_gemm.get_num_sms()
-            )
-            if metadata.paged_mqa_schedule_metadata is None:
-                metadata.paged_mqa_schedule_metadata = new_schedule
-            else:
-                metadata.paged_mqa_schedule_metadata.copy_(new_schedule)
-        except (ImportError, ModuleNotFoundError):
+        if self.use_sm80_dsa:
             metadata.paged_mqa_schedule_metadata = None
+        else:
+            try:
+                import deep_gemm
+
+                new_schedule = deep_gemm.get_paged_mqa_logits_metadata(
+                    metadata.cache_seqlens_int32, 64, deep_gemm.get_num_sms()
+                )
+                if metadata.paged_mqa_schedule_metadata is None:
+                    metadata.paged_mqa_schedule_metadata = new_schedule
+                else:
+                    metadata.paged_mqa_schedule_metadata.copy_(new_schedule)
+            except (ImportError, ModuleNotFoundError):
+                metadata.paged_mqa_schedule_metadata = None
 
         self.forward_metadata = metadata
 
@@ -663,7 +686,7 @@ class KeyeSparseAttnBackend(AttentionBackend):
         save_kv_cache: bool = True,
         **kwargs,
     ) -> torch.Tensor:
-        """Prefill forward using sparse_attention_forward (effective_kernels)."""
+        """Prefill forward using the selected sparse-attention implementation."""
         topk_indices = kwargs["topk_indices"]
         if k is not None and v is not None and save_kv_cache:
             cache_loc = (
@@ -678,7 +701,32 @@ class KeyeSparseAttnBackend(AttentionBackend):
         metadata = self.forward_metadata
         q = q.view(-1, self.num_q_heads, self.head_dim)
 
+        if self.use_sm80_dsa:
+            token_slots = topk_indices
+            if not self.deterministic_topk:
+                token_slots = transform_index_page_table_prefill(
+                    page_table=metadata.page_table_1,
+                    topk_indices=topk_indices,
+                    extend_lens_cpu=metadata.sa_extend_seq_lens_list,
+                    page_size=1,
+                )
+            k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+            v_cache = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
+            return keye_dsa_paged_attention(
+                q,
+                k_cache,
+                v_cache,
+                token_slots,
+                num_q_heads=self.num_q_heads,
+                head_dim=self.head_dim,
+                sm_scale=layer.scaling,
+                is_decode=False,
+                workspace=self.sm80_workspace,
+            )
+
         assert metadata.sa_extend_seq_lens_list is not None
+        from effective_kernels.ops import sparse_attention_forward, topk_block_unique
+
         unique_indices, q_mask, block_counts = topk_block_unique(
             topk_indices,
             metadata.cu_seqlens_q,
@@ -710,8 +758,9 @@ class KeyeSparseAttnBackend(AttentionBackend):
         save_kv_cache: bool = True,
         **kwargs,
     ) -> torch.Tensor:
-        """Decode forward using flash_attn_with_kvcache with sparse page table."""
-        assert _has_flash_attn, "flash_attn is required for decode"
+        """Decode forward using the selected sparse-attention implementation."""
+        if not self.use_sm80_dsa:
+            assert _has_flash_attn, "flash_attn is required for decode"
         topk_indices = kwargs["topk_indices"]
 
         if k is not None and v is not None and save_kv_cache:
@@ -739,6 +788,20 @@ class KeyeSparseAttnBackend(AttentionBackend):
                 topk_indices=topk_indices,
                 page_size=1,
             )
+
+        if self.use_sm80_dsa:
+            return keye_dsa_paged_attention(
+                q,
+                k_cache,
+                v_cache,
+                token_slots,
+                num_q_heads=self.num_q_heads,
+                head_dim=self.head_dim,
+                sm_scale=layer.scaling,
+                is_decode=True,
+                workspace=self.sm80_workspace,
+            )
+
         k_cache_view = k_cache.view(-1, 1, self.num_kv_heads, self.head_dim)
         v_cache_view = v_cache.view(-1, 1, self.num_kv_heads, self.head_dim)
 

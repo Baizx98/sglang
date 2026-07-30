@@ -17,18 +17,23 @@ from typing import Iterable, Optional, Tuple
 import torch
 from transformers import PretrainedConfig
 
+from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
-from sglang.srt.models.keye_topk_mask import KeyeTopKMaskAttention
 from sglang.srt.models.keye_qwen3 import KeyeVL1_5ForConditionalGeneration
+from sglang.srt.models.keye_topk_mask import KeyeTopKMaskAttention
 from sglang.srt.models.qwen3_moe import Qwen3MoeDecoderLayer, Qwen3MoeModel
 from sglang.srt.models.qwen3_vl_moe import load_fused_expert_weights
-from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
-from sglang.srt.utils import add_prefix, is_cuda, is_hopper_with_cuda_12_3, print_info_once
+from sglang.srt.utils import (
+    add_prefix,
+    is_ampere_with_cuda_12_3,
+    is_cuda,
+    is_hopper_with_cuda_12_3,
+)
 
 _is_cuda = is_cuda()
 
@@ -53,7 +58,9 @@ class KeyeTopKMaskMoeDecoderLayer(Qwen3MoeDecoderLayer):
         )
 
         sa_config = getattr(config, "sa_config", None)
-        if is_hopper_with_cuda_12_3() and sa_config is not None:
+        if (
+            is_ampere_with_cuda_12_3() or is_hopper_with_cuda_12_3()
+        ) and sa_config is not None:
             head_dim = getattr(config, "head_dim", None)
             self.self_attn = KeyeTopKMaskAttention(
                 hidden_size=config.hidden_size,
@@ -63,7 +70,9 @@ class KeyeTopKMaskMoeDecoderLayer(Qwen3MoeDecoderLayer):
                 rope_theta=getattr(config, "rope_theta", 1000000),
                 rope_scaling=getattr(config, "rope_scaling", None),
                 head_dim=head_dim,
-                max_position_embeddings=getattr(config, "max_position_embeddings", 32768),
+                max_position_embeddings=getattr(
+                    config, "max_position_embeddings", 32768
+                ),
                 quant_config=quant_config,
                 rms_norm_eps=config.rms_norm_eps,
                 attention_bias=config.attention_bias,
@@ -262,21 +271,42 @@ class KeyeVL2MoeForConditionalGeneration(KeyeVL1_5ForConditionalGeneration):
                         if "experts.gate_up_proj" in name:
                             loaded_weight = loaded_weight.chunk(2, dim=-2)
                             load_fused_expert_weights(
-                                name_mapped, params_dict, loaded_weight[0], "w1", num_experts
+                                name_mapped,
+                                params_dict,
+                                loaded_weight[0],
+                                "w1",
+                                num_experts,
                             )
                             load_fused_expert_weights(
-                                name_mapped, params_dict, loaded_weight[1], "w3", num_experts
+                                name_mapped,
+                                params_dict,
+                                loaded_weight[1],
+                                "w3",
+                                num_experts,
                             )
                         else:
                             load_fused_expert_weights(
-                                name_mapped, params_dict, loaded_weight, shard_id, num_experts
+                                name_mapped,
+                                params_dict,
+                                loaded_weight,
+                                shard_id,
+                                num_experts,
                             )
                     else:
-                        if name_mapped.endswith(ignore_suffixes) and name_mapped not in params_dict:
+                        if (
+                            name_mapped.endswith(ignore_suffixes)
+                            and name_mapped not in params_dict
+                        ):
                             continue
                         param = params_dict[name_mapped]
                         weight_loader = param.weight_loader
-                        weight_loader(param, loaded_weight, name_mapped, shard_id=shard_id, expert_id=expert_id)
+                        weight_loader(
+                            param,
+                            loaded_weight,
+                            name_mapped,
+                            shard_id=shard_id,
+                            expert_id=expert_id,
+                        )
                     name = name_mapped
                     break
                 else:
@@ -286,7 +316,9 @@ class KeyeVL2MoeForConditionalGeneration(KeyeVL1_5ForConditionalGeneration):
                         continue
                     if name in params_dict:
                         param = params_dict[name]
-                        weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                        weight_loader = getattr(
+                            param, "weight_loader", default_weight_loader
+                        )
                         weight_loader(param, loaded_weight)
                     else:
                         logger.warning(f"Parameter {name} not found in params_dict")

@@ -10,7 +10,12 @@ Current implementation:
 
 from __future__ import annotations
 
+import itertools
+import json
 import logging
+import os
+import time
+from pathlib import Path
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
@@ -37,6 +42,8 @@ _is_cuda = is_cuda()
 _is_hip = is_hip()
 
 logger = logging.getLogger(__name__)
+_use_sm80_dsa = os.getenv("KEYE_SM80_DSA", "0") == "1"
+_trace_counter = itertools.count()
 
 DUAL_STREAM_TOKEN_THRESHOLD = 1024
 
@@ -44,6 +51,31 @@ DUAL_STREAM_TOKEN_THRESHOLD = 1024
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _should_trace_layer(layer_id: int) -> bool:
+    """Return whether the configured top-k trace includes ``layer_id``."""
+    layer_spec = os.getenv("KEYE_SM80_TRACE_LAYERS", "all").strip()
+    if layer_spec.lower() == "all":
+        return True
+    if not layer_spec:
+        raise ValueError(
+            "KEYE_SM80_TRACE_LAYERS must be 'all' or a comma-separated layer list"
+        )
+
+    try:
+        traced_layers = {
+            int(value.strip()) for value in layer_spec.split(",") if value.strip()
+        }
+    except ValueError as exc:
+        raise ValueError(
+            "KEYE_SM80_TRACE_LAYERS must be 'all' or a comma-separated layer list"
+        ) from exc
+    if not traced_layers or any(layer < 0 for layer in traced_layers):
+        raise ValueError(
+            "KEYE_SM80_TRACE_LAYERS must contain non-negative layer IDs"
+        )
+    return layer_id in traced_layers
 
 
 def _rotate_activation(x: torch.Tensor) -> torch.Tensor:
@@ -156,13 +188,15 @@ class KeyeIndexer(MultiPlatformOp):
         self.q_norm = RMSNorm(self.head_dim, eps=1e-6)
         self.k_norm = LayerNorm(self.head_dim, eps=1e-6, dtype=torch.float32)
 
-        if not _is_cuda or isinstance(deep_gemm, Exception):
+        if not _is_cuda:
+            raise RuntimeError("KeyeIndexer requires CUDA")
+        if not _use_sm80_dsa and isinstance(deep_gemm, Exception):
             raise RuntimeError(
                 "KeyeIndexer requires CUDA and deep_gemm. "
                 "Make sure deep_gemm is installed."
             )
 
-        self.sm_count = deep_gemm.get_num_sms()
+        self.sm_count = 0 if _use_sm80_dsa else deep_gemm.get_num_sms()
         self.half_device_sm_count = ceil_align(self.sm_count // 2, 8)
 
         assert self.head_dim in (32, 64, 128), (
@@ -170,7 +204,12 @@ class KeyeIndexer(MultiPlatformOp):
         )
         self.block_size = min(self.head_dim, self.block_size)
 
-        if not KeyeIndexer._fp8_logged:
+        if _use_sm80_dsa:
+            logger.info(
+                "KeyeIndexer: using exact BF16 Ampere path "
+                f"(head_dim={self.head_dim}, num_heads={self.num_heads}, topk={self.topk})"
+            )
+        elif not KeyeIndexer._fp8_logged:
             KeyeIndexer._fp8_logged = True
             logger.info(
                 "KeyeIndexer: using FP8 path "
@@ -321,6 +360,15 @@ class KeyeIndexer(MultiPlatformOp):
         if metadata is None:
             return None
 
+        if _use_sm80_dsa:
+            result = self._forward_sm80(
+                x, positions, forward_batch, layer_id, metadata
+            )
+            self._dump_topk_sm80(
+                result, positions, forward_batch, layer_id
+            )
+            return result
+
         total_tokens = x.shape[0]
         pool = forward_batch.token_to_kv_pool
         from sglang.srt.layers.attention.nsa.triton_kernel import act_quant
@@ -420,6 +468,275 @@ class KeyeIndexer(MultiPlatformOp):
         if forward_batch.forward_mode.is_extend_without_speculative():
             return self._get_topk_ragged(forward_batch, layer_id, q_fp8, weights, metadata)
         return self._get_topk_paged(forward_batch, layer_id, q_fp8, weights, metadata)
+
+    def _all_causal_indices_sm80(
+        self, forward_batch: ForwardBatch, total_tokens: int, max_kv_len: int
+    ) -> torch.Tensor:
+        """Return every valid logical token when the sequence fits in top-k."""
+        result = torch.full(
+            (total_tokens, self.topk),
+            -1,
+            dtype=torch.int32,
+            device=forward_batch.out_cache_loc.device,
+        )
+        cols = torch.arange(max_kv_len, dtype=torch.int32, device=result.device)
+        q_offset = 0
+        for i in range(forward_batch.batch_size):
+            seq_len = int(forward_batch.seq_lens_cpu[i].item())
+            extend_len = int(forward_batch.extend_seq_lens_cpu[i])
+            history = seq_len - extend_len
+            if extend_len:
+                valid_counts = torch.arange(
+                    history + 1,
+                    history + extend_len + 1,
+                    dtype=torch.int32,
+                    device=result.device,
+                )
+                rows = cols.unsqueeze(0).expand(extend_len, -1)
+                result[q_offset : q_offset + extend_len, :max_kv_len] = torch.where(
+                    rows < valid_counts.unsqueeze(1), rows, -1
+                )
+            q_offset += extend_len
+        return result
+
+    def _dump_topk_sm80(
+        self,
+        indices: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+    ) -> None:
+        """Persist optional snapshots and per-token trace shards on TP rank 0."""
+        if torch.cuda.current_device() != 0:
+            return
+
+        path = os.getenv("KEYE_SM80_DUMP_TOPK")
+        if path and layer_id == 0:
+            row = indices[-1].detach().cpu()
+            torch.save(
+                {
+                    "indices": row,
+                    "valid_count": int((row >= 0).sum().item()),
+                    "query_row": indices.shape[0] - 1,
+                    "forward_mode": str(forward_batch.forward_mode),
+                    "seq_lens": (
+                        forward_batch.seq_lens.detach().cpu()
+                        if forward_batch.seq_lens is not None
+                        else None
+                    ),
+                },
+                path,
+            )
+
+        trace_dir_value = os.getenv("KEYE_SM80_TRACE_DIR")
+        if not trace_dir_value:
+            return
+        if not _should_trace_layer(layer_id):
+            return
+
+        trace_dir = Path(trace_dir_value)
+        trace_dir.mkdir(parents=True, exist_ok=True)
+        event_id = next(_trace_counter)
+        timestamp_ns = time.time_ns()
+        file_name = (
+            f"event_{event_id:09d}_{timestamp_ns}_layer_{layer_id:02d}.pt"
+        )
+        final_path = trace_dir / file_name
+        temp_path = trace_dir / f".{file_name}.tmp"
+
+        def optional_cpu(name: str):
+            value = getattr(forward_batch, name, None)
+            return value.detach().cpu() if isinstance(value, torch.Tensor) else value
+
+        indices_cpu = indices.detach().to(device="cpu", dtype=torch.int32)
+        positions_cpu = positions.detach().to(device="cpu")
+        valid_counts = (indices_cpu >= 0).sum(dim=-1).to(torch.int32)
+        input_ids_cpu = optional_cpu("input_ids")
+        req_pool_indices_cpu = optional_cpu("req_pool_indices")
+        request_ids = list(getattr(forward_batch, "rids", None) or [])
+
+        # SGLang packs prefill tokens request-by-request, while decode has one
+        # row per request.  Persist an explicit row mapping so concurrent
+        # benchmark requests can be reconstructed without relying on ephemeral
+        # request-pool slots.
+        token_req_pool_indices = None
+        token_request_ids = None
+        extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
+        if isinstance(extend_lens, torch.Tensor):
+            extend_lens = extend_lens.tolist()
+        if (
+            extend_lens is not None
+            and sum(int(length) for length in extend_lens) == indices_cpu.shape[0]
+        ):
+            repeats = torch.tensor(extend_lens, dtype=torch.long)
+            if isinstance(req_pool_indices_cpu, torch.Tensor):
+                token_req_pool_indices = torch.repeat_interleave(
+                    req_pool_indices_cpu[: len(extend_lens)], repeats
+                )
+            if len(request_ids) >= len(extend_lens):
+                token_request_ids = [
+                    request_ids[request_index]
+                    for request_index, length in enumerate(extend_lens)
+                    for _ in range(int(length))
+                ]
+        elif (
+            isinstance(req_pool_indices_cpu, torch.Tensor)
+            and req_pool_indices_cpu.numel() == indices_cpu.shape[0]
+        ):
+            token_req_pool_indices = req_pool_indices_cpu.reshape(-1).clone()
+            if len(request_ids) == indices_cpu.shape[0]:
+                token_request_ids = request_ids.copy()
+
+        record = {
+            "schema_version": 2,
+            "event_id": event_id,
+            "timestamp_ns": timestamp_ns,
+            "layer_id": layer_id,
+            "forward_mode": int(forward_batch.forward_mode),
+            "indices": indices_cpu,
+            "valid_counts": valid_counts,
+            "input_ids": input_ids_cpu,
+            "positions": positions_cpu,
+            "seq_lens": optional_cpu("seq_lens"),
+            "extend_seq_lens": optional_cpu("extend_seq_lens"),
+            "extend_seq_lens_cpu": getattr(
+                forward_batch, "extend_seq_lens_cpu", None
+            ),
+            "request_ids": request_ids,
+            "req_pool_indices": req_pool_indices_cpu,
+            "token_request_ids": token_request_ids,
+            "token_req_pool_indices": token_req_pool_indices,
+            "out_cache_loc": optional_cpu("out_cache_loc"),
+        }
+        torch.save(record, temp_path)
+        os.replace(temp_path, final_path)
+
+        manifest_record = {
+            "event_id": event_id,
+            "timestamp_ns": timestamp_ns,
+            "file": file_name,
+            "layer_id": layer_id,
+            "forward_mode": int(forward_batch.forward_mode),
+            "num_tokens": indices_cpu.shape[0],
+            "topk_width": indices_cpu.shape[1],
+            "valid_min": int(valid_counts.min().item()),
+            "valid_max": int(valid_counts.max().item()),
+            "request_ids": request_ids,
+        }
+        with (trace_dir / "manifest.jsonl").open("a", encoding="utf-8") as file:
+            file.write(json.dumps(manifest_record, separators=(",", ":")) + "\n")
+
+    def _score_sm80(
+        self, query: torch.Tensor, keys: torch.Tensor, weights: torch.Tensor
+    ) -> torch.Tensor:
+        """Evaluate the original Keye BF16 indexer score equation."""
+        keys_t = keys.transpose(0, 1).unsqueeze(0).expand(query.shape[0], -1, -1)
+        per_head = torch.bmm(query, keys_t)
+        per_head = torch.relu(per_head.float() * self.softmax_scale)
+        return (per_head * weights.float().unsqueeze(-1)).sum(dim=1)
+
+    def _topk_sm80(
+        self, scores: torch.Tensor, lengths: torch.Tensor
+    ) -> torch.Tensor:
+        """Select top-k with the optimized DSA kernel when its contract applies."""
+        if self.topk == 2048 and scores.shape[1] >= self.topk:
+            from sgl_kernel import fast_topk_v2
+
+            if lengths.dtype != torch.int32:
+                lengths = lengths.to(torch.int32)
+            return fast_topk_v2(scores, lengths, self.topk)
+
+        actual_topk = min(self.topk, scores.shape[1])
+        cols = torch.arange(scores.shape[1], device=scores.device).unsqueeze(0)
+        scores.masked_fill_(cols >= lengths.unsqueeze(1), -float("inf"))
+        values, indices = torch.topk(scores, actual_topk, dim=-1)
+        indices = indices.to(torch.int32).masked_fill(~values.isfinite(), -1)
+        if actual_topk == self.topk:
+            return indices
+        result = torch.full(
+            (scores.shape[0], self.topk),
+            -1,
+            dtype=torch.int32,
+            device=scores.device,
+        )
+        result[:, :actual_topk] = indices
+        return result
+
+    def _forward_sm80(
+        self,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        metadata: BaseIndexerMetadata,
+    ) -> torch.Tensor:
+        """Exact BF16 index selection for GPUs without FP8/DeepGEMM."""
+        pool = forward_batch.token_to_kv_pool
+        loc = forward_batch.out_cache_loc
+        if loc.dtype != torch.long:
+            loc = loc.to(dtype=torch.long)
+        is_extend = forward_batch.forward_mode.is_extend_without_speculative()
+
+        if is_extend and len(forward_batch.seq_lens_cpu) > 0:
+            max_kv_len = int(forward_batch.seq_lens_cpu.max().item())
+            if max_kv_len <= self.topk:
+                key = self._get_k_bf16(x, positions)
+                pool.set_index_k_bf16_buffer(layer_id, loc, key)
+                return self._all_causal_indices_sm80(
+                    forward_batch, x.shape[0], max_kv_len
+                )
+
+        query, key, weights = self._get_q_k_w_bf16(
+            x, positions, enable_dual_stream=False
+        )
+        pool.set_index_k_bf16_buffer(layer_id, loc, key)
+        key_cache = pool.get_index_k_bf16_buffer(layer_id)
+        page_table = metadata.get_page_table_1()
+
+        if not is_extend:
+            from sglang.srt.layers.attention.keye_topk.ampere_indexer import (
+                keye_indexer_score_paged,
+            )
+
+            seqlens = metadata.get_seqlens_int32()
+            scores = keye_indexer_score_paged(
+                query,
+                key_cache,
+                page_table,
+                weights,
+                seqlens,
+                self.softmax_scale,
+            )
+            return self._topk_sm80(scores, seqlens)
+
+        result = torch.full(
+            (x.shape[0], self.topk), -1, dtype=torch.int32, device=x.device
+        )
+        q_offset = 0
+        chunk_size = 64
+        for i in range(forward_batch.batch_size):
+            seq_len = int(forward_batch.seq_lens_cpu[i].item())
+            extend_len = int(forward_batch.extend_seq_lens_cpu[i])
+            history = seq_len - extend_len
+            slots = page_table[i, :seq_len].to(dtype=torch.long)
+            keys = key_cache[slots]
+            for start in range(0, extend_len, chunk_size):
+                end = min(start + chunk_size, extend_len)
+                scores = self._score_sm80(
+                    query[q_offset + start : q_offset + end],
+                    keys,
+                    weights[q_offset + start : q_offset + end],
+                )
+                valid = history + torch.arange(
+                    start + 1,
+                    end + 1,
+                    device=x.device,
+                    dtype=torch.int32,
+                )
+                indices = self._topk_sm80(scores, valid)
+                result[q_offset + start : q_offset + end] = indices
+            q_offset += extend_len
+        return result
 
     def _get_topk_ragged(
         self,

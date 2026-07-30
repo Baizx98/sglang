@@ -45,6 +45,7 @@ from sglang.srt.utils.common import (
     get_quantization_config,
     has_fp8_weights_in_checkpoint,
     human_readable_int,
+    is_ampere_with_cuda_12_3,
     is_blackwell_supported,
     is_cpu,
     is_cuda,
@@ -2311,9 +2312,9 @@ class ServerArgs:
             "KeyeVL2MoeForConditionalGeneration",
         ]:
             # Keye Top-K Mask model (dense or MoE) with sparse attention.
-            # Only apply keye_sa attention backend on Hopper GPU.
-            if is_hopper_with_cuda_12_3():
-                # Both prefill and decode use keye_sa on Hopper.
+            # Keye has native sparse paths on Ampere and Hopper.
+            if is_ampere_with_cuda_12_3() or is_hopper_with_cuda_12_3():
+                # Both prefill and decode use keye_sa on supported NVIDIA GPUs.
                 if self.prefill_attention_backend is None:
                     self.prefill_attention_backend = "keye_sa"
                     logger.info(
@@ -2327,13 +2328,13 @@ class ServerArgs:
                 # Sync attention_backend for compatibility checks downstream
                 if self.attention_backend is None:
                     self.attention_backend = self.decode_attention_backend
-                # Force page_size=64 for Keye models on Hopper.
+                # The Keye FP8 index cache uses fixed 64-token pages.
                 self.page_size = 64
-                logger.info("Setting page_size=64 for Keye model on Hopper GPU.")
+                logger.info("Setting page_size=64 for Keye sparse attention.")
             else:
-                # On non-Hopper GPU, use default attention backend.
                 logger.info(
-                    f"Using default attention backend for {model_arch} on non-Hopper GPU."
+                    f"Using default attention backend for {model_arch}: "
+                    "Keye sparse attention requires Ampere or Hopper."
                 )
 
         if (
@@ -3224,7 +3225,10 @@ class ServerArgs:
         4) Re-run step (1) if step (3) changed I/O backend.
         """
         # Keye models must use direct io backend for indexer buffer compatibility.
-        if self.enable_hierarchical_cache and self.decode_attention_backend == "keye_sa":
+        if (
+            self.enable_hierarchical_cache
+            and self.decode_attention_backend == "keye_sa"
+        ):
             if self.hicache_io_backend != "direct":
                 self.hicache_io_backend = "direct"
                 logger.warning(

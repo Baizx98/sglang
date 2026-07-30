@@ -26,7 +26,13 @@ from transformers import PretrainedConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization import QUANTIZATION_METHODS
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import is_hip, is_hopper_with_cuda_12_3, is_sm100_supported, retry
+from sglang.srt.utils import (
+    is_ampere_with_cuda_12_3,
+    is_hip,
+    is_hopper_with_cuda_12_3,
+    is_sm100_supported,
+    retry,
+)
 from sglang.srt.utils.hf_transformers_utils import (
     get_config,
     get_context_length,
@@ -125,14 +131,15 @@ def get_nsa_index_n_heads(config: PretrainedConfig) -> int:
 
 def is_keye_topk_mask(config: PretrainedConfig) -> bool:
     """Check if the model is a Keye model with Top-K Mask sparse attention.
-    
-    Only returns True when running on Hopper GPU architecture.
+
+    Sparse Keye kernels are available on Ampere and Hopper GPUs.
     """
-    if not is_hopper_with_cuda_12_3():
+    if not (is_ampere_with_cuda_12_3() or is_hopper_with_cuda_12_3()):
         return False
     return (
         config.architectures is not None
-        and config.architectures[0] in [
+        and config.architectures[0]
+        in [
             "KeyeVL2ForConditionalGeneration",
             "KeyeVL2MoeForConditionalGeneration",
         ]

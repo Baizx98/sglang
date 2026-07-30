@@ -51,10 +51,11 @@ if TYPE_CHECKING:
 # SetKAndS — write FP8 K + float32 scale into paged buffer (K-first+scale-last)
 # ---------------------------------------------------------------------------
 
+
 def set_k_and_s(
-    buf: torch.Tensor,            # [num_pages, page_size*(head_dim+4)], uint8
-    loc: torch.Tensor,            # [N], int64 — write address (page=loc//page_size, off=loc%page_size)
-    index_k: torch.Tensor,        # [N, head_dim], float8_e4m3fn
+    buf: torch.Tensor,  # [num_pages, page_size*(head_dim+4)], uint8
+    loc: torch.Tensor,  # [N], int64 — write address (page=loc//page_size, off=loc%page_size)
+    index_k: torch.Tensor,  # [N, head_dim], float8_e4m3fn
     index_k_scale: torch.Tensor,  # [N] or [N,1], float32
     page_size: int,
 ) -> None:
@@ -85,17 +86,19 @@ def set_k_and_s(
             f"index_k_scale must be 1D or 2D, got shape {index_k_scale.shape}"
         )
 
-    assert index_head_dim in (32, 64, 128), (
-        f"keye_index_buf_accessor: index_head_dim={index_head_dim} must be 32, 64, or 128"
-    )
+    assert index_head_dim in (
+        32,
+        64,
+        128,
+    ), f"keye_index_buf_accessor: index_head_dim={index_head_dim} must be 32, 64, or 128"
     assert page_size == 64, f"page_size={page_size} must be 64"
     assert buf_numel_per_page == page_size * (index_head_dim + 4), (
         f"buf_numel_per_page={buf_numel_per_page} != page_size*({index_head_dim}+4)="
         f"{page_size*(index_head_dim+4)}"
     )
-    assert num_tokens == num_tokens_ == num_tokens__, (
-        f"Shape mismatch: loc={num_tokens}, k={num_tokens_}, scale={num_tokens__}"
-    )
+    assert (
+        num_tokens == num_tokens_ == num_tokens__
+    ), f"Shape mismatch: loc={num_tokens}, k={num_tokens_}, scale={num_tokens__}"
     assert scale_dim == 1
 
     assert buf.dtype == torch.uint8
@@ -108,14 +111,17 @@ def set_k_and_s(
     assert index_k.is_contiguous()
     assert index_k_scale.is_contiguous()
 
-    buf_fp8 = buf.view(torch.float8_e4m3fn)
+    # Copy the encoded FP8 bytes rather than asking Triton to load/store an FP8
+    # type.  SM80 cannot lower Triton's fp8e4nv operations, but the byte format
+    # in the cache is identical on Ampere and Hopper.
+    index_k_u8 = index_k.view(torch.uint8)
     buf_fp32 = buf.view(torch.float32)
 
     _set_k_and_s_kernel[(num_tokens,)](
-        buf_fp8,
+        buf,
         buf_fp32,
         loc,
-        index_k,
+        index_k_u8,
         index_k_scale,
         index_k.stride(0),
         PAGE_SIZE=page_size,
@@ -127,10 +133,10 @@ def set_k_and_s(
 
 @triton.jit
 def _set_k_and_s_kernel(
-    buf_fp8_ptr,
+    buf_u8_ptr,
     buf_fp32_ptr,
     loc_ptr,
-    index_k_ptr,
+    index_k_u8_ptr,
     index_k_scale_ptr,
     index_k_ptr_stride_0,
     PAGE_SIZE: tl.constexpr,
@@ -156,7 +162,7 @@ def _set_k_and_s_kernel(
     loc = tl.load(loc_ptr + token_id)
 
     in_k_offsets = token_id * index_k_ptr_stride_0 + tl.arange(0, NUM_K_ELEMS_PER_TOKEN)
-    k = tl.load(index_k_ptr + in_k_offsets)
+    k = tl.load(index_k_u8_ptr + in_k_offsets)
     k_scale = tl.load(index_k_scale_ptr + token_id)
 
     loc_page_index = loc // PAGE_SIZE
@@ -175,7 +181,7 @@ def _set_k_and_s_kernel(
         + loc_token_offset_in_page
     )
 
-    tl.store(buf_fp8_ptr + out_k_offsets, k)
+    tl.store(buf_u8_ptr + out_k_offsets, k)
     tl.store(buf_fp32_ptr + out_s_offset, k_scale)
 
 
@@ -183,8 +189,9 @@ def _set_k_and_s_kernel(
 # GetKAndS — read FP8 K + float32 scale from paged buffer (K-first+scale-last)
 # ---------------------------------------------------------------------------
 
+
 def get_k_and_s(
-    buf: torch.Tensor,           # [num_pages, page_size*(head_dim+4)], uint8
+    buf: torch.Tensor,  # [num_pages, page_size*(head_dim+4)], uint8
     page_indices: torch.Tensor,  # [num_pages], int32/int64
     seq_len: int,
     page_size: int,
@@ -209,7 +216,7 @@ def get_k_and_s(
         s_out,
         seq_len,
         page_size,
-        buf.shape[1],          # buf_numel_per_page
+        buf.shape[1],  # buf_numel_per_page
         index_head_dim,
         s_offset_in_page,
         BLOCK_SIZE_K=index_head_dim,
@@ -252,7 +259,9 @@ def _get_k_and_s_kernel(
     tl.store(k_out_ptr + token_id * index_head_dim + k_offsets, k_data, mask=k_mask)
 
     # ----- S (scale) data -----
-    s_src_base = page_index * buf_numel_per_page + s_offset_in_page + token_offset_in_page * 4
+    s_src_base = (
+        page_index * buf_numel_per_page + s_offset_in_page + token_offset_in_page * 4
+    )
     s_offsets = tl.arange(0, 4)
     s_data = tl.load(buf_ptr + s_src_base + s_offsets)
     tl.store(s_out_ptr + token_id * 4 + s_offsets, s_data)
@@ -261,6 +270,7 @@ def _get_k_and_s_kernel(
 # ---------------------------------------------------------------------------
 # Pool-level wrapper classes (same interface as NSA index_buf_accessor)
 # ---------------------------------------------------------------------------
+
 
 class SetKAndS:
     @classmethod

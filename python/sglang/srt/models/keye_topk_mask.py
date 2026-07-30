@@ -2,15 +2,14 @@
 KeyeTopKMask 模型实现 - sglang 版本
 基于 Qwen3 架构,使用 Top-K Mask 稀疏注意力机制优化推理性能
 """
-import os
+
 import logging
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
 import torch.nn as nn
 from transformers import PretrainedConfig
 
-from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.attention.keye_topk.keye_indexer import KeyeIndexer
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import QKVParallelLinear, RowParallelLinear
@@ -24,27 +23,34 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.models.keye_qwen3 import KeyeVL1_5ForConditionalGeneration
-from sglang.srt.models.qwen2 import Qwen2MLP as Qwen3MLP, Qwen2Model
+from sglang.srt.models.qwen2 import Qwen2Model
 from sglang.srt.models.qwen3 import Qwen3DecoderLayer
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix, is_cuda, is_hopper_with_cuda_12_3, print_info_once
+from sglang.srt.utils import (
+    add_prefix,
+    is_ampere_with_cuda_12_3,
+    is_cuda,
+    is_hopper_with_cuda_12_3,
+    print_info_once,
+)
 
 _is_cuda = is_cuda()
 
 logger = logging.getLogger(__name__)
 
+
 class KeyeTopKMaskAttention(nn.Module):
     """
     Top-K Mask Sparse Attention for Keye model (sglang version).
-    
+
     使用 Stage 1 训练的 Indexer 的 top-k 结果来构建注意力掩码，
     然后应用带掩码的 eager attention 进行稀疏推理。
-    
+
     核心思想:
       1. 正常计算 Q*K^T 注意力分数
       2. 使用 Indexer 的 top-k 索引来掩码非选中的 KV 位置 (-inf)
       3. 应用 softmax 并与 V 相乘
-    
+
     Args:
         hidden_size: 隐藏层大小
         num_heads: 注意力头数量
@@ -82,16 +88,20 @@ class KeyeTopKMaskAttention(nn.Module):
         super().__init__()
         self.layer_id = layer_id
         self.hidden_size = hidden_size
-        
+
         # 处理 TP - 使用 attention-specific TP functions
-        from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
+        from sglang.srt.layers.dp_attention import (
+            get_attention_tp_rank,
+            get_attention_tp_size,
+        )
+
         attn_tp_rank = get_attention_tp_rank()
         attn_tp_size = get_attention_tp_size()
-        
+
         self.total_num_heads = num_heads
         assert self.total_num_heads % attn_tp_size == 0
         self.num_heads = self.total_num_heads // attn_tp_size
-        
+
         self.total_num_kv_heads = num_kv_heads
         if self.total_num_kv_heads >= attn_tp_size:
             # Number of KV heads is greater than TP size, so we partition
@@ -102,20 +112,20 @@ class KeyeTopKMaskAttention(nn.Module):
             # the KV heads across multiple tensor parallel GPUs.
             assert attn_tp_size % self.total_num_kv_heads == 0
         self.num_kv_heads = max(1, self.total_num_kv_heads // attn_tp_size)
-        
+
         if head_dim is not None:
             self.head_dim = head_dim
         else:
             self.head_dim = hidden_size // self.total_num_heads
-        
+
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
-        self.scaling = self.head_dim ** -0.5
+        self.scaling = self.head_dim**-0.5
         self.num_key_value_groups = self.total_num_heads // self.total_num_kv_heads
         self.is_causal = True
         self.attention_dropout = 0.0  # Inference mode
         self.rope_scaling = rope_scaling
-        
+
         # Q, K, V, O 投影层
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
@@ -138,7 +148,7 @@ class KeyeTopKMaskAttention(nn.Module):
             reduce_results=False,
             prefix=add_prefix("o_proj", prefix),
         )
-        
+
         # Q/K Normalization
         norm_kwargs = (
             dict(
@@ -150,7 +160,7 @@ class KeyeTopKMaskAttention(nn.Module):
         )
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps, **norm_kwargs)
         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps, **norm_kwargs)
-        
+
         # RoPE
         self.rotary_emb = get_rope(
             self.head_dim,
@@ -159,7 +169,7 @@ class KeyeTopKMaskAttention(nn.Module):
             base=rope_theta,
             rope_scaling=rope_scaling,
         )
-        
+
         # Radix Attention (用于标准的 KV cache 管理)
         self.attn = RadixAttention(
             self.num_heads,
@@ -171,23 +181,23 @@ class KeyeTopKMaskAttention(nn.Module):
             prefix=add_prefix("attn", prefix),
         )
         self.alt_stream = alt_stream
-        
+
         # === Indexer for Sparse Attention ===
         self.sa_indexer: Optional[KeyeIndexer] = None
         self.sa_topk = 2048
-        
+
         # 从 sa_config 初始化 Indexer
         if sa_config is not None:
-            indexer_num_heads = sa_config.get('indexer_num_heads', 4)
-            indexer_head_dim = sa_config.get('indexer_head_dim', 128)
-            topk = sa_config.get('topk', 2048)
+            indexer_num_heads = sa_config.get("indexer_num_heads", 4)
+            indexer_head_dim = sa_config.get("indexer_head_dim", 128)
+            topk = sa_config.get("topk", 2048)
             self.sa_topk = topk
-            
+
             # 提取 mrope_section
             mrope_section = [16, 24, 24]  # 默认值
             if rope_scaling is not None and isinstance(rope_scaling, dict):
-                mrope_section = rope_scaling.get('mrope_section', mrope_section)
-            
+                mrope_section = rope_scaling.get("mrope_section", mrope_section)
+
             self.sa_indexer = KeyeIndexer(
                 hidden_size=hidden_size,
                 num_heads=indexer_num_heads,
@@ -236,31 +246,31 @@ class KeyeTopKMaskAttention(nn.Module):
     ) -> torch.Tensor:
         """
         Forward pass with Top-K Mask sparse attention.
-        
+
         处理两种情况：
         1. Prefill (q_len > 1): 使用 Indexer 计算 top-k，应用稀疏 attention
         2. Decode (q_len == 1): 使用缓存的 Indexer K 计算 top-k，应用稀疏 attention
-        
+
         注意：当前版本暂时不支持 topk_mask，需要后续扩展 RadixAttention
-        
+
         Args:
             positions: Position IDs (可能是 3D [3, B, N] 用于 mrope)
             hidden_states: Input tensor, shape [B, q_len, hidden_size] or [total_tokens, hidden_size]
             forward_batch: Forward batch info (包含 KV cache 和 position IDs)
-            
+
         Returns:
             attn_output: Same shape as input hidden_states
         """
         # ---- 1. Compute Q, K, V ----
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        
+
         # Apply Q/K normalization
         q, k = self._apply_qk_norm(q, k)
-        
+
         # ---- 2. Apply RoPE ----
         q, k = self.rotary_emb(positions, q, k)
-        
+
         # ---- 3. 运行 Indexer 获取 top-k (如果启用) ----
         topk_indices = None
         if self.sa_indexer is not None:
@@ -270,14 +280,14 @@ class KeyeTopKMaskAttention(nn.Module):
                 forward_batch=forward_batch,
                 layer_id=self.layer_id,
             )
-        
+
         # ---- 4. 使用 RadixAttention (通过kwargs传递topk_indices) ----
         # topk_indices will be handled by KeyeSparseAttnBackend
         attn_output = self.attn(q, k, v, forward_batch, topk_indices=topk_indices)
-        
+
         # ---- 5. Output Projection ----
         output, _ = self.o_proj(attn_output)
-        
+
         return output
 
 
@@ -299,7 +309,9 @@ class KeyeTopKMaskDecoderLayer(Qwen3DecoderLayer):
         )
 
         sa_config = getattr(config, "sa_config", None)
-        if is_hopper_with_cuda_12_3() and sa_config is not None:
+        if (
+            is_ampere_with_cuda_12_3() or is_hopper_with_cuda_12_3()
+        ) and sa_config is not None:
             head_dim = getattr(config, "head_dim", None)
             self.self_attn = KeyeTopKMaskAttention(
                 hidden_size=config.hidden_size,
@@ -309,7 +321,9 @@ class KeyeTopKMaskDecoderLayer(Qwen3DecoderLayer):
                 rope_theta=getattr(config, "rope_theta", 1000000),
                 rope_scaling=getattr(config, "rope_scaling", None),
                 head_dim=head_dim,
-                max_position_embeddings=getattr(config, "max_position_embeddings", 32768),
+                max_position_embeddings=getattr(
+                    config, "max_position_embeddings", 32768
+                ),
                 quant_config=quant_config,
                 rms_norm_eps=config.rms_norm_eps,
                 attention_bias=config.attention_bias,
@@ -317,7 +331,6 @@ class KeyeTopKMaskDecoderLayer(Qwen3DecoderLayer):
                 alt_stream=alt_stream,
                 sa_config=sa_config,
             )
-
 
 
 class KeyeTopKMaskModel(Qwen2Model):
@@ -352,7 +365,6 @@ class KeyeVL2ForConditionalGeneration(KeyeVL1_5ForConditionalGeneration):
     - 多模态处理逻辑 - 继承
     """
 
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -367,11 +379,11 @@ class KeyeVL2ForConditionalGeneration(KeyeVL1_5ForConditionalGeneration):
             prefix=prefix,
             language_model_cls=KeyeTopKMaskModel,
         )
-    
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         """
         权重加载，特殊处理 sa_indexer 的权重
-        
+
         处理两种情况：
         1. checkpoint 中没有 sa_indexer 权重 -> 跳过，使用随机初始化
         2. checkpoint 中有 sa_indexer 权重 -> 正常加载
@@ -385,7 +397,7 @@ class KeyeVL2ForConditionalGeneration(KeyeVL1_5ForConditionalGeneration):
             ("gate_up_proj", "gate_proj", 0),
         ]
         params_dict = dict(self.named_parameters(remove_duplicate=False))
-        
+
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
@@ -411,12 +423,12 @@ class KeyeVL2ForConditionalGeneration(KeyeVL1_5ForConditionalGeneration):
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
-                
+
                 # 检查参数是否存在
                 if name not in params_dict:
                     print_info_once(f"Warning: parameter not found in model: {name}")
                     continue
-                    
+
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
@@ -443,12 +455,14 @@ class KeyeVL2ForConditionalGeneration(KeyeVL1_5ForConditionalGeneration):
                     name = name.replace(weight_name, param_name)
                     if name.endswith(".bias") and name not in params_dict:
                         continue
-                    
+
                     # 检查参数是否存在
                     if name not in params_dict:
-                        print_info_once(f"Warning: parameter not found in model: {name}")
+                        print_info_once(
+                            f"Warning: parameter not found in model: {name}"
+                        )
                         continue
-                        
+
                     param = params_dict[name]
                     weight_loader = param.weight_loader
                     weight_loader(param, loaded_weight, shard_id)
@@ -461,12 +475,14 @@ class KeyeVL2ForConditionalGeneration(KeyeVL1_5ForConditionalGeneration):
                         continue
                     if any(ignore_name in name for ignore_name in ignore_names):
                         continue
-                    
+
                     # 检查参数是否存在，不存在则跳过（而不是报错）
                     if name not in params_dict:
-                        print_info_once(f"Warning: parameter not found in model: {name}")
+                        print_info_once(
+                            f"Warning: parameter not found in model: {name}"
+                        )
                         continue
-                        
+
                     param = params_dict[name]
                     weight_loader = getattr(
                         param,
@@ -474,6 +490,7 @@ class KeyeVL2ForConditionalGeneration(KeyeVL1_5ForConditionalGeneration):
                         default_weight_loader,
                     )
                     weight_loader(param, loaded_weight)
+
     # 其他方法（pad_input_ids, get_image_feature, get_video_feature,
     # get_input_embeddings, forward）都从父类继承
 

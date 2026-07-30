@@ -27,6 +27,7 @@ KVCache actually holds the physical kv cache.
 import abc
 import dataclasses
 import logging
+import os
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, fields
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
@@ -2127,7 +2128,10 @@ class KeyeTokenToKVPool(MHATokenToKVPool):
     # to match the KeyeIndexer's block_size logic.
     # NOTE: Always access via instance (self.quant_block_size), never via class
     # (KeyeTokenToKVPool.quant_block_size), because Keye supports head_dim 32/64/128.
-    index_k_with_scale_buffer_dtype = torch.uint8
+    use_sm80_dsa = os.getenv("KEYE_SM80_DSA", "0") == "1"
+    index_k_with_scale_buffer_dtype = (
+        torch.bfloat16 if use_sm80_dsa else torch.uint8
+    )
 
     def _should_finalize_in_init(self) -> bool:
         return False
@@ -2183,8 +2187,21 @@ class KeyeTokenToKVPool(MHATokenToKVPool):
                 if self.enable_custom_mem_pool
                 else nullcontext()
             ):
-                self.index_k_with_scale_buffer: Optional[List[torch.Tensor]] = [
-                    torch.zeros(
+                if self.use_sm80_dsa:
+                    # SM80 has no native FP8 tensor-core path.  Keep the exact
+                    # Hadamard-rotated index keys in BF16, addressed by the same
+                    # physical token slots as the main KV cache.
+                    self.index_k_with_scale_buffer = [
+                        torch.zeros(
+                            (num_pages * self.page_size, index_head_dim),
+                            dtype=torch.bfloat16,
+                            device=device,
+                        )
+                        for _ in range(layer_num)
+                    ]
+                else:
+                    self.index_k_with_scale_buffer: Optional[List[torch.Tensor]] = [
+                        torch.zeros(
                         # Layout (same as NSA index_k_with_scale_buffer):
                         #   shape: (num_pages, page_size * (index_head_dim + index_head_dim//quant_block_size * 4))
                         #   data: for page i,
@@ -2200,9 +2217,9 @@ class KeyeTokenToKVPool(MHATokenToKVPool):
                         ),
                         dtype=self.index_k_with_scale_buffer_dtype,
                         device=device,
-                    )
-                    for _ in range(layer_num)
-                ]
+                        )
+                        for _ in range(layer_num)
+                    ]
         self._finalize_allocation_log(size)
 
     def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
@@ -2214,6 +2231,19 @@ class KeyeTokenToKVPool(MHATokenToKVPool):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         return self.index_k_with_scale_buffer[layer_id - self.start_layer]
+
+    def get_index_k_bf16_buffer(self, layer_id: int) -> torch.Tensor:
+        """Return the physical-token BF16 index-key cache used on Ampere."""
+        if not self.use_sm80_dsa:
+            raise RuntimeError("BF16 index-key cache requires KEYE_SM80_DSA=1")
+        return self.get_index_k_with_scale_buffer(layer_id)
+
+    def set_index_k_bf16_buffer(
+        self, layer_id: int, loc: torch.Tensor, index_k: torch.Tensor
+    ) -> None:
+        """Store BF16 index keys at SGLang physical token locations."""
+        buf = self.get_index_k_bf16_buffer(layer_id)
+        buf[loc.to(dtype=torch.long)] = index_k.to(dtype=torch.bfloat16)
 
     def get_index_k_scale_buffer(
         self,
