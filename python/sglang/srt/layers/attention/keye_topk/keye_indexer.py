@@ -19,14 +19,13 @@ from pathlib import Path
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
-
-from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.layers.attention.nsa.nsa_indexer import BaseIndexerMetadata
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
+from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
-from sglang.srt.server_args import get_global_server_args
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, ceil_align, is_cuda, is_hip
 
 if is_cuda():
@@ -44,6 +43,7 @@ _is_hip = is_hip()
 logger = logging.getLogger(__name__)
 _use_sm80_dsa = os.getenv("KEYE_SM80_DSA", "0") == "1"
 _trace_counter = itertools.count()
+_trace_decode_counters: dict[Tuple[str, int], int] = {}
 
 DUAL_STREAM_TOKEN_THRESHOLD = 1024
 
@@ -72,10 +72,30 @@ def _should_trace_layer(layer_id: int) -> bool:
             "KEYE_SM80_TRACE_LAYERS must be 'all' or a comma-separated layer list"
         ) from exc
     if not traced_layers or any(layer < 0 for layer in traced_layers):
-        raise ValueError(
-            "KEYE_SM80_TRACE_LAYERS must contain non-negative layer IDs"
-        )
+        raise ValueError("KEYE_SM80_TRACE_LAYERS must contain non-negative layer IDs")
     return layer_id in traced_layers
+
+
+def _trace_mode() -> str:
+    """Return the configured payload mode for SM80 trace records."""
+    mode = os.getenv("KEYE_SM80_TRACE_MODE", "topk").strip().lower()
+    if mode not in {"topk", "score", "both"}:
+        raise ValueError("KEYE_SM80_TRACE_MODE must be 'topk', 'score', or 'both'")
+    return mode
+
+
+def _trace_decode_step_limit() -> int:
+    """Return the per-request, per-layer decode-step limit (0 means unlimited)."""
+    raw_value = os.getenv("KEYE_SM80_TRACE_DECODE_STEPS", "0").strip()
+    try:
+        limit = int(raw_value)
+    except ValueError as exc:
+        raise ValueError(
+            "KEYE_SM80_TRACE_DECODE_STEPS must be a non-negative integer"
+        ) from exc
+    if limit < 0:
+        raise ValueError("KEYE_SM80_TRACE_DECODE_STEPS must be a non-negative integer")
+    return limit
 
 
 def _rotate_activation(x: torch.Tensor) -> torch.Tensor:
@@ -306,12 +326,16 @@ class KeyeIndexer(MultiPlatformOp):
         if enable_dual_stream:
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
-            query = _rotate_activation(q_flat).view(total_tokens, self.num_heads, self.head_dim)
+            query = _rotate_activation(q_flat).view(
+                total_tokens, self.num_heads, self.head_dim
+            )
             with torch.cuda.stream(self.alt_stream):
                 key = _rotate_activation(key)
             current_stream.wait_stream(self.alt_stream)
         else:
-            query = _rotate_activation(q_flat).view(total_tokens, self.num_heads, self.head_dim)
+            query = _rotate_activation(q_flat).view(
+                total_tokens, self.num_heads, self.head_dim
+            )
             key = _rotate_activation(key)
 
         return query, key, w_raw
@@ -354,18 +378,18 @@ class KeyeIndexer(MultiPlatformOp):
         if x.shape[0] == 0:
             return torch.full((0, self.topk), -1, dtype=torch.int32, device=x.device)
 
-        metadata: Optional[
-            BaseIndexerMetadata
-        ] = forward_batch.attn_backend.get_indexer_metadata(layer_id, forward_batch)
+        metadata: Optional[BaseIndexerMetadata] = (
+            forward_batch.attn_backend.get_indexer_metadata(layer_id, forward_batch)
+        )
         if metadata is None:
             return None
 
         if _use_sm80_dsa:
-            result = self._forward_sm80(
+            result, trace_scores = self._forward_sm80(
                 x, positions, forward_batch, layer_id, metadata
             )
             self._dump_topk_sm80(
-                result, positions, forward_batch, layer_id
+                result, trace_scores, positions, forward_batch, layer_id
             )
             return result
 
@@ -408,7 +432,9 @@ class KeyeIndexer(MultiPlatformOp):
                     extend_len = int(extend_lens_cpu[i])
                     history = seq_len - extend_len
                     if extend_len > 0:
-                        col_idx = torch.arange(max_kv_len, dtype=torch.int32, device=device)
+                        col_idx = torch.arange(
+                            max_kv_len, dtype=torch.int32, device=device
+                        )
                         valid_counts = torch.arange(
                             history + 1,
                             history + extend_len + 1,
@@ -416,12 +442,14 @@ class KeyeIndexer(MultiPlatformOp):
                             device=device,
                         )
                         mask = col_idx.unsqueeze(0) < valid_counts.unsqueeze(1)
-                        result[q_offset : q_offset + extend_len, :max_kv_len] = torch.where(
-                            mask,
-                            col_idx.unsqueeze(0).expand(extend_len, -1),
-                            torch.full_like(
-                                col_idx.unsqueeze(0).expand(extend_len, -1), -1
-                            ),
+                        result[q_offset : q_offset + extend_len, :max_kv_len] = (
+                            torch.where(
+                                mask,
+                                col_idx.unsqueeze(0).expand(extend_len, -1),
+                                torch.full_like(
+                                    col_idx.unsqueeze(0).expand(extend_len, -1), -1
+                                ),
+                            )
                         )
                     q_offset += extend_len
                 return result
@@ -466,7 +494,9 @@ class KeyeIndexer(MultiPlatformOp):
         weights = self._get_logits_head_gate(w_raw, q_scale)
 
         if forward_batch.forward_mode.is_extend_without_speculative():
-            return self._get_topk_ragged(forward_batch, layer_id, q_fp8, weights, metadata)
+            return self._get_topk_ragged(
+                forward_batch, layer_id, q_fp8, weights, metadata
+            )
         return self._get_topk_paged(forward_batch, layer_id, q_fp8, weights, metadata)
 
     def _all_causal_indices_sm80(
@@ -502,6 +532,7 @@ class KeyeIndexer(MultiPlatformOp):
     def _dump_topk_sm80(
         self,
         indices: torch.Tensor,
+        scores: Optional[torch.Tensor],
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         layer_id: int,
@@ -534,13 +565,56 @@ class KeyeIndexer(MultiPlatformOp):
         if not _should_trace_layer(layer_id):
             return
 
+        trace_mode = _trace_mode()
+        decode_step_limit = _trace_decode_step_limit()
+        is_decode = forward_batch.forward_mode.is_decode()
+        if trace_mode in {"score", "both"} and scores is None:
+            # Score traces intentionally cover decode steps only. Prefill can
+            # have thousands of query rows and would dominate both I/O and
+            # storage without helping the planned cross-step comparison.
+            return
+
+        row_indices = list(range(indices.shape[0]))
+        decode_step_ids: Optional[List[int]] = None
+        request_ids = list(getattr(forward_batch, "rids", None) or [])
+        if decode_step_limit:
+            if not is_decode or len(request_ids) != indices.shape[0]:
+                return
+            selected_rows = []
+            decode_step_ids = []
+            for row_index, request_id in enumerate(request_ids):
+                counter_key = (request_id, layer_id)
+                decode_step = _trace_decode_counters.get(counter_key, 0)
+                _trace_decode_counters[counter_key] = decode_step + 1
+                if decode_step < decode_step_limit:
+                    selected_rows.append(row_index)
+                    decode_step_ids.append(decode_step)
+            if not selected_rows:
+                return
+            row_indices = selected_rows
+
+        row_selector = torch.tensor(
+            row_indices, dtype=torch.long, device=indices.device
+        )
+        indices = indices.index_select(0, row_selector)
+        if scores is not None:
+            scores = scores.index_select(0, row_selector)
+        if positions.shape[-1] == len(request_ids):
+            positions = positions.index_select(
+                positions.dim() - 1,
+                row_selector.to(device=positions.device),
+            )
+        selected_request_ids = (
+            [request_ids[row_index] for row_index in row_indices]
+            if len(request_ids) >= max(row_indices, default=-1) + 1
+            else request_ids
+        )
+
         trace_dir = Path(trace_dir_value)
         trace_dir.mkdir(parents=True, exist_ok=True)
         event_id = next(_trace_counter)
         timestamp_ns = time.time_ns()
-        file_name = (
-            f"event_{event_id:09d}_{timestamp_ns}_layer_{layer_id:02d}.pt"
-        )
+        file_name = f"event_{event_id:09d}_{timestamp_ns}_layer_{layer_id:02d}.pt"
         final_path = trace_dir / file_name
         temp_path = trace_dir / f".{file_name}.tmp"
 
@@ -551,9 +625,27 @@ class KeyeIndexer(MultiPlatformOp):
         indices_cpu = indices.detach().to(device="cpu", dtype=torch.int32)
         positions_cpu = positions.detach().to(device="cpu")
         valid_counts = (indices_cpu >= 0).sum(dim=-1).to(torch.int32)
+        score_valid_counts = optional_cpu("seq_lens")
+        if isinstance(score_valid_counts, torch.Tensor) and score_valid_counts.shape[
+            0
+        ] == len(request_ids):
+            score_valid_counts = score_valid_counts.index_select(
+                0, torch.tensor(row_indices, dtype=torch.long)
+            ).to(torch.int32)
         input_ids_cpu = optional_cpu("input_ids")
+        if isinstance(input_ids_cpu, torch.Tensor) and input_ids_cpu.shape[0] == len(
+            request_ids
+        ):
+            input_ids_cpu = input_ids_cpu.index_select(
+                0, torch.tensor(row_indices, dtype=torch.long)
+            )
         req_pool_indices_cpu = optional_cpu("req_pool_indices")
-        request_ids = list(getattr(forward_batch, "rids", None) or [])
+        if isinstance(
+            req_pool_indices_cpu, torch.Tensor
+        ) and req_pool_indices_cpu.shape[0] == len(request_ids):
+            req_pool_indices_cpu = req_pool_indices_cpu.index_select(
+                0, torch.tensor(row_indices, dtype=torch.long)
+            )
 
         # SGLang packs prefill tokens request-by-request, while decode has one
         # row per request.  Persist an explicit row mapping so concurrent
@@ -573,9 +665,9 @@ class KeyeIndexer(MultiPlatformOp):
                 token_req_pool_indices = torch.repeat_interleave(
                     req_pool_indices_cpu[: len(extend_lens)], repeats
                 )
-            if len(request_ids) >= len(extend_lens):
+            if len(selected_request_ids) >= len(extend_lens):
                 token_request_ids = [
-                    request_ids[request_index]
+                    selected_request_ids[request_index]
                     for request_index, length in enumerate(extend_lens)
                     for _ in range(int(length))
                 ]
@@ -584,25 +676,31 @@ class KeyeIndexer(MultiPlatformOp):
             and req_pool_indices_cpu.numel() == indices_cpu.shape[0]
         ):
             token_req_pool_indices = req_pool_indices_cpu.reshape(-1).clone()
-            if len(request_ids) == indices_cpu.shape[0]:
-                token_request_ids = request_ids.copy()
+            if len(selected_request_ids) == indices_cpu.shape[0]:
+                token_request_ids = selected_request_ids.copy()
 
         record = {
-            "schema_version": 2,
+            "schema_version": 3,
             "event_id": event_id,
             "timestamp_ns": timestamp_ns,
             "layer_id": layer_id,
             "forward_mode": int(forward_batch.forward_mode),
-            "indices": indices_cpu,
+            "trace_mode": trace_mode,
+            "indices": indices_cpu if trace_mode in {"topk", "both"} else None,
+            "scores": (
+                scores.detach().to(device="cpu", dtype=torch.float32)
+                if scores is not None and trace_mode in {"score", "both"}
+                else None
+            ),
             "valid_counts": valid_counts,
+            "score_valid_counts": score_valid_counts,
+            "decode_step_ids": decode_step_ids,
             "input_ids": input_ids_cpu,
             "positions": positions_cpu,
             "seq_lens": optional_cpu("seq_lens"),
             "extend_seq_lens": optional_cpu("extend_seq_lens"),
-            "extend_seq_lens_cpu": getattr(
-                forward_batch, "extend_seq_lens_cpu", None
-            ),
-            "request_ids": request_ids,
+            "extend_seq_lens_cpu": getattr(forward_batch, "extend_seq_lens_cpu", None),
+            "request_ids": selected_request_ids,
             "req_pool_indices": req_pool_indices_cpu,
             "token_request_ids": token_request_ids,
             "token_req_pool_indices": token_req_pool_indices,
@@ -619,9 +717,11 @@ class KeyeIndexer(MultiPlatformOp):
             "forward_mode": int(forward_batch.forward_mode),
             "num_tokens": indices_cpu.shape[0],
             "topk_width": indices_cpu.shape[1],
+            "score_width": scores.shape[1] if scores is not None else None,
             "valid_min": int(valid_counts.min().item()),
             "valid_max": int(valid_counts.max().item()),
-            "request_ids": request_ids,
+            "decode_step_ids": decode_step_ids,
+            "request_ids": selected_request_ids,
         }
         with (trace_dir / "manifest.jsonl").open("a", encoding="utf-8") as file:
             file.write(json.dumps(manifest_record, separators=(",", ":")) + "\n")
@@ -635,9 +735,7 @@ class KeyeIndexer(MultiPlatformOp):
         per_head = torch.relu(per_head.float() * self.softmax_scale)
         return (per_head * weights.float().unsqueeze(-1)).sum(dim=1)
 
-    def _topk_sm80(
-        self, scores: torch.Tensor, lengths: torch.Tensor
-    ) -> torch.Tensor:
+    def _topk_sm80(self, scores: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
         """Select top-k with the optimized DSA kernel when its contract applies."""
         if self.topk == 2048 and scores.shape[1] >= self.topk:
             from sgl_kernel import fast_topk_v2
@@ -669,7 +767,7 @@ class KeyeIndexer(MultiPlatformOp):
         forward_batch: ForwardBatch,
         layer_id: int,
         metadata: BaseIndexerMetadata,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Exact BF16 index selection for GPUs without FP8/DeepGEMM."""
         pool = forward_batch.token_to_kv_pool
         loc = forward_batch.out_cache_loc
@@ -682,8 +780,11 @@ class KeyeIndexer(MultiPlatformOp):
             if max_kv_len <= self.topk:
                 key = self._get_k_bf16(x, positions)
                 pool.set_index_k_bf16_buffer(layer_id, loc, key)
-                return self._all_causal_indices_sm80(
-                    forward_batch, x.shape[0], max_kv_len
+                return (
+                    self._all_causal_indices_sm80(
+                        forward_batch, x.shape[0], max_kv_len
+                    ),
+                    None,
                 )
 
         query, key, weights = self._get_q_k_w_bf16(
@@ -707,7 +808,7 @@ class KeyeIndexer(MultiPlatformOp):
                 seqlens,
                 self.softmax_scale,
             )
-            return self._topk_sm80(scores, seqlens)
+            return self._topk_sm80(scores, seqlens), scores
 
         result = torch.full(
             (x.shape[0], self.topk), -1, dtype=torch.int32, device=x.device
@@ -736,7 +837,7 @@ class KeyeIndexer(MultiPlatformOp):
                 indices = self._topk_sm80(scores, valid)
                 result[q_offset + start : q_offset + end] = indices
             q_offset += extend_len
-        return result
+        return result, None
 
     def _get_topk_ragged(
         self,
@@ -821,15 +922,27 @@ class KeyeIndexer(MultiPlatformOp):
         )
 
         if not need_chunk:
-            q_in = _pad_to(q_fp8[:q_offset], padded_q_offset) if need_pad else q_fp8[:q_offset]
-            w_in = _pad_to(weights[:q_offset], padded_q_offset) if need_pad else weights[:q_offset]
+            q_in = (
+                _pad_to(q_fp8[:q_offset], padded_q_offset)
+                if need_pad
+                else q_fp8[:q_offset]
+            )
+            w_in = (
+                _pad_to(weights[:q_offset], padded_q_offset)
+                if need_pad
+                else weights[:q_offset]
+            )
             ks_in = _pad_to(ks, padded_q_offset) if need_pad else ks
             ke_in = _pad_to(ke, padded_q_offset) if need_pad else ke
             logits = deep_gemm.fp8_mqa_logits(
                 q_in, kv_fp8, w_in, ks_in, ke_in, clean_logits=False
             )
             raw_result = metadata.topk_transform(
-                logits[:q_offset], self.topk, forward_batch, ks=ks, context_length=k_offset,
+                logits[:q_offset],
+                self.topk,
+                forward_batch,
+                ks=ks,
+                context_length=k_offset,
             )
             return raw_result
 
@@ -880,7 +993,8 @@ class KeyeIndexer(MultiPlatformOp):
             real_len = end_real - start
             logits_real = logits_chunk[:real_len]
             topk_result[start:end_real] = metadata.topk_transform(
-                logits_real, self.topk,
+                logits_real,
+                self.topk,
                 forward_batch,
                 ks=ks[start:end_real],
                 ke_offset=ke[start:end_real] - ks[start:end_real],
@@ -921,9 +1035,7 @@ class KeyeIndexer(MultiPlatformOp):
 
         head_dim_with_sf = self.head_dim + self.head_dim // self.block_size * 4
         q_4d = q_fp8.unsqueeze(1)
-        kv_4d = kv_cache_fp8.view(
-            kv_cache_fp8.shape[0], page_size, 1, head_dim_with_sf
-        )
+        kv_4d = kv_cache_fp8.view(kv_cache_fp8.shape[0], page_size, 1, head_dim_with_sf)
 
         logits = deep_gemm.fp8_paged_mqa_logits(
             q_4d,
@@ -936,4 +1048,6 @@ class KeyeIndexer(MultiPlatformOp):
             clean_logits=False,
         )
 
-        return metadata.topk_transform(logits, self.topk, forward_batch, ks=None, context_length=max_seq_len)
+        return metadata.topk_transform(
+            logits, self.topk, forward_batch, ks=None, context_length=max_seq_len
+        )
