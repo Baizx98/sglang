@@ -14,6 +14,7 @@ import itertools
 import json
 import logging
 import os
+import re
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, List, Optional, Tuple
@@ -44,6 +45,7 @@ logger = logging.getLogger(__name__)
 _use_sm80_dsa = os.getenv("KEYE_SM80_DSA", "0") == "1"
 _trace_counter = itertools.count()
 _trace_decode_counters: dict[Tuple[str, int], int] = {}
+_trace_chunk_buffers: dict[Tuple[str, int], list[dict[str, object]]] = {}
 
 DUAL_STREAM_TOKEN_THRESHOLD = 1024
 
@@ -96,6 +98,27 @@ def _trace_decode_step_limit() -> int:
     if limit < 0:
         raise ValueError("KEYE_SM80_TRACE_DECODE_STEPS must be a non-negative integer")
     return limit
+
+
+def _trace_chunk_steps() -> int:
+    """Return the number of decode rows stored in one trace chunk."""
+    raw_value = os.getenv("KEYE_SM80_TRACE_CHUNK_STEPS", "0").strip()
+    try:
+        chunk_steps = int(raw_value)
+    except ValueError as exc:
+        raise ValueError(
+            "KEYE_SM80_TRACE_CHUNK_STEPS must be a non-negative integer"
+        ) from exc
+    if chunk_steps < 0:
+        raise ValueError(
+            "KEYE_SM80_TRACE_CHUNK_STEPS must be a non-negative integer"
+        )
+    return chunk_steps
+
+
+def _trace_rid_prefix() -> str:
+    """Return the optional request-id prefix used to exclude health/warmup calls."""
+    return os.getenv("KEYE_SM80_TRACE_RID_PREFIX", "").strip()
 
 
 def _rotate_activation(x: torch.Tensor) -> torch.Tensor:
@@ -577,21 +600,27 @@ class KeyeIndexer(MultiPlatformOp):
         row_indices = list(range(indices.shape[0]))
         decode_step_ids: Optional[List[int]] = None
         request_ids = list(getattr(forward_batch, "rids", None) or [])
-        if decode_step_limit:
-            if not is_decode or len(request_ids) != indices.shape[0]:
-                return
+        rid_prefix = _trace_rid_prefix()
+        if is_decode and len(request_ids) == indices.shape[0]:
             selected_rows = []
             decode_step_ids = []
             for row_index, request_id in enumerate(request_ids):
+                if rid_prefix and not request_id.startswith(rid_prefix):
+                    continue
                 counter_key = (request_id, layer_id)
                 decode_step = _trace_decode_counters.get(counter_key, 0)
                 _trace_decode_counters[counter_key] = decode_step + 1
-                if decode_step < decode_step_limit:
+                if not decode_step_limit or decode_step < decode_step_limit:
                     selected_rows.append(row_index)
                     decode_step_ids.append(decode_step)
             if not selected_rows:
                 return
             row_indices = selected_rows
+        elif decode_step_limit or rid_prefix:
+            # Formal trace collection is decode-only and requires a stable
+            # row-to-request mapping.
+            if not is_decode or len(request_ids) != indices.shape[0]:
+                return
 
         row_selector = torch.tensor(
             row_indices, dtype=torch.long, device=indices.device
@@ -612,11 +641,6 @@ class KeyeIndexer(MultiPlatformOp):
 
         trace_dir = Path(trace_dir_value)
         trace_dir.mkdir(parents=True, exist_ok=True)
-        event_id = next(_trace_counter)
-        timestamp_ns = time.time_ns()
-        file_name = f"event_{event_id:09d}_{timestamp_ns}_layer_{layer_id:02d}.pt"
-        final_path = trace_dir / file_name
-        temp_path = trace_dir / f".{file_name}.tmp"
 
         def optional_cpu(name: str):
             value = getattr(forward_batch, name, None)
@@ -679,6 +703,65 @@ class KeyeIndexer(MultiPlatformOp):
             if len(selected_request_ids) == indices_cpu.shape[0]:
                 token_request_ids = selected_request_ids.copy()
 
+        chunk_steps = _trace_chunk_steps()
+        if chunk_steps:
+            if not is_decode or decode_step_ids is None:
+                return
+            if decode_step_limit and chunk_steps > decode_step_limit:
+                raise ValueError(
+                    "KEYE_SM80_TRACE_CHUNK_STEPS cannot exceed "
+                    "KEYE_SM80_TRACE_DECODE_STEPS"
+                )
+            for output_row, request_id in enumerate(selected_request_ids):
+                score_valid_count = (
+                    int(score_valid_counts[output_row].item())
+                    if isinstance(score_valid_counts, torch.Tensor)
+                    else int(scores.shape[1])
+                )
+                row_score = (
+                    scores[output_row, :score_valid_count]
+                    .detach()
+                    .to(device="cpu", dtype=torch.float32)
+                    if scores is not None and trace_mode in {"score", "both"}
+                    else None
+                )
+                row_input_id = (
+                    input_ids_cpu[output_row].clone()
+                    if isinstance(input_ids_cpu, torch.Tensor)
+                    and input_ids_cpu.numel() > output_row
+                    else None
+                )
+                row_position = (
+                    positions_cpu[..., output_row].clone()
+                    if positions_cpu.shape[-1] == len(selected_request_ids)
+                    else positions_cpu.clone()
+                )
+                self._append_trace_chunk_row(
+                    trace_dir=trace_dir,
+                    trace_mode=trace_mode,
+                    request_id=request_id,
+                    layer_id=layer_id,
+                    decode_step_id=decode_step_ids[output_row],
+                    indices=(
+                        indices_cpu[output_row].clone()
+                        if trace_mode in {"topk", "both"}
+                        else None
+                    ),
+                    score=row_score,
+                    valid_count=int(valid_counts[output_row].item()),
+                    score_valid_count=score_valid_count,
+                    input_id=row_input_id,
+                    position=row_position,
+                    chunk_steps=chunk_steps,
+                )
+            return
+
+        event_id = next(_trace_counter)
+        timestamp_ns = time.time_ns()
+        file_name = f"event_{event_id:09d}_{timestamp_ns}_layer_{layer_id:02d}.pt"
+        final_path = trace_dir / file_name
+        temp_path = trace_dir / f".{file_name}.tmp"
+
         record = {
             "schema_version": 3,
             "event_id": event_id,
@@ -725,6 +808,133 @@ class KeyeIndexer(MultiPlatformOp):
         }
         with (trace_dir / "manifest.jsonl").open("a", encoding="utf-8") as file:
             file.write(json.dumps(manifest_record, separators=(",", ":")) + "\n")
+
+    def _append_trace_chunk_row(
+        self,
+        *,
+        trace_dir: Path,
+        trace_mode: str,
+        request_id: str,
+        layer_id: int,
+        decode_step_id: int,
+        indices: Optional[torch.Tensor],
+        score: Optional[torch.Tensor],
+        valid_count: int,
+        score_valid_count: int,
+        input_id: Optional[torch.Tensor],
+        position: torch.Tensor,
+        chunk_steps: int,
+    ) -> None:
+        """Buffer one decode row and atomically persist a schema-v4 chunk."""
+        buffer_key = (request_id, layer_id)
+        rows = _trace_chunk_buffers.setdefault(buffer_key, [])
+        rows.append(
+            {
+                "decode_step_id": decode_step_id,
+                "indices": indices,
+                "score": score,
+                "valid_count": valid_count,
+                "score_valid_count": score_valid_count,
+                "input_id": input_id,
+                "position": position,
+            }
+        )
+        if len(rows) < chunk_steps:
+            return
+        if len(rows) > chunk_steps:
+            raise RuntimeError(f"Trace chunk overflow for {buffer_key}: {len(rows)}")
+
+        rows.sort(key=lambda row: int(row["decode_step_id"]))
+        decode_step_ids = [int(row["decode_step_id"]) for row in rows]
+        if len(set(decode_step_ids)) != len(decode_step_ids):
+            raise RuntimeError(f"Duplicate decode steps for trace chunk {buffer_key}")
+
+        score_valid_counts = torch.tensor(
+            [int(row["score_valid_count"]) for row in rows], dtype=torch.int32
+        )
+        max_score_width = int(score_valid_counts.max().item())
+        scores_cpu = None
+        if trace_mode in {"score", "both"}:
+            scores_cpu = torch.zeros(
+                (chunk_steps, max_score_width), dtype=torch.float32
+            )
+            for row_index, row in enumerate(rows):
+                row_score = row["score"]
+                if not isinstance(row_score, torch.Tensor):
+                    raise RuntimeError(f"Missing score row for {buffer_key}")
+                scores_cpu[row_index, : row_score.numel()] = row_score
+
+        indices_cpu = None
+        if trace_mode in {"topk", "both"}:
+            index_rows = [row["indices"] for row in rows]
+            if not all(isinstance(row, torch.Tensor) for row in index_rows):
+                raise RuntimeError(f"Missing top-k row for {buffer_key}")
+            indices_cpu = torch.stack(index_rows).to(torch.int32)
+
+        input_ids = [row["input_id"] for row in rows]
+        input_ids_cpu = (
+            torch.stack(input_ids)
+            if all(isinstance(value, torch.Tensor) for value in input_ids)
+            else None
+        )
+        positions_cpu = torch.stack(
+            [row["position"] for row in rows]
+        )
+        valid_counts = torch.tensor(
+            [int(row["valid_count"]) for row in rows], dtype=torch.int32
+        )
+
+        event_id = next(_trace_counter)
+        timestamp_ns = time.time_ns()
+        safe_request_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", request_id)[:96]
+        file_name = (
+            f"chunk_{event_id:09d}_{safe_request_id}_"
+            f"layer_{layer_id:02d}_steps_{decode_step_ids[0]:03d}-"
+            f"{decode_step_ids[-1]:03d}.pt"
+        )
+        final_path = trace_dir / file_name
+        temp_path = trace_dir / f".{file_name}.tmp"
+        record = {
+            "schema_version": 4,
+            "event_id": event_id,
+            "timestamp_ns": timestamp_ns,
+            "layer_id": layer_id,
+            "forward_mode": 2,
+            "trace_mode": trace_mode,
+            "request_id": request_id,
+            "request_ids": [request_id] * chunk_steps,
+            "decode_step_ids": decode_step_ids,
+            "indices": indices_cpu,
+            "scores": scores_cpu,
+            "valid_counts": valid_counts,
+            "score_valid_counts": score_valid_counts,
+            "input_ids": input_ids_cpu,
+            "positions": positions_cpu,
+        }
+        torch.save(record, temp_path)
+        os.replace(temp_path, final_path)
+
+        manifest_record = {
+            "schema_version": 4,
+            "event_id": event_id,
+            "timestamp_ns": timestamp_ns,
+            "file": file_name,
+            "layer_id": layer_id,
+            "request_id": request_id,
+            "request_ids": [request_id],
+            "num_steps": chunk_steps,
+            "decode_step_ids": decode_step_ids,
+            "topk_width": indices_cpu.shape[1] if indices_cpu is not None else None,
+            "score_width": scores_cpu.shape[1] if scores_cpu is not None else None,
+            "valid_min": int(valid_counts.min().item()),
+            "valid_max": int(valid_counts.max().item()),
+            "score_valid_min": int(score_valid_counts.min().item()),
+            "score_valid_max": int(score_valid_counts.max().item()),
+            "bytes": final_path.stat().st_size,
+        }
+        with (trace_dir / "manifest.jsonl").open("a", encoding="utf-8") as file:
+            file.write(json.dumps(manifest_record, separators=(",", ":")) + "\n")
+        del _trace_chunk_buffers[buffer_key]
 
     def _score_sm80(
         self, query: torch.Tensor, keys: torch.Tensor, weights: torch.Tensor

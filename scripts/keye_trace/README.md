@@ -13,12 +13,19 @@ export KEYE_SM80_TRACE_DIR=/absolute/path/to/run/events
 export KEYE_SM80_TRACE_LAYERS=0,1,15,16,31,32,46,47
 export KEYE_SM80_TRACE_MODE=both
 export KEYE_SM80_TRACE_DECODE_STEPS=32
+export KEYE_SM80_TRACE_CHUNK_STEPS=32
+export KEYE_SM80_TRACE_RID_PREFIX=bfclseg__
 ```
 
 `KEYE_SM80_TRACE_DECODE_STEPS` is enforced independently for every
 `(request ID, layer)` pair. Schema v3 event files keep the FP32 score vector,
 int32 top-k indices, valid score length, request ID, layer ID, and decode step
 in one record.
+
+With `KEYE_SM80_TRACE_CHUNK_STEPS` enabled, schema v4 stores one atomic file
+per `(request ID, layer)` chunk. This avoids creating one small file per decode
+step while retaining FP32 scores and int32 top-k indices. The optional request
+prefix filter excludes health checks and warm-up requests.
 
 ## Replay
 
@@ -31,6 +38,24 @@ deterministic observation before the next round.
 .venv/bin/python scripts/keye_trace/run_bfcl_teacher_forced.py \
   --bfcl-root data/external/gorilla/berkeley-function-call-leaderboard \
   --output-dir data/agent-score-trace/<run-id>
+```
+
+`run_bfcl_segmented.py` is the full semantic-context experiment. It
+deterministically selects stratified BFCL trajectories, executes the official
+BFCL ground-truth tool calls, renders the exact Keye chat prompt, labels every
+prompt token by semantic segment, and sends the resulting token IDs directly
+to SGLang:
+
+```bash
+.venv/bin/python scripts/keye_trace/run_bfcl_segmented.py \
+  --bfcl-root data/external/gorilla/berkeley-function-call-leaderboard \
+  --output-dir data/agent-score-trace/<run-id> \
+  --prepare-only
+
+.venv/bin/python scripts/keye_trace/run_bfcl_segmented.py \
+  --bfcl-root data/external/gorilla/berkeley-function-call-leaderboard \
+  --output-dir data/agent-score-trace/<run-id> \
+  --reuse-prepared
 ```
 
 ## Analysis
