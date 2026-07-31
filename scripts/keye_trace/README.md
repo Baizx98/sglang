@@ -73,3 +73,16 @@ step stability or adjacent-step score-change metrics.
 
 The analysis requires `pandas`, `pyarrow`, `scipy`, and `matplotlib`. Raw traces
 and generated figures remain under the Git-ignored `data/` directory.
+
+For the schema-v4 semantic experiment, use the full-layer analyzer:
+
+```bash
+.venv/bin/python scripts/keye_trace/analyze_segment_trace.py \
+  --run-dir data/agent-score-trace/<run-id> \
+  --style /path/to/matplotlib_style.mplstyle
+```
+
+It emits per-layer step metrics, a sampled full 48-layer similarity matrix,
+semantic segment lift and cross-round stable-core metrics, stripe diagnostics,
+trace-driven candidate-set simulations, typed Parquet tables, and PDF/300 dpi
+PNG figures. Statistical intervals are clustered by trajectory.
