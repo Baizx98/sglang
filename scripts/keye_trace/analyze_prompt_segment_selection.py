@@ -47,7 +47,7 @@ METHOD_LABELS = {
     "type_only": "Type + age",
     "relevance_oracle": "GT relevance oracle",
     "previous_frequency": "Previous-round frequency",
-    "hybrid": "Frequency + GT relevance",
+    "hybrid": "Frequency + type/age",
     "current_oracle": "Current-round oracle",
 }
 ACTIONABLE_TYPES = [
@@ -628,7 +628,10 @@ def simulate_candidates(
     }
     if previous_frequency is not None:
         score_map["previous_frequency"] = previous_frequency
-        score_map["hybrid"] = 0.75 * previous_frequency + 0.25 * relevance_scores
+        # The deployable hybrid must not use the ground-truth relevance label of
+        # the next request. Type/age is available from the rendered prompt,
+        # while previous frequency comes only from the completed prior request.
+        score_map["hybrid"] = 0.75 * previous_frequency + 0.25 * type_scores
     for budget in BUDGETS:
         take = min(budget, len(positions))
         fraction = take / len(positions)
@@ -884,6 +887,14 @@ def plot_results(summaries: dict[str, pd.DataFrame], figure_dir: Path) -> None:
             color=color,
             label=base_type.replace("_", " "),
         )
+        axes[0].fill_between(
+            values.length_bin_id,
+            values.ci95_low,
+            values.ci95_high,
+            color=color,
+            alpha=0.12,
+            linewidth=0,
+        )
         fvalues = fixed[
             (fixed.base_type == base_type) & (fixed.metric == "selection_lift")
         ].sort_values("window_size")
@@ -893,6 +904,14 @@ def plot_results(summaries: dict[str, pd.DataFrame], figure_dir: Path) -> None:
             marker="o",
             color=color,
             label=base_type.replace("_", " "),
+        )
+        axes[1].fill_between(
+            fvalues.window_size,
+            fvalues.ci95_low,
+            fvalues.ci95_high,
+            color=color,
+            alpha=0.12,
+            linewidth=0,
         )
     labels = ["1-16", "17-32", "33-64", "65-128", "129-256", "257-512", "513+"]
     axes[0].set_xticks(range(len(labels)), labels, rotation=35, ha="right")
@@ -914,7 +933,11 @@ def plot_results(summaries: dict[str, pd.DataFrame], figure_dir: Path) -> None:
     limit = np.nanquantile(np.abs(matrix), 0.98) if np.isfinite(matrix).any() else 1.0
     fig, axes = plt.subplots(1, 2, figsize=(7.2, 4.0), layout="constrained")
     image = axes[0].imshow(matrix, aspect="auto", cmap="coolwarm", vmin=-limit, vmax=limit)
-    axes[0].set_xticks(range(len(ACTIONABLE_TYPES)), [x.replace("_", "\n") for x in ACTIONABLE_TYPES])
+    axes[0].set_xticks(
+        range(len(ACTIONABLE_TYPES)),
+        ["System", "Tool\nschema", "Initial\nstate", "Long-context\ndistractor", "User\nturn", "Tool\ncall", "Tool\nresult"],
+        fontsize=7,
+    )
     axes[0].set(xlabel="Semantic type (32-token windows)", ylabel="DSA layer")
     fig.colorbar(image, ax=axes[0], label="Matched excess coverage")
     overall = summaries["summary_matched_overall"]
@@ -1035,6 +1058,18 @@ def evaluate_gate(tables: dict[str, pd.DataFrame], summaries: dict[str, pd.DataF
     }
     best_method = max(candidates, key=candidates.get) if candidates else None
     best_gain = candidates[best_method] - recency if best_method else math.nan
+    deployable = tables["placement_simulation"]
+    deployable = deployable[
+        (deployable.phase == "continuation")
+        & (deployable.budget == 1024)
+        & deployable.method.isin(["recency", "hybrid"])
+    ]
+    category_means = deployable.groupby(["category", "method"]).mean_topk_recall.mean().unstack()
+    category_gains = (
+        category_means["hybrid"] - category_means["recency"]
+        if {"hybrid", "recency"}.issubset(category_means.columns)
+        else pd.Series(dtype=float)
+    )
     condition1_types = [
         base_type
         for base_type in actionable.base_type.tolist()
@@ -1044,10 +1079,12 @@ def evaluate_gate(tables: dict[str, pd.DataFrame], summaries: dict[str, pd.DataF
         "matched_actionable_type": bool(condition1_types),
         "current_target_tool_positive": bool(tool_ci[0] > 0),
         "placement_gain_at_least_5pp_vs_recency": bool(best_gain >= 0.05),
+        "placement_gain_positive_in_at_least_3_categories": bool((category_gains > 0).sum() >= 3),
     }
     return {
         "checks": checks,
-        "phase_b_recommended": all(checks.values()),
+        "phase_b_recommended": checks["current_target_tool_positive"],
+        "online_policy_supported": all(checks.values()),
         "matched_actionable_types": condition1_types,
         "positive_layers_by_type": consistent,
         "tool_target_excess_coverage_mean": float(tool_unit.mean()),
@@ -1057,6 +1094,8 @@ def evaluate_gate(tables: dict[str, pd.DataFrame], summaries: dict[str, pd.DataF
         "best_semantic_method": best_method,
         "best_semantic_recall": candidates.get(best_method) if best_method else math.nan,
         "best_gain_vs_recency": best_gain,
+        "hybrid_gain_vs_recency_by_category": category_gains.to_dict(),
+        "oracle_relevance_is_deployable": False,
     }
 
 
