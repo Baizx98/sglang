@@ -116,3 +116,19 @@ controls, and simulates semantic candidate-KV placement. It evaluates the
 pre-registered gate for a later controlled Phase-B trace collection. The
 simulation marks policies that use current or future ground truth as oracles;
 deployable policies use only type/age or previous-round selection frequency.
+
+If Phase A triggers the controlled tool-schema validation, prepare the 72
+strictly nested budget/position variants with:
+
+```bash
+.venv/bin/python scripts/keye_trace/run_bfcl_schema_intervention.py \
+  --bfcl-root data/external/gorilla/berkeley-function-call-leaderboard \
+  --source-run data/agent-score-trace/<semantic-run-id> \
+  --output-dir data/agent-score-trace/<intervention-run-id> \
+  --prepare-only
+```
+
+The intervention uses 12 single-target requests (three from each BFCL
+category), schema budgets near 2.5k/3.5k/full tokens, and target-schema
+front/tail placement. Distractor sets are deterministic and strictly nested;
+each replay is cache-flushed and generates 16 greedy decode tokens.
