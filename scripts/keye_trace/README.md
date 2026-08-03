@@ -100,3 +100,19 @@ The analysis excludes the newly appended decode position from historical-KV
 coverage, audits score-derived K=2048 against the stored top-k, and reports
 fixed-K/normalized-K curves, ECDFs, required-K distributions, per-layer
 budgets, context-length sensitivity, and recency/random/oracle baselines.
+
+To measure whether semantic prompt regions receive disproportionate DSA
+selection after controlling for region length and position, run:
+
+```bash
+.venv/bin/python scripts/keye_trace/analyze_prompt_segment_selection.py \
+  --run-dir data/agent-score-trace/<run-id> \
+  --style /path/to/matplotlib_style.mplstyle
+```
+
+This offline Phase-A analysis labels tool relevance and cross-round history,
+reports natural-length and fixed-window metrics, constructs position-matched
+controls, and simulates semantic candidate-KV placement. It evaluates the
+pre-registered gate for a later controlled Phase-B trace collection. The
+simulation marks policies that use current or future ground truth as oracles;
+deployable policies use only type/age or previous-round selection frequency.
