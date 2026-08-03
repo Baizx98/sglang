@@ -1154,6 +1154,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--style", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--limit-requests", type=int)
+    parser.add_argument("--reuse-base-tables", action="store_true")
     return parser.parse_args()
 
 
@@ -1177,17 +1178,37 @@ def main() -> None:
         plt.style.use(args.style)
     plt.rcParams["axes.prop_cycle"] = cycler(color=COLORS + ["#4D4D4D", "#9E9E9E"])
 
-    validation = validate_segments(requests, segments_by_rid)
-    lookup = build_lookup(args.run_dir, requests)
     contexts = build_contexts(requests)
-    natural, fixed, cache, trace_validation = analyze_segments(
-        args.run_dir, requests, segments_by_rid, lookup, contexts
-    )
-    validation.update(trace_validation)
-    natural = add_loo_scores(natural)
-    matched = matched_window_effects(fixed)
-    tool_matches = tool_relevance_matches(natural)
-    placement = placement_simulation(requests, segments_by_rid, natural, cache)
+    if args.reuse_base_tables:
+        required = [
+            "segment_selection_length_aware",
+            "fixed_window_selection",
+            "matched_window_effects",
+            "tool_relevance_matches",
+            "placement_simulation",
+        ]
+        loaded = {
+            name: pd.read_parquet(table_dir / f"{name}.parquet")
+            for name in required
+        }
+        natural = loaded["segment_selection_length_aware"]
+        fixed = loaded["fixed_window_selection"]
+        matched = loaded["matched_window_effects"]
+        tool_matches = loaded["tool_relevance_matches"]
+        placement = loaded["placement_simulation"]
+        validation = json.loads((output_dir / "validation.json").read_text())
+        validation["base_tables_reused"] = True
+    else:
+        validation = validate_segments(requests, segments_by_rid)
+        lookup = build_lookup(args.run_dir, requests)
+        natural, fixed, cache, trace_validation = analyze_segments(
+            args.run_dir, requests, segments_by_rid, lookup, contexts
+        )
+        validation.update(trace_validation)
+        natural = add_loo_scores(natural)
+        matched = matched_window_effects(fixed)
+        tool_matches = tool_relevance_matches(natural)
+        placement = placement_simulation(requests, segments_by_rid, natural, cache)
     tables = {
         "segment_selection_length_aware": natural,
         "fixed_window_selection": fixed,
@@ -1256,6 +1277,7 @@ def main() -> None:
         "kv_bytes_per_token_layer_tp2": KV_BYTES_PER_TOKEN_LAYER_TP2,
         "matching": "same request/layer/window size; position decile +/-1; up to 10 controls",
         "figure_formats": ["PDF", "PNG 300 dpi"],
+        "base_tables_reused": args.reuse_base_tables,
     }
     (output_dir / "reproducibility.json").write_text(
         json.dumps(reproducibility, indent=2, ensure_ascii=False) + "\n"
