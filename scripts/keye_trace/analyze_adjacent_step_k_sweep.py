@@ -348,6 +348,22 @@ def summarize(
             value_column = f"_value_{method}_{k}"
             transitions[value_column] = method_series(transitions, method, k)
             trajectory = transitions.groupby("trajectory_id")[value_column].mean()
+            diagnostics = transitions[
+                ["trajectory_id", "target_common_count"]
+            ].copy()
+            diagnostics["intersection"] = (
+                transitions[value_column] * transitions.target_common_count
+            )
+            diagnostics["miss_tokens"] = (
+                diagnostics.target_common_count - diagnostics.intersection
+            )
+            diagnostics["candidate_precision"] = diagnostics.intersection / k
+            diagnostics["oracle_efficiency"] = transitions[value_column] / np.minimum(
+                1.0, k / transitions.target_common_count
+            )
+            trajectory_diagnostics = diagnostics.groupby("trajectory_id")[
+                ["miss_tokens", "candidate_precision", "oracle_efficiency"]
+            ].mean()
             ci_low, ci_high = bootstrap_ci(trajectory, rng)
             overall_rows.append(
                 {
@@ -360,6 +376,15 @@ def summarize(
                     "p10_trajectory": float(trajectory.quantile(0.10)),
                     "p50_trajectory": float(trajectory.quantile(0.50)),
                     "p90_trajectory": float(trajectory.quantile(0.90)),
+                    "mean_miss_tokens": float(
+                        trajectory_diagnostics.miss_tokens.mean()
+                    ),
+                    "mean_candidate_precision": float(
+                        trajectory_diagnostics.candidate_precision.mean()
+                    ),
+                    "mean_oracle_efficiency": float(
+                        trajectory_diagnostics.oracle_efficiency.mean()
+                    ),
                     "estimated_kv_mib_per_layer_tp2": k * 2048 / 2**20,
                 }
             )
@@ -515,6 +540,24 @@ def summarize(
                     }
                 )
 
+    required_unit = pd.DataFrame(required_unit_rows)
+    required_layer_rows: list[dict[str, Any]] = []
+    for (target, layer), values in required_unit.groupby(
+        ["coverage_target", "layer"]
+    ):
+        ci_low, ci_high = bootstrap_ci(values.median_required_k, rng)
+        required_layer_rows.append(
+            {
+                "coverage_target": float(target),
+                "layer": int(layer),
+                "mean_required_k": float(values.median_required_k.mean()),
+                "ci95_low": ci_low,
+                "ci95_high": ci_high,
+                "p50_required_k": float(values.median_required_k.median()),
+                "trajectory_count": int(len(values)),
+            }
+        )
+
     return {
         "summary_by_k_overall": pd.DataFrame(overall_rows),
         "summary_by_k_layer": pd.DataFrame(layer_rows),
@@ -523,7 +566,8 @@ def summarize(
         "summary_by_normalized_k": pd.DataFrame(normalized_rows),
         "cdf_points": pd.DataFrame(cdf_rows),
         "required_k_by_transition": required_transition,
-        "required_k_by_trajectory_layer": pd.DataFrame(required_unit_rows),
+        "required_k_by_trajectory_layer": required_unit,
+        "required_k_by_layer": pd.DataFrame(required_layer_rows),
     }
 
 
@@ -568,6 +612,14 @@ def plot_results(tables: dict[str, pd.DataFrame], figure_dir: Path) -> None:
     )
     axes[0].legend(frameon=False, fontsize=7)
     axes[0].grid(alpha=0.25)
+    amplification_axis = axes[0].secondary_xaxis(
+        "top",
+        functions=(
+            lambda candidate_k: candidate_k / TARGET_K,
+            lambda amplification: amplification * TARGET_K,
+        ),
+    )
+    amplification_axis.set_xlabel("Candidate amplification K / 2048")
 
     score = overall[overall.method == "previous_score_rank"].sort_values("k")
     gain = np.diff(score.mean_coverage) / np.diff(score.k) * 256
@@ -625,6 +677,7 @@ def plot_results(tables: dict[str, pd.DataFrame], figure_dir: Path) -> None:
         ylabel="Empirical CDF",
         ylim=(0, 1.0),
     )
+    ax.set_yticks(np.linspace(0.0, 1.0, 6))
     ax.legend(frameon=False, fontsize=8)
     ax.grid(alpha=0.25)
     save_figure(fig, figure_dir / "required_k_ecdf")
@@ -642,26 +695,33 @@ def plot_results(tables: dict[str, pd.DataFrame], figure_dir: Path) -> None:
             for layer_id in range(48)
         ]
     )
-    required_unit = tables["required_k_by_trajectory_layer"]
+    required_layer = tables["required_k_by_layer"]
     fig, axes = plt.subplots(1, 2, figsize=(7.2, 4.0), layout="constrained")
     image = axes[0].imshow(matrix, aspect="auto", cmap="viridis", vmin=0, vmax=1)
     axes[0].set_xticks(range(len(ABSOLUTE_K)), ABSOLUTE_K, rotation=45)
     axes[0].set(xlabel="Candidate K", ylabel="DSA layer")
     fig.colorbar(image, ax=axes[0], label="Mean coverage")
     for color, target in zip([COLORS[0], COLORS[1]], [0.90, 0.95]):
-        values = (
-            required_unit[required_unit.coverage_target == target]
-            .groupby("layer")
-            .median_required_k.mean()
-        )
+        values = required_layer[
+            required_layer.coverage_target == target
+        ].sort_values("layer")
         axes[1].plot(
-            values.index,
-            values,
+            values.layer,
+            values.mean_required_k,
             color=color,
             label=f"Required K@{int(target * 100)}",
         )
+        axes[1].fill_between(
+            values.layer,
+            values.ci95_low,
+            values.ci95_high,
+            color=color,
+            alpha=0.14,
+        )
     axes[1].axhline(2048, color="#4D4D4D", linestyle="--", label="K=2048")
-    axes[1].set(xlabel="DSA layer", ylabel="Median required K")
+    axes[1].set(
+        xlabel="DSA layer", ylabel="Mean required K across trajectories"
+    )
     axes[1].legend(frameon=False)
     axes[1].grid(alpha=0.25)
     save_figure(fig, figure_dir / "layer_k_heatmap_and_budget")
@@ -677,6 +737,18 @@ def plot_results(tables: dict[str, pd.DataFrame], figure_dir: Path) -> None:
         ].sort_values("k")
         if not values.empty:
             axes[0].plot(values.k, values.mean_coverage, color=color, label=bucket)
+        random_values = context[
+            (context.method == "random_expectation")
+            & (context.context_bucket == bucket)
+        ].sort_values("k")
+        if not random_values.empty:
+            axes[0].plot(
+                random_values.k,
+                random_values.mean_coverage,
+                color=color,
+                linestyle="--",
+                alpha=0.50,
+            )
         frac = normalized[
             (normalized.method == "previous_score_rank")
             & (normalized.context_bucket == bucket)
@@ -688,6 +760,13 @@ def plot_results(tables: dict[str, pd.DataFrame], figure_dir: Path) -> None:
                 color=color,
                 label=bucket,
             )
+    axes[1].plot(
+        FRACTIONS,
+        FRACTIONS,
+        color="#4D4D4D",
+        linestyle="--",
+        label="Random expectation",
+    )
     axes[0].set(
         xlabel="Candidate K",
         ylabel="Mean historical top-k coverage",
@@ -698,7 +777,8 @@ def plot_results(tables: dict[str, pd.DataFrame], figure_dir: Path) -> None:
         ylabel="Mean historical top-k coverage",
         ylim=(0, 1.0),
     )
-    axes[0].legend(title="Context length", frameon=False, fontsize=7)
+    axes[0].legend(title="Context length (solid=score, dashed=random)", frameon=False, fontsize=7)
+    axes[1].legend(frameon=False, fontsize=7)
     for ax in axes:
         ax.grid(alpha=0.25)
     save_figure(fig, figure_dir / "context_length_sensitivity")
@@ -732,6 +812,13 @@ def build_summary(
                 float(score.loc[k, "ci95_high"]),
             ],
             "p10_trajectory": float(score.loc[k, "p10_trajectory"]),
+            "mean_miss_tokens": float(score.loc[k, "mean_miss_tokens"]),
+            "mean_candidate_precision": float(
+                score.loc[k, "mean_candidate_precision"]
+            ),
+            "mean_oracle_efficiency": float(
+                score.loc[k, "mean_oracle_efficiency"]
+            ),
             "estimated_kv_mib_per_layer_tp2": float(
                 score.loc[k, "estimated_kv_mib_per_layer_tp2"]
             ),
@@ -829,6 +916,13 @@ def main() -> None:
         "common_context_policy": "exclude positions not visible at previous step",
         "cdf_unit": "trajectory-layer",
         "figure_formats": ["PDF", "PNG 300 dpi"],
+        "figure_inputs": {
+            "coverage_vs_k": "tables/summary_by_k_overall.parquet",
+            "coverage_ecdf": "tables/cdf_points.parquet; unit=trajectory-layer mean",
+            "required_k_ecdf": "tables/cdf_points.parquet; unit=trajectory-layer median/p90",
+            "layer_k_heatmap_and_budget": "tables/summary_by_k_layer.parquet + tables/required_k_by_layer.parquet",
+            "context_length_sensitivity": "tables/summary_by_context_bucket.parquet + tables/summary_by_normalized_k.parquet",
+        },
     }
     (output_dir / "reproducibility.json").write_text(
         json.dumps(reproducibility, indent=2, ensure_ascii=False) + "\n"
