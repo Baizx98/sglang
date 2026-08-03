@@ -92,7 +92,7 @@ def build_lookup(
 
 def tie_audit(
     scores: np.ndarray, order: np.ndarray, stored: np.ndarray
-) -> tuple[int, int, int]:
+) -> tuple[int, int, int, float]:
     common = len(scores)
     stored = stored[(stored >= 0) & (stored < common)].astype(np.int64)
     if len(stored) != TARGET_K or len(np.unique(stored)) != TARGET_K:
@@ -104,7 +104,7 @@ def tie_audit(
     mismatch = int(2 * len(missing_from_stored))
     if mismatch == 0:
         threshold = scores[derived[-1]]
-        return 0, 0, int(np.count_nonzero(scores == threshold))
+        return 0, 0, int(np.count_nonzero(scores == threshold)), 0.0
 
     derived_mask = np.zeros(common, dtype=bool)
     derived_mask[derived] = True
@@ -114,7 +114,20 @@ def tie_audit(
         np.count_nonzero(scores[missing_from_stored] != threshold)
         + np.count_nonzero(scores[missing_from_derived] != threshold)
     )
-    return mismatch, non_tie, int(np.count_nonzero(scores == threshold))
+    # Positive regret means the online fast_topk result retained a lower-score
+    # token than the exact FP32 ranking. The CUDA kernel's own test permits a
+    # small number of boundary replacements, so record this divergence instead
+    # of silently treating the saved indices as exact score order.
+    boundary_regret = max(
+        0.0,
+        float(scores[missing_from_stored].max() - scores[missing_from_derived].min()),
+    )
+    return (
+        mismatch,
+        non_tie,
+        int(np.count_nonzero(scores == threshold)),
+        boundary_regret,
+    )
 
 
 def required_k(sorted_target_ranks: np.ndarray, quantile: float) -> int:
@@ -131,7 +144,11 @@ def analyze_transitions(
     rows: list[dict[str, Any]] = []
     exact_match_transitions = 0
     tie_only_transitions = 0
+    non_tie_transitions = 0
     mismatch_entries = 0
+    non_tie_mismatch_entries = 0
+    max_replacements = 0
+    max_boundary_regret = 0.0
     max_tie_block = 0
     new_token_selected = 0
     target_counts: defaultdict[int, int] = defaultdict(int)
@@ -173,19 +190,26 @@ def analyze_transitions(
                 target_counts[target_count] += 1
 
                 target_ranks = np.sort(ranks[target])
-                mismatch, non_tie, tie_block = tie_audit(
+                mismatch, non_tie, tie_block, boundary_regret = tie_audit(
                     previous_scores, order, indices[step]
                 )
                 if non_tie:
-                    raise ValueError(
-                        f"non-tie K=2048 reconstruction mismatch: "
-                        f"{rid}, L{layer}, step {step}, count={non_tie}"
-                    )
-                if mismatch:
+                    non_tie_transitions += 1
+                    non_tie_mismatch_entries += mismatch
+                elif mismatch:
                     tie_only_transitions += 1
-                    mismatch_entries += mismatch
                 else:
                     exact_match_transitions += 1
+                mismatch_entries += mismatch
+                replacements = mismatch // 2
+                if replacements > 5:
+                    raise ValueError(
+                        "fast_topk differs from exact FP32 ranking by more than "
+                        f"the kernel-test tolerance: {rid}, L{layer}, step {step}, "
+                        f"replacements={replacements}"
+                    )
+                max_replacements = max(max_replacements, replacements)
+                max_boundary_regret = max(max_boundary_regret, boundary_regret)
                 max_tie_block = max(max_tie_block, tie_block)
 
                 row: dict[str, Any] = {
@@ -252,8 +276,11 @@ def analyze_transitions(
         "normalized_fractions": FRACTIONS,
         "exact_k2048_reconstruction_transitions": exact_match_transitions,
         "tie_only_reconstruction_transitions": tie_only_transitions,
-        "tie_only_symmetric_difference_entries": mismatch_entries,
-        "non_tie_reconstruction_mismatches": 0,
+        "non_tie_fast_topk_divergence_transitions": non_tie_transitions,
+        "all_symmetric_difference_entries": mismatch_entries,
+        "non_tie_symmetric_difference_entries": non_tie_mismatch_entries,
+        "max_fast_topk_boundary_replacements": max_replacements,
+        "max_fast_topk_boundary_score_regret": max_boundary_regret,
         "max_kth_tie_block": max_tie_block,
         "next_new_token_selected_count": new_token_selected,
         "target_common_count_histogram": {
@@ -265,7 +292,9 @@ def analyze_transitions(
             "recency_coverage_monotonic": True,
             "coverage_within_capacity_oracle": True,
             "full_context_coverage_one": True,
-            "only_tie_k2048_mismatches": True,
+            "fast_topk_replacements_within_kernel_test_tolerance": (
+                max_replacements <= 5
+            ),
             "common_target_is_2047_or_2048": True,
         },
     }
