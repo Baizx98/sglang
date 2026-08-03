@@ -86,3 +86,17 @@ It emits per-layer step metrics, a sampled full 48-layer similarity matrix,
 semantic segment lift and cross-round stable-core metrics, stripe diagnostics,
 trace-driven candidate-set simulations, typed Parquet tables, and PDF/300 dpi
 PNG figures. Statistical intervals are clustered by trajectory.
+
+To sweep the previous-step score-ranked candidate size against the next-step
+normal top-k, reuse the schema-v4 trace without starting a model server:
+
+```bash
+.venv/bin/python scripts/keye_trace/analyze_adjacent_step_k_sweep.py \
+  --run-dir data/agent-score-trace/<run-id> \
+  --style /path/to/matplotlib_style.mplstyle
+```
+
+The analysis excludes the newly appended decode position from historical-KV
+coverage, audits score-derived K=2048 against the stored top-k, and reports
+fixed-K/normalized-K curves, ECDFs, required-K distributions, per-layer
+budgets, context-length sensitivity, and recency/random/oracle baselines.
