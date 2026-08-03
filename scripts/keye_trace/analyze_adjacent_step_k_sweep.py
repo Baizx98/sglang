@@ -21,6 +21,7 @@ import pandas as pd
 import scipy
 import torch
 from cycler import cycler
+from matplotlib.lines import Line2D
 
 TARGET_K = 2048
 ABSOLUTE_K = [512, 768, 1024, 1280, 1536, 1792, 2048, 2304, 2560, 2816, 3072]
@@ -777,7 +778,25 @@ def plot_results(tables: dict[str, pd.DataFrame], figure_dir: Path) -> None:
         ylabel="Mean historical top-k coverage",
         ylim=(0, 1.0),
     )
-    axes[0].legend(title="Context length (solid=score, dashed=random)", frameon=False, fontsize=7)
+    context_legend = axes[0].legend(
+        title="Context length", frameon=False, fontsize=7, loc="upper left"
+    )
+    axes[0].add_artist(context_legend)
+    axes[0].legend(
+        handles=[
+            Line2D([0], [0], color="#4D4D4D", label="Score rank"),
+            Line2D(
+                [0],
+                [0],
+                color="#4D4D4D",
+                linestyle="--",
+                label="Random expectation",
+            ),
+        ],
+        frameon=False,
+        fontsize=7,
+        loc="lower right",
+    )
     axes[1].legend(frameon=False, fontsize=7)
     for ax in axes:
         ax.grid(alpha=0.25)
