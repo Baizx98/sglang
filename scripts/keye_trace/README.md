@@ -132,3 +132,15 @@ The intervention uses 12 single-target requests (three from each BFCL
 category), schema budgets near 2.5k/3.5k/full tokens, and target-schema
 front/tail placement. Distractor sets are deterministic and strictly nested;
 each replay is cache-flushed and generates 16 greedy decode tokens.
+
+After replay, analyze the 48-layer intervention with:
+
+```bash
+.venv/bin/python scripts/keye_trace/analyze_schema_intervention.py \
+  --run-dir data/agent-score-trace/<intervention-run-id> \
+  --style /path/to/matplotlib_style.mplstyle
+```
+
+Decode step 0 is the primary paired comparison. Later steps are marked
+comparable only while all six variants of a source request share the same
+generated prefix.
