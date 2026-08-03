@@ -1058,6 +1058,13 @@ def evaluate_gate(tables: dict[str, pd.DataFrame], summaries: dict[str, pd.DataF
     }
     best_method = max(candidates, key=candidates.get) if candidates else None
     best_gain = candidates[best_method] - recency if best_method else math.nan
+    previous_recall = (
+        float(p.loc["previous_frequency", "mean"])
+        if "previous_frequency" in p.index
+        else math.nan
+    )
+    hybrid_recall = float(p.loc["hybrid", "mean"]) if "hybrid" in p.index else math.nan
+    hybrid_gain_vs_previous = hybrid_recall - previous_recall
     deployable = tables["placement_simulation"]
     deployable = deployable[
         (deployable.phase == "continuation")
@@ -1080,6 +1087,7 @@ def evaluate_gate(tables: dict[str, pd.DataFrame], summaries: dict[str, pd.DataF
         "current_target_tool_positive": bool(tool_ci[0] > 0),
         "placement_gain_at_least_5pp_vs_recency": bool(best_gain >= 0.05),
         "placement_gain_positive_in_at_least_3_categories": bool((category_gains > 0).sum() >= 3),
+        "hybrid_beats_previous_frequency": bool(hybrid_gain_vs_previous > 0),
     }
     return {
         "checks": checks,
@@ -1094,8 +1102,11 @@ def evaluate_gate(tables: dict[str, pd.DataFrame], summaries: dict[str, pd.DataF
         "best_semantic_method": best_method,
         "best_semantic_recall": candidates.get(best_method) if best_method else math.nan,
         "best_gain_vs_recency": best_gain,
+        "previous_frequency_recall": previous_recall,
+        "hybrid_gain_vs_previous_frequency": hybrid_gain_vs_previous,
         "hybrid_gain_vs_recency_by_category": category_gains.to_dict(),
         "oracle_relevance_is_deployable": False,
+        "policy_class": "strong" if all(checks.values()) else "weak_hint",
     }
 
 
