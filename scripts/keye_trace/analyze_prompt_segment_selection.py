@@ -935,7 +935,7 @@ def plot_results(summaries: dict[str, pd.DataFrame], figure_dir: Path) -> None:
     image = axes[0].imshow(matrix, aspect="auto", cmap="coolwarm", vmin=-limit, vmax=limit)
     axes[0].set_xticks(
         range(len(ACTIONABLE_TYPES)),
-        ["System", "Schema", "Initial", "Distractor", "User", "Call", "Result"],
+        ["Sys", "Sch", "Init", "Dist", "User", "Call", "Res"],
         fontsize=7,
     )
     axes[0].set(xlabel="Semantic type (32-token windows)", ylabel="DSA layer")
