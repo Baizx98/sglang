@@ -4,6 +4,7 @@ KeyeTopKMask 模型实现 - sglang 版本
 """
 
 import logging
+import os
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
@@ -274,12 +275,48 @@ class KeyeTopKMaskAttention(nn.Module):
         # ---- 3. 运行 Indexer 获取 top-k (如果启用) ----
         topk_indices = None
         if self.sa_indexer is not None:
+            lookahead_active = bool(
+                os.getenv("KEYE_LOOKAHEAD_TRACE_DIR", "").strip()
+                or os.getenv("KEYE_LOOKAHEAD_USE_LAYERS", "").strip()
+            )
+            if lookahead_active and self.layer_id == 0:
+                forward_batch._keye_lookahead_previous_x = None
+                forward_batch._keye_lookahead_previous_indices = None
+            previous_x = getattr(
+                forward_batch, "_keye_lookahead_previous_x", None
+            )
+            previous_indices = getattr(
+                forward_batch, "_keye_lookahead_previous_indices", None
+            )
             topk_indices = self.sa_indexer(
                 x=hidden_states,
                 positions=positions,
                 forward_batch=forward_batch,
                 layer_id=self.layer_id,
             )
+            exact_topk_indices = topk_indices
+            if (
+                lookahead_active
+                and previous_x is not None
+                and previous_indices is not None
+            ):
+                lookahead_topk_indices = self.sa_indexer.trace_cross_layer_lookahead_sm80(
+                    previous_x=previous_x,
+                    current_x=hidden_states,
+                    previous_indices=previous_indices,
+                    exact_indices=topk_indices,
+                    exact_scores=self.sa_indexer._last_sm80_scores,
+                    positions=positions,
+                    forward_batch=forward_batch,
+                    layer_id=self.layer_id,
+                )
+                if lookahead_topk_indices is not None:
+                    topk_indices = lookahead_topk_indices
+                self.sa_indexer._last_sm80_scores = None
+            if lookahead_active:
+                forward_batch._keye_lookahead_previous_x = hidden_states.detach()
+                # Keep the baseline exact set for the next layer's direct-reuse trace.
+                forward_batch._keye_lookahead_previous_indices = exact_topk_indices.detach()
 
         # ---- 4. 使用 RadixAttention (通过kwargs传递topk_indices) ----
         # topk_indices will be handled by KeyeSparseAttnBackend

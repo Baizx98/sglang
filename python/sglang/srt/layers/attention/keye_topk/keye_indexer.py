@@ -46,6 +46,9 @@ _use_sm80_dsa = os.getenv("KEYE_SM80_DSA", "0") == "1"
 _trace_counter = itertools.count()
 _trace_decode_counters: dict[Tuple[str, int], int] = {}
 _trace_chunk_buffers: dict[Tuple[str, int], list[dict[str, object]]] = {}
+_lookahead_counter = itertools.count()
+_lookahead_decode_counters: dict[Tuple[str, int], int] = {}
+_lookahead_chunk_buffers: dict[Tuple[str, int], list[dict[str, object]]] = {}
 
 DUAL_STREAM_TOKEN_THRESHOLD = 1024
 
@@ -121,6 +124,51 @@ def _trace_rid_prefix() -> str:
     return os.getenv("KEYE_SM80_TRACE_RID_PREFIX", "").strip()
 
 
+def _lookahead_trace_dir() -> Optional[Path]:
+    value = os.getenv("KEYE_LOOKAHEAD_TRACE_DIR", "").strip()
+    return Path(value) if value else None
+
+
+def _lookahead_decode_steps() -> int:
+    raw_value = os.getenv("KEYE_LOOKAHEAD_DECODE_STEPS", "32").strip()
+    try:
+        steps = int(raw_value)
+    except ValueError as exc:
+        raise ValueError("KEYE_LOOKAHEAD_DECODE_STEPS must be positive") from exc
+    if steps <= 0:
+        raise ValueError("KEYE_LOOKAHEAD_DECODE_STEPS must be positive")
+    return steps
+
+
+def _lookahead_max_k() -> int:
+    raw_value = os.getenv("KEYE_LOOKAHEAD_MAX_K", "3072").strip()
+    try:
+        max_k = int(raw_value)
+    except ValueError as exc:
+        raise ValueError("KEYE_LOOKAHEAD_MAX_K must be at least 2048") from exc
+    if max_k < 2048:
+        raise ValueError("KEYE_LOOKAHEAD_MAX_K must be at least 2048")
+    return max_k
+
+
+def _lookahead_rid_prefix() -> str:
+    return os.getenv("KEYE_LOOKAHEAD_RID_PREFIX", "").strip()
+
+
+def _lookahead_use_layers() -> set[int]:
+    raw = os.getenv("KEYE_LOOKAHEAD_USE_LAYERS", "").strip()
+    if not raw:
+        return set()
+    try:
+        layers = {int(value.strip()) for value in raw.split(",") if value.strip()}
+    except ValueError as exc:
+        raise ValueError("KEYE_LOOKAHEAD_USE_LAYERS must be comma-separated integers") from exc
+    invalid = sorted(layer for layer in layers if layer < 1)
+    if invalid:
+        raise ValueError(f"lookahead target layers must be positive: {invalid}")
+    return layers
+
+
 def _rotate_activation(x: torch.Tensor) -> torch.Tensor:
     """Hadamard transform."""
     # Upstream moved hadamard_transform out of sgl_kernel; mirror nsa_indexer.rotate_activation:
@@ -181,6 +229,7 @@ class KeyeIndexer(MultiPlatformOp):
         self.total_q_dim = num_heads * head_dim
         self.softmax_scale = head_dim**-0.5
         self.alt_stream = alt_stream
+        self._last_sm80_scores: Optional[torch.Tensor] = None
 
         assert main_head_dim is not None, (
             "main_head_dim is required for mrope_section scaling"
@@ -410,6 +459,9 @@ class KeyeIndexer(MultiPlatformOp):
         if _use_sm80_dsa:
             result, trace_scores = self._forward_sm80(
                 x, positions, forward_batch, layer_id, metadata
+            )
+            self._last_sm80_scores = (
+                trace_scores if _lookahead_trace_dir() is not None else None
             )
             self._dump_topk_sm80(
                 result, trace_scores, positions, forward_batch, layer_id
@@ -1048,6 +1100,276 @@ class KeyeIndexer(MultiPlatformOp):
                 result[q_offset + start : q_offset + end] = indices
             q_offset += extend_len
         return result, None
+
+    def _topk_with_lengths(
+        self, scores: torch.Tensor, lengths: torch.Tensor, topk: int
+    ) -> torch.Tensor:
+        """Return exact score-ranked indices with -1 padding to ``topk``."""
+        width = min(topk, scores.shape[1])
+        cols = torch.arange(scores.shape[1], device=scores.device).unsqueeze(0)
+        masked_scores = scores.masked_fill(cols >= lengths.unsqueeze(1), -float("inf"))
+        values, indices = torch.topk(masked_scores, width, dim=-1)
+        indices = indices.to(torch.int32).masked_fill(~values.isfinite(), -1)
+        if width == topk:
+            return indices
+        output = torch.full(
+            (scores.shape[0], topk), -1, dtype=torch.int32, device=scores.device
+        )
+        output[:, :width] = indices
+        return output
+
+    def trace_cross_layer_lookahead_sm80(
+        self,
+        *,
+        previous_x: torch.Tensor,
+        current_x: torch.Tensor,
+        previous_indices: torch.Tensor,
+        exact_indices: torch.Tensor,
+        exact_scores: Optional[torch.Tensor],
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+    ) -> Optional[torch.Tensor]:
+        """Record shadow scores and optionally return top-k for selected layers."""
+        trace_dir = _lookahead_trace_dir()
+        use_for_attention = layer_id in _lookahead_use_layers()
+        record_enabled = trace_dir is not None and torch.cuda.current_device() == 0
+        if (not record_enabled and not use_for_attention) or not _use_sm80_dsa:
+            return None
+        if layer_id <= 0 or not forward_batch.forward_mode.is_decode():
+            return None
+        if previous_x.shape != current_x.shape:
+            return None
+        if record_enabled and exact_scores is None:
+            return None
+
+        request_ids = list(getattr(forward_batch, "rids", None) or [])
+        if len(request_ids) != exact_indices.shape[0]:
+            return None
+        rid_prefix = _lookahead_rid_prefix()
+        step_limit = _lookahead_decode_steps()
+        selected_rows: list[int] = []
+        decode_steps: list[int] = []
+        selected_request_ids: list[str] = []
+        if record_enabled:
+            for row_index, request_id in enumerate(request_ids):
+                if rid_prefix and not request_id.startswith(rid_prefix):
+                    continue
+                counter_key = (request_id, layer_id)
+                decode_step = _lookahead_decode_counters.get(counter_key, 0)
+                _lookahead_decode_counters[counter_key] = decode_step + 1
+                if decode_step >= step_limit:
+                    continue
+                selected_rows.append(row_index)
+                decode_steps.append(decode_step)
+                selected_request_ids.append(request_id)
+        if not selected_rows and not use_for_attention:
+            return None
+
+        metadata = forward_batch.attn_backend.get_indexer_metadata(
+            layer_id, forward_batch
+        )
+        if metadata is None:
+            return None
+        query, _, weights = self._get_q_k_w_bf16(
+            previous_x, positions, enable_dual_stream=False
+        )
+        pool = forward_batch.token_to_kv_pool
+        key_cache = pool.get_index_k_bf16_buffer(layer_id)
+        page_table = metadata.get_page_table_1()
+        seqlens = metadata.get_seqlens_int32()
+        from sglang.srt.layers.attention.keye_topk.ampere_indexer import (
+            keye_indexer_score_paged,
+        )
+
+        lookahead_scores = keye_indexer_score_paged(
+            query,
+            key_cache,
+            page_table,
+            weights,
+            seqlens,
+            self.softmax_scale,
+        )
+        max_k = max(_lookahead_max_k(), self.topk)
+        history_lengths = torch.clamp(seqlens - 1, min=0)
+        history_indices = self._topk_with_lengths(
+            lookahead_scores, history_lengths, max_k - 1
+        )
+        self_indices = (seqlens - 1).to(torch.int32).unsqueeze(1)
+        lookahead_indices = torch.cat((self_indices, history_indices), dim=1)
+
+        selfcheck_max_abs: Optional[torch.Tensor] = None
+        selfcheck_topk_equal: Optional[torch.Tensor] = None
+        if record_enabled and os.getenv("KEYE_LOOKAHEAD_SELFCHECK", "0") == "1" and any(
+            step == 0 for step in decode_steps
+        ):
+            exact_query, _, exact_weights = self._get_q_k_w_bf16(
+                current_x, positions, enable_dual_stream=False
+            )
+            recomputed_scores = keye_indexer_score_paged(
+                exact_query,
+                key_cache,
+                page_table,
+                exact_weights,
+                seqlens,
+                self.softmax_scale,
+            )
+            valid_mask = torch.arange(
+                exact_scores.shape[1], device=exact_scores.device
+            ).unsqueeze(0) < seqlens.unsqueeze(1)
+            difference = torch.where(
+                valid_mask,
+                (recomputed_scores - exact_scores).abs(),
+                torch.zeros_like(exact_scores),
+            )
+            selfcheck_max_abs = difference.max(dim=1).values
+            recomputed_topk = self._topk_sm80(recomputed_scores, seqlens)
+            selfcheck_topk_equal = torch.sort(recomputed_topk, dim=1).values.eq(
+                torch.sort(exact_indices, dim=1).values
+            ).all(dim=1)
+
+        if trace_dir is not None and selected_rows:
+            trace_dir.mkdir(parents=True, exist_ok=True)
+        for list_index, row_index in enumerate(selected_rows):
+            valid_count = int(seqlens[row_index].item())
+            row = {
+                "decode_step_id": decode_steps[list_index],
+                "valid_count": valid_count,
+                "exact_indices": exact_indices[row_index].detach().to(
+                    device="cpu", dtype=torch.int32
+                ),
+                "lookahead_indices": lookahead_indices[row_index].detach().to(
+                    device="cpu", dtype=torch.int32
+                ),
+                "direct_reuse_indices": previous_indices[row_index].detach().to(
+                    device="cpu", dtype=torch.int32
+                ),
+                "exact_scores": exact_scores[row_index, :valid_count].detach().to(
+                    device="cpu", dtype=torch.float32
+                ),
+                "lookahead_scores": lookahead_scores[
+                    row_index, :valid_count
+                ].detach().to(device="cpu", dtype=torch.float32),
+                "selfcheck_max_abs": (
+                    float(selfcheck_max_abs[row_index].item())
+                    if selfcheck_max_abs is not None and decode_steps[list_index] == 0
+                    else None
+                ),
+                "selfcheck_topk_equal": (
+                    bool(selfcheck_topk_equal[row_index].item())
+                    if selfcheck_topk_equal is not None
+                    and decode_steps[list_index] == 0
+                    else None
+                ),
+            }
+            self._append_lookahead_chunk_row(
+                # selected_rows is populated only when trace_dir is non-null.
+                trace_dir=trace_dir,
+                request_id=selected_request_ids[list_index],
+                target_layer_id=layer_id,
+                max_k=max_k,
+                chunk_steps=step_limit,
+                row=row,
+            )
+        if use_for_attention:
+            return lookahead_indices[:, : self.topk]
+        return None
+
+    def _append_lookahead_chunk_row(
+        self,
+        *,
+        trace_dir: Path,
+        request_id: str,
+        target_layer_id: int,
+        max_k: int,
+        chunk_steps: int,
+        row: dict[str, object],
+    ) -> None:
+        buffer_key = (request_id, target_layer_id)
+        rows = _lookahead_chunk_buffers.setdefault(buffer_key, [])
+        rows.append(row)
+        if len(rows) < chunk_steps:
+            return
+        if len(rows) > chunk_steps:
+            raise RuntimeError(f"Lookahead chunk overflow for {buffer_key}")
+        rows.sort(key=lambda value: int(value["decode_step_id"]))
+        decode_step_ids = [int(value["decode_step_id"]) for value in rows]
+        if decode_step_ids != list(range(chunk_steps)):
+            raise RuntimeError(
+                f"Non-contiguous lookahead steps for {buffer_key}: {decode_step_ids}"
+            )
+
+        valid_counts = torch.tensor(
+            [int(value["valid_count"]) for value in rows], dtype=torch.int32
+        )
+        score_width = int(valid_counts.max().item())
+        exact_scores = torch.full(
+            (chunk_steps, score_width), float("nan"), dtype=torch.float32
+        )
+        lookahead_scores = torch.full_like(exact_scores, float("nan"))
+        for row_index, value in enumerate(rows):
+            valid_count = int(value["valid_count"])
+            exact_scores[row_index, :valid_count] = value["exact_scores"]
+            lookahead_scores[row_index, :valid_count] = value["lookahead_scores"]
+
+        event_id = next(_lookahead_counter)
+        timestamp_ns = time.time_ns()
+        safe_request_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", request_id)[:96]
+        file_name = (
+            f"chunk_{event_id:09d}_{safe_request_id}_target_layer_"
+            f"{target_layer_id:02d}_steps_000-{chunk_steps - 1:03d}.pt"
+        )
+        final_path = trace_dir / file_name
+        temp_path = trace_dir / f".{file_name}.tmp"
+        record = {
+            "schema_version": 1,
+            "event_id": event_id,
+            "timestamp_ns": timestamp_ns,
+            "request_id": request_id,
+            "source_layer_id": target_layer_id - 1,
+            "target_layer_id": target_layer_id,
+            "decode_step_ids": decode_step_ids,
+            "valid_counts": valid_counts,
+            "exact_indices": torch.stack(
+                [value["exact_indices"] for value in rows]
+            ).to(torch.int32),
+            "lookahead_indices": torch.stack(
+                [value["lookahead_indices"] for value in rows]
+            ).to(torch.int32),
+            "direct_reuse_indices": torch.stack(
+                [value["direct_reuse_indices"] for value in rows]
+            ).to(torch.int32),
+            "exact_scores": exact_scores,
+            "lookahead_scores": lookahead_scores,
+            "selfcheck_max_abs": [value["selfcheck_max_abs"] for value in rows],
+            "selfcheck_topk_equal": [
+                value["selfcheck_topk_equal"] for value in rows
+            ],
+            "max_k": max_k,
+            "self_token_forced": True,
+            "canonical_historical_k_cache": True,
+        }
+        torch.save(record, temp_path)
+        os.replace(temp_path, final_path)
+        manifest_record = {
+            "schema_version": 1,
+            "event_id": event_id,
+            "timestamp_ns": timestamp_ns,
+            "file": file_name,
+            "request_id": request_id,
+            "source_layer_id": target_layer_id - 1,
+            "target_layer_id": target_layer_id,
+            "num_steps": chunk_steps,
+            "score_width": score_width,
+            "exact_topk": int(record["exact_indices"].shape[1]),
+            "lookahead_max_k": max_k,
+            "valid_min": int(valid_counts.min().item()),
+            "valid_max": int(valid_counts.max().item()),
+            "bytes": final_path.stat().st_size,
+        }
+        with (trace_dir / "manifest.jsonl").open("a", encoding="utf-8") as file:
+            file.write(json.dumps(manifest_record, separators=(",", ":")) + "\n")
+        del _lookahead_chunk_buffers[buffer_key]
 
     def _get_topk_ragged(
         self,
