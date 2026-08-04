@@ -695,7 +695,7 @@ def prepare_files(args: argparse.Namespace) -> list[dict[str, Any]]:
         "case_ids": args.case_ids,
         "limit_rounds": args.limit_rounds,
         "max_new_tokens": args.max_new_tokens,
-        "ignore_eos": True,
+        "ignore_eos": args.ignore_eos,
         "temperature": 0,
     }
     write_json(args.output_dir / "run_config.json", run_config)
@@ -726,7 +726,7 @@ def run_requests(args: argparse.Namespace, requests: list[dict[str, Any]]) -> No
             "sampling_params": {
                 "temperature": 0,
                 "max_new_tokens": args.max_new_tokens,
-                "ignore_eos": True,
+                "ignore_eos": args.ignore_eos,
             },
             "stream": False,
             "rid": actual_rid,
@@ -762,6 +762,12 @@ def run_requests(args: argparse.Namespace, requests: list[dict[str, Any]]) -> No
             ),
             flush=True,
         )
+    from audit_inference_outputs import audit_run
+
+    audit = audit_run(args.output_dir)
+    print(json.dumps({"inference_output_audit": audit}, ensure_ascii=False), flush=True)
+    if not audit["passed"]:
+        raise RuntimeError("inference output audit failed")
 
 
 def parse_args() -> argparse.Namespace:
@@ -780,6 +786,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--case-ids", nargs="*")
     parser.add_argument("--limit-rounds", type=int)
     parser.add_argument("--max-new-tokens", type=int, default=64)
+    parser.add_argument(
+        "--ignore-eos",
+        action="store_true",
+        help="force a fixed decode length; disabled by default to preserve valid output",
+    )
     parser.add_argument("--timeout", type=float, default=600)
     parser.add_argument("--prepare-only", action="store_true")
     parser.add_argument("--reuse-prepared", action="store_true")

@@ -321,7 +321,7 @@ def prepare_files(args: argparse.Namespace) -> list[dict[str, Any]]:
             "sampling": {
                 "temperature": 0,
                 "max_new_tokens": args.max_new_tokens,
-                "ignore_eos": True,
+                "ignore_eos": args.ignore_eos,
                 "concurrency": 1,
             },
         },
@@ -348,7 +348,7 @@ def run_requests(args: argparse.Namespace, requests: list[dict[str, Any]]) -> No
                 "sampling_params": {
                     "temperature": 0,
                     "max_new_tokens": args.max_new_tokens,
-                    "ignore_eos": True,
+                    "ignore_eos": args.ignore_eos,
                 },
                 "stream": False,
                 "rid": request["rid"],
@@ -382,6 +382,16 @@ def run_requests(args: argparse.Namespace, requests: list[dict[str, Any]]) -> No
             f"prompt={request['prompt_len']} latency={latency_s:.3f}s",
             flush=True,
         )
+    from audit_inference_outputs import audit_run
+
+    audit = audit_run(
+        args.output_dir,
+        min_target_mention_rate=args.min_target_mention_rate,
+        allow_partial=args.request_limit is not None,
+    )
+    print(json.dumps({"inference_output_audit": audit}, ensure_ascii=False), flush=True)
+    if not audit["passed"]:
+        raise RuntimeError("inference output audit failed")
 
 
 def parse_args() -> argparse.Namespace:
@@ -391,7 +401,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--base-url", default="http://127.0.0.1:30000")
     parser.add_argument("--model", default="/Tan/model/Keye-VL-2.0-30B-A3B")
-    parser.add_argument("--max-new-tokens", type=int, default=16)
+    parser.add_argument("--max-new-tokens", type=int, default=256)
+    parser.add_argument(
+        "--ignore-eos",
+        action="store_true",
+        help="force a fixed decode length; disabled by default to preserve valid output",
+    )
+    parser.add_argument("--min-target-mention-rate", type=float, default=0.9)
+    parser.add_argument("--request-limit", type=int)
     parser.add_argument("--timeout", type=float, default=600)
     parser.add_argument("--prepare-only", action="store_true")
     parser.add_argument("--reuse-prepared", action="store_true")
@@ -405,6 +422,8 @@ def main() -> None:
         if args.reuse_prepared
         else prepare_files(args)
     )
+    if args.request_limit is not None:
+        requests = requests[: args.request_limit]
     if not args.prepare_only:
         run_requests(args, requests)
 

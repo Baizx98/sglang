@@ -22,6 +22,12 @@ export KEYE_SM80_TRACE_RID_PREFIX=bfclseg__
 int32 top-k indices, valid score length, request ID, layer ID, and decode step
 in one record.
 
+The replay scripts always persist the full SGLang response in
+`requests.jsonl`, including generated text, `output_ids`, finish reason, prompt
+and completion token counts, and latency. They respect EOS by default so saved
+responses remain valid inference outputs. Use `--ignore-eos` only when a fixed
+decode length is explicitly more important than response quality.
+
 With `KEYE_SM80_TRACE_CHUNK_STEPS` enabled, schema v4 stores one atomic file
 per `(request ID, layer)` chunk. This avoids creating one small file per decode
 step while retaining FP32 scores and int32 top-k indices. The optional request
@@ -59,6 +65,45 @@ to SGLang:
 ```
 
 ## Analysis
+
+Before collecting a large trace, validate the SM80 attention kernel directly
+against a PyTorch reference on both target GPUs:
+
+```bash
+.venv/bin/python scripts/keye_trace/validate_keye_dsa_attention.py \
+  --output data/kernel-validation/<run-id>/results.json
+```
+
+The validator covers BF16/FP16, decode split-K, prefill, ragged padded top-k,
+and the physical KV-slot adapter at Keye's real 32-query-head, 4-KV-head,
+128-head-dimension, K=2048 shape.
+
+Every segmented or schema-intervention replay automatically audits the saved
+outputs after inference. Existing runs can be checked independently with:
+
+```bash
+.venv/bin/python scripts/keye_trace/audit_inference_outputs.py \
+  --run-dir data/agent-score-trace/<run-id>
+```
+
+The audit checks response/token metadata, finite latency, invalid characters,
+pathological repetition, finish reason, and whether the expected BFCL tool and
+ground-truth constants appear. Semantic checks are diagnostics rather than a
+replacement for the official BFCL evaluator.
+
+For a controlled trace-on versus trace-off smoke test, keep the model,
+requests, random seed, and sampling settings fixed, then compare outputs with:
+
+```bash
+.venv/bin/python scripts/keye_trace/compare_inference_outputs.py \
+  --reference-run data/<reference-run> \
+  --candidate-run data/<trace-run> \
+  --output data/<comparison.json>
+```
+
+The report includes exact equality and the common generated-token prefix. A
+TP/MoE baseline can be non-deterministic even with greedy decoding, so exact
+inequality must be interpreted against a repeated trace-off baseline.
 
 `analyze_score_trace.py` validates the full `9 requests × 8 layers × 32 steps`
 grid, writes typed Parquet tables, and exports PDF plus 300 dpi PNG figures.
@@ -131,7 +176,8 @@ strictly nested budget/position variants with:
 The intervention uses 12 single-target requests (three from each BFCL
 category), schema budgets near 2.5k/3.5k/full tokens, and target-schema
 front/tail placement. Distractor sets are deterministic and strictly nested;
-each replay is cache-flushed and generates 16 greedy decode tokens.
+each replay is cache-flushed and generates up to 256 greedy decode tokens,
+stopping at EOS by default.
 
 After replay, analyze the 48-layer intervention with:
 
