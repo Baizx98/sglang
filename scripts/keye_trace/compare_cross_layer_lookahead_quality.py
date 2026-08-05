@@ -39,6 +39,10 @@ def main() -> None:
     parser.add_argument("--exact-run", type=Path, required=True)
     parser.add_argument("--selective-run", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument(
+        "--comparison-label",
+        default="exact DSA vs calibration-selected synchronous lookahead K=2048",
+    )
     args = parser.parse_args()
     exact_run = args.exact_run.resolve()
     selective_run = args.selective_run.resolve()
@@ -76,6 +80,7 @@ def main() -> None:
                 "exact_output_tokens": len(exact_ids),
                 "selective_output_tokens": len(selective_ids),
                 "output_exact_match": exact_ids == selective_ids,
+                "comparable_prefix_exact_match": prefix == comparable,
                 "common_prefix_tokens": prefix,
                 "common_prefix_fraction": prefix / comparable if comparable else math.nan,
                 "position_token_agreement": (
@@ -104,7 +109,7 @@ def main() -> None:
     frame.to_parquet(output_dir / "request_quality_comparison.parquet", index=False)
     summary: dict[str, Any] = {
         "schema_version": 1,
-        "comparison": "exact DSA vs calibration-selected synchronous lookahead K=2048",
+        "comparison": args.comparison_label,
         "request_count": len(frame),
         "splits": {},
         "phase_c_proceed": False,
@@ -133,6 +138,9 @@ def main() -> None:
         summary["splits"][split] = {
             "request_count": len(group),
             "output_exact_match_count": int(group["output_exact_match"].sum()),
+            "comparable_prefix_exact_match_count": int(
+                group["comparable_prefix_exact_match"].sum()
+            ),
             "common_prefix_tokens_median": finite_or_none(group["common_prefix_tokens"].median()),
             "position_token_agreement_mean": finite_or_none(group["position_token_agreement"].mean()),
             "sequence_match_ratio_mean": finite_or_none(group["sequence_match_ratio"].mean()),

@@ -49,6 +49,9 @@ _trace_chunk_buffers: dict[Tuple[str, int], list[dict[str, object]]] = {}
 _lookahead_counter = itertools.count()
 _lookahead_decode_counters: dict[Tuple[str, int], int] = {}
 _lookahead_chunk_buffers: dict[Tuple[str, int], list[dict[str, object]]] = {}
+_rescore_counter = itertools.count()
+_rescore_decode_counters: dict[Tuple[str, int], int] = {}
+_rescore_chunk_buffers: dict[Tuple[str, int], list[dict[str, object]]] = {}
 
 DUAL_STREAM_TOKEN_THRESHOLD = 1024
 
@@ -167,6 +170,57 @@ def _lookahead_use_layers() -> set[int]:
     if invalid:
         raise ValueError(f"lookahead target layers must be positive: {invalid}")
     return layers
+
+
+def _rescore_candidate_k() -> int:
+    raw_value = os.getenv("KEYE_RESCORE_CANDIDATE_K", "3072").strip()
+    try:
+        candidate_k = int(raw_value)
+    except ValueError as exc:
+        raise ValueError("KEYE_RESCORE_CANDIDATE_K must be at least 2048") from exc
+    if candidate_k < 2048:
+        raise ValueError("KEYE_RESCORE_CANDIDATE_K must be at least 2048")
+    return candidate_k
+
+
+def _rescore_use_layers() -> set[int]:
+    raw = os.getenv("KEYE_RESCORE_USE_LAYERS", "").strip()
+    if not raw:
+        return set()
+    try:
+        layers = {int(value.strip()) for value in raw.split(",") if value.strip()}
+    except ValueError as exc:
+        raise ValueError("KEYE_RESCORE_USE_LAYERS must be comma-separated integers") from exc
+    invalid = sorted(layer for layer in layers if layer < 1)
+    if invalid:
+        raise ValueError(f"rescore target layers must be positive: {invalid}")
+    return layers
+
+
+def _rescore_enabled() -> bool:
+    """Allow request-boundary exact/rescore A/B tests in one loaded server."""
+    control_file = os.getenv("KEYE_RESCORE_ENABLE_FILE", "").strip()
+    return not control_file or Path(control_file).is_file()
+
+
+def _rescore_trace_dir() -> Optional[Path]:
+    value = os.getenv("KEYE_RESCORE_TRACE_DIR", "").strip()
+    return Path(value) if value else None
+
+
+def _rescore_decode_steps() -> int:
+    raw_value = os.getenv("KEYE_RESCORE_DECODE_STEPS", "32").strip()
+    try:
+        steps = int(raw_value)
+    except ValueError as exc:
+        raise ValueError("KEYE_RESCORE_DECODE_STEPS must be positive") from exc
+    if steps <= 0:
+        raise ValueError("KEYE_RESCORE_DECODE_STEPS must be positive")
+    return steps
+
+
+def _rescore_rid_prefix() -> str:
+    return os.getenv("KEYE_RESCORE_RID_PREFIX", "").strip()
 
 
 def _rotate_activation(x: torch.Tensor) -> torch.Tensor:
@@ -1117,6 +1171,280 @@ class KeyeIndexer(MultiPlatformOp):
         )
         output[:, :width] = indices
         return output
+
+    def forward_cross_layer_rescore_sm80(
+        self,
+        *,
+        previous_x: torch.Tensor,
+        current_x: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+    ) -> Optional[torch.Tensor]:
+        """Synchronously build lookahead candidates and exactly rescore them."""
+        if (
+            not _use_sm80_dsa
+            or not _rescore_enabled()
+            or layer_id not in _rescore_use_layers()
+        ):
+            return None
+        if layer_id <= 0 or not forward_batch.forward_mode.is_decode():
+            return None
+        if previous_x.shape != current_x.shape or current_x.shape[0] == 0:
+            return None
+        if get_is_capture_mode():
+            # The experiment path has not yet registered fixed-shape graph buffers.
+            return None
+
+        metadata = forward_batch.attn_backend.get_indexer_metadata(
+            layer_id, forward_batch
+        )
+        if metadata is None:
+            return None
+
+        pool = forward_batch.token_to_kv_pool
+        if not hasattr(pool, "index_head_dim"):
+            return None
+        key_cache = pool.get_index_k_bf16_buffer(layer_id)
+        page_table = metadata.get_page_table_1()
+        seqlens = metadata.get_seqlens_int32()
+        candidate_k = _rescore_candidate_k()
+
+        from sglang.srt.layers.attention.keye_topk.ampere_indexer import (
+            keye_indexer_score_candidates,
+            keye_indexer_score_paged,
+        )
+
+        # Candidate generation intentionally uses only historical target-layer K.
+        lookahead_query, _, lookahead_weights = self._get_q_k_w_bf16(
+            previous_x, positions, enable_dual_stream=False
+        )
+        lookahead_scores = keye_indexer_score_paged(
+            lookahead_query,
+            key_cache,
+            page_table,
+            lookahead_weights,
+            torch.clamp(seqlens - 1, min=0),
+            self.softmax_scale,
+        )
+        history_lengths = torch.clamp(seqlens - 1, min=0)
+        history_indices = self._topk_with_lengths(
+            lookahead_scores, history_lengths, candidate_k - 1
+        )
+        self_indices = (seqlens - 1).to(torch.int32).unsqueeze(1)
+        candidate_indices = torch.cat((self_indices, history_indices), dim=1)
+
+        # Only exact current-layer K is allowed to mutate the canonical cache.
+        exact_query, exact_key, exact_weights = self._get_q_k_w_bf16(
+            current_x, positions, enable_dual_stream=False
+        )
+        loc = forward_batch.out_cache_loc
+        if loc.dtype != torch.long:
+            loc = loc.to(dtype=torch.long)
+        pool.set_index_k_bf16_buffer(layer_id, loc, exact_key)
+
+        candidate_scores = keye_indexer_score_candidates(
+            exact_query,
+            key_cache,
+            page_table,
+            candidate_indices,
+            exact_weights,
+            seqlens,
+            self.softmax_scale,
+        )
+        candidate_lengths = torch.clamp(seqlens, max=candidate_k).to(torch.int32)
+        candidate_offsets = self._topk_sm80(candidate_scores, candidate_lengths)
+        safe_offsets = candidate_offsets.clamp_min(0).to(torch.long)
+        final_indices = candidate_indices.gather(1, safe_offsets)
+        final_indices = final_indices.masked_fill(candidate_offsets < 0, -1)
+
+        trace_dir = _rescore_trace_dir()
+        verify_full = trace_dir is not None or os.getenv(
+            "KEYE_RESCORE_VERIFY_FULL", "0"
+        ) == "1"
+        if verify_full:
+            full_scores = keye_indexer_score_paged(
+                exact_query,
+                key_cache,
+                page_table,
+                exact_weights,
+                seqlens,
+                self.softmax_scale,
+            )
+            exact_indices = self._topk_sm80(full_scores, seqlens)
+            safe_candidates = candidate_indices.clamp_min(0).to(torch.long)
+            gathered_full_scores = full_scores.gather(1, safe_candidates)
+            valid_candidates = candidate_indices >= 0
+            score_difference = torch.where(
+                valid_candidates,
+                (candidate_scores - gathered_full_scores).abs(),
+                torch.zeros_like(candidate_scores),
+            )
+            max_score_difference = score_difference.max(dim=1).values
+            if trace_dir is not None:
+                self._trace_cross_layer_rescore_sm80(
+                    trace_dir=trace_dir,
+                    candidate_indices=candidate_indices,
+                    final_indices=final_indices,
+                    exact_indices=exact_indices,
+                    max_score_difference=max_score_difference,
+                    seqlens=seqlens,
+                    forward_batch=forward_batch,
+                    layer_id=layer_id,
+                    candidate_k=candidate_k,
+                )
+            if not torch.all(max_score_difference == 0):
+                raise RuntimeError(
+                    "restricted candidate scores differ from the full exact scorer: "
+                    f"max_abs={float(max_score_difference.max().item())}"
+                )
+
+        return final_indices
+
+    def _trace_cross_layer_rescore_sm80(
+        self,
+        *,
+        trace_dir: Path,
+        candidate_indices: torch.Tensor,
+        final_indices: torch.Tensor,
+        exact_indices: torch.Tensor,
+        max_score_difference: torch.Tensor,
+        seqlens: torch.Tensor,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        candidate_k: int,
+    ) -> None:
+        """Persist compact per-request fidelity records for restricted rescoring."""
+        if torch.cuda.current_device() != 0:
+            return
+        request_ids = list(getattr(forward_batch, "rids", None) or [])
+        if len(request_ids) != candidate_indices.shape[0]:
+            return
+
+        rid_prefix = _rescore_rid_prefix()
+        step_limit = _rescore_decode_steps()
+        trace_dir.mkdir(parents=True, exist_ok=True)
+        for row_index, request_id in enumerate(request_ids):
+            if rid_prefix and not request_id.startswith(rid_prefix):
+                continue
+            counter_key = (request_id, layer_id)
+            decode_step = _rescore_decode_counters.get(counter_key, 0)
+            _rescore_decode_counters[counter_key] = decode_step + 1
+            if decode_step >= step_limit:
+                continue
+            self._append_rescore_chunk_row(
+                trace_dir=trace_dir,
+                request_id=request_id,
+                target_layer_id=layer_id,
+                candidate_k=candidate_k,
+                chunk_steps=step_limit,
+                row={
+                    "decode_step_id": decode_step,
+                    "valid_count": int(seqlens[row_index].item()),
+                    "candidate_indices": candidate_indices[row_index]
+                    .detach()
+                    .to(device="cpu", dtype=torch.int32),
+                    "final_indices": final_indices[row_index]
+                    .detach()
+                    .to(device="cpu", dtype=torch.int32),
+                    "exact_indices": exact_indices[row_index]
+                    .detach()
+                    .to(device="cpu", dtype=torch.int32),
+                    "candidate_score_max_abs": float(
+                        max_score_difference[row_index].item()
+                    ),
+                },
+            )
+
+    def _append_rescore_chunk_row(
+        self,
+        *,
+        trace_dir: Path,
+        request_id: str,
+        target_layer_id: int,
+        candidate_k: int,
+        chunk_steps: int,
+        row: dict[str, object],
+    ) -> None:
+        buffer_key = (request_id, target_layer_id)
+        rows = _rescore_chunk_buffers.setdefault(buffer_key, [])
+        rows.append(row)
+        if len(rows) < chunk_steps:
+            return
+        if len(rows) > chunk_steps:
+            raise RuntimeError(f"Rescore trace chunk overflow for {buffer_key}")
+
+        rows.sort(key=lambda value: int(value["decode_step_id"]))
+        decode_step_ids = [int(value["decode_step_id"]) for value in rows]
+        if decode_step_ids != list(range(chunk_steps)):
+            raise RuntimeError(
+                f"Non-contiguous rescore steps for {buffer_key}: {decode_step_ids}"
+            )
+
+        event_id = next(_rescore_counter)
+        timestamp_ns = time.time_ns()
+        safe_request_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", request_id)[:96]
+        file_name = (
+            f"chunk_{event_id:09d}_{safe_request_id}_target_layer_"
+            f"{target_layer_id:02d}_steps_000-{chunk_steps - 1:03d}.pt"
+        )
+        final_path = trace_dir / file_name
+        temp_path = trace_dir / f".{file_name}.tmp"
+        valid_counts = torch.tensor(
+            [int(value["valid_count"]) for value in rows], dtype=torch.int32
+        )
+        record = {
+            "schema_version": 1,
+            "event_id": event_id,
+            "timestamp_ns": timestamp_ns,
+            "request_id": request_id,
+            "source_layer_id": target_layer_id - 1,
+            "target_layer_id": target_layer_id,
+            "decode_step_ids": decode_step_ids,
+            "valid_counts": valid_counts,
+            "candidate_k": candidate_k,
+            "final_topk": self.topk,
+            "candidate_indices": torch.stack(
+                [value["candidate_indices"] for value in rows]
+            ).to(torch.int32),
+            "final_indices": torch.stack(
+                [value["final_indices"] for value in rows]
+            ).to(torch.int32),
+            "exact_indices": torch.stack(
+                [value["exact_indices"] for value in rows]
+            ).to(torch.int32),
+            "candidate_score_max_abs": torch.tensor(
+                [value["candidate_score_max_abs"] for value in rows],
+                dtype=torch.float32,
+            ),
+            "self_token_forced_into_candidate": True,
+            "final_self_token_forced": False,
+            "canonical_exact_k_cache": True,
+            "synchronous": True,
+        }
+        torch.save(record, temp_path)
+        os.replace(temp_path, final_path)
+        manifest_record = {
+            "schema_version": 1,
+            "event_id": event_id,
+            "timestamp_ns": timestamp_ns,
+            "file": file_name,
+            "request_id": request_id,
+            "source_layer_id": target_layer_id - 1,
+            "target_layer_id": target_layer_id,
+            "num_steps": chunk_steps,
+            "candidate_k": candidate_k,
+            "final_topk": self.topk,
+            "valid_min": int(valid_counts.min().item()),
+            "valid_max": int(valid_counts.max().item()),
+            "max_candidate_score_abs": max(
+                float(value["candidate_score_max_abs"]) for value in rows
+            ),
+            "bytes": final_path.stat().st_size,
+        }
+        with (trace_dir / "manifest.jsonl").open("a", encoding="utf-8") as file:
+            file.write(json.dumps(manifest_record, separators=(",", ":")) + "\n")
+        del _rescore_chunk_buffers[buffer_key]
 
     def trace_cross_layer_lookahead_sm80(
         self,
