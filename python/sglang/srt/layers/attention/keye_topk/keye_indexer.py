@@ -61,6 +61,14 @@ DUAL_STREAM_TOKEN_THRESHOLD = 1024
 # ---------------------------------------------------------------------------
 
 
+def _use_exact_topk_sm80() -> bool:
+    """Return whether SM80 experiments require an exact FP32 top-k."""
+    raw_value = os.getenv("KEYE_SM80_EXACT_TOPK", "0").strip()
+    if raw_value not in {"0", "1"}:
+        raise ValueError("KEYE_SM80_EXACT_TOPK must be either '0' or '1'")
+    return raw_value == "1"
+
+
 def _should_trace_layer(layer_id: int) -> bool:
     """Return whether the configured top-k trace includes ``layer_id``."""
     layer_spec = os.getenv("KEYE_SM80_TRACE_LAYERS", "all").strip()
@@ -87,9 +95,88 @@ def _should_trace_layer(layer_id: int) -> bool:
 def _trace_mode() -> str:
     """Return the configured payload mode for SM80 trace records."""
     mode = os.getenv("KEYE_SM80_TRACE_MODE", "topk").strip().lower()
-    if mode not in {"topk", "score", "both"}:
-        raise ValueError("KEYE_SM80_TRACE_MODE must be 'topk', 'score', or 'both'")
+    if mode not in {"topk", "score", "both", "compact"}:
+        raise ValueError(
+            "KEYE_SM80_TRACE_MODE must be 'topk', 'score', 'both', or 'compact'"
+        )
     return mode
+
+
+def _trace_compact_k() -> int:
+    """Return the ranked candidate width saved by compact schema v5."""
+    raw_value = os.getenv("KEYE_SM80_TRACE_COMPACT_K", "4096").strip()
+    try:
+        compact_k = int(raw_value)
+    except ValueError as exc:
+        raise ValueError("KEYE_SM80_TRACE_COMPACT_K must be at least 2048") from exc
+    if compact_k < 2048:
+        raise ValueError("KEYE_SM80_TRACE_COMPACT_K must be at least 2048")
+    return compact_k
+
+
+def _trace_compact_ranks() -> list[int]:
+    """Return score-rank thresholds retained by compact schema v5."""
+    raw_value = os.getenv(
+        "KEYE_SM80_TRACE_COMPACT_RANKS", "2048,2560,3072,4096"
+    ).strip()
+    try:
+        ranks = sorted(
+            {int(value.strip()) for value in raw_value.split(",") if value.strip()}
+        )
+    except ValueError as exc:
+        raise ValueError(
+            "KEYE_SM80_TRACE_COMPACT_RANKS must be comma-separated positive ints"
+        ) from exc
+    if not ranks or ranks[0] <= 0:
+        raise ValueError(
+            "KEYE_SM80_TRACE_COMPACT_RANKS must be comma-separated positive ints"
+        )
+    if ranks[-1] > _trace_compact_k():
+        raise ValueError(
+            "KEYE_SM80_TRACE_COMPACT_RANKS cannot exceed KEYE_SM80_TRACE_COMPACT_K"
+        )
+    return ranks
+
+
+def _trace_score_block_size() -> int:
+    """Return the token block size used for compact score summaries."""
+    raw_value = os.getenv("KEYE_SM80_TRACE_SCORE_BLOCK_SIZE", "256").strip()
+    try:
+        block_size = int(raw_value)
+    except ValueError as exc:
+        raise ValueError("KEYE_SM80_TRACE_SCORE_BLOCK_SIZE must be positive") from exc
+    if block_size <= 0:
+        raise ValueError("KEYE_SM80_TRACE_SCORE_BLOCK_SIZE must be positive")
+    return block_size
+
+
+def _trace_full_score_layers() -> set[int]:
+    """Return layers whose compact records additionally retain full scores."""
+    raw_value = os.getenv("KEYE_SM80_TRACE_FULL_SCORE_LAYERS", "").strip()
+    if not raw_value:
+        return set()
+    try:
+        layers = {
+            int(value.strip()) for value in raw_value.split(",") if value.strip()
+        }
+    except ValueError as exc:
+        raise ValueError(
+            "KEYE_SM80_TRACE_FULL_SCORE_LAYERS must be comma-separated layer IDs"
+        ) from exc
+    if any(layer < 0 for layer in layers):
+        raise ValueError("KEYE_SM80_TRACE_FULL_SCORE_LAYERS must be non-negative")
+    return layers
+
+
+def _should_trace_full_score(request_id: str, layer_id: int) -> bool:
+    """Return whether a compact row belongs to the explicit full-score sample."""
+    if layer_id not in _trace_full_score_layers():
+        return False
+    raw_prefixes = os.getenv("KEYE_SM80_TRACE_FULL_SCORE_RID_PREFIXES", "").strip()
+    if not raw_prefixes:
+        return True
+    prefixes = [value.strip() for value in raw_prefixes.split(",") if value.strip()]
+    return any(request_id.startswith(prefix) for prefix in prefixes)
 
 
 def _trace_decode_step_limit() -> int:
@@ -172,7 +259,7 @@ def _lookahead_use_layers() -> set[int]:
     return layers
 
 
-def _rescore_candidate_k() -> int:
+def _rescore_candidate_k(layer_id: Optional[int] = None) -> int:
     raw_value = os.getenv("KEYE_RESCORE_CANDIDATE_K", "3072").strip()
     try:
         candidate_k = int(raw_value)
@@ -180,6 +267,32 @@ def _rescore_candidate_k() -> int:
         raise ValueError("KEYE_RESCORE_CANDIDATE_K must be at least 2048") from exc
     if candidate_k < 2048:
         raise ValueError("KEYE_RESCORE_CANDIDATE_K must be at least 2048")
+
+    raw_overrides = os.getenv("KEYE_RESCORE_CANDIDATE_K_BY_LAYER", "").strip()
+    if raw_overrides:
+        try:
+            overrides = {
+                int(layer.strip()): int(value.strip())
+                for item in raw_overrides.split(",")
+                if item.strip()
+                for layer, value in [item.split(":", 1)]
+            }
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "KEYE_RESCORE_CANDIDATE_K_BY_LAYER must use layer:k pairs"
+            ) from exc
+        invalid = {
+            layer: value
+            for layer, value in overrides.items()
+            if layer < 1 or value < 2048
+        }
+        if invalid:
+            raise ValueError(
+                "rescore per-layer candidate K requires layer >= 1 and K >= 2048: "
+                f"{invalid}"
+            )
+        if layer_id is not None:
+            candidate_k = overrides.get(layer_id, candidate_k)
     return candidate_k
 
 
@@ -201,6 +314,11 @@ def _rescore_enabled() -> bool:
     """Allow request-boundary exact/rescore A/B tests in one loaded server."""
     control_file = os.getenv("KEYE_RESCORE_ENABLE_FILE", "").strip()
     return not control_file or Path(control_file).is_file()
+
+
+def _rescore_exact_rid_prefix() -> str:
+    """Return the request prefix whose rows use full exact top-k as controls."""
+    return os.getenv("KEYE_RESCORE_EXACT_RID_PREFIX", "").strip()
 
 
 def _rescore_trace_dir() -> Optional[Path]:
@@ -284,6 +402,8 @@ class KeyeIndexer(MultiPlatformOp):
         self.softmax_scale = head_dim**-0.5
         self.alt_stream = alt_stream
         self._last_sm80_scores: Optional[torch.Tensor] = None
+        self._last_rescore_candidate_indices: Optional[torch.Tensor] = None
+        self._last_rescore_exact_indices: Optional[torch.Tensor] = None
 
         assert main_head_dim is not None, (
             "main_head_dim is required for mrope_section scaling"
@@ -658,6 +778,89 @@ class KeyeIndexer(MultiPlatformOp):
             q_offset += extend_len
         return result
 
+    def _compact_trace_row_sm80(
+        self,
+        scores: torch.Tensor,
+        score_valid_count: int,
+    ) -> dict[str, object]:
+        """Build the bounded schema-v5 payload for one decode row.
+
+        Threshold-relative block counts preserve the score distribution around
+        the candidate cutoffs without writing the full context-length vector.
+        The canonical top-2048 is stored separately because a generic
+        ``torch.topk`` need not make the same choice at exact score ties as the
+        serving kernel.
+        """
+        compact_k = _trace_compact_k()
+        threshold_ranks = _trace_compact_ranks()
+        block_size = _trace_score_block_size()
+        valid_scores = scores[:score_valid_count].float()
+        actual_k = min(compact_k, score_valid_count)
+        candidate_scores, candidate_indices = torch.topk(
+            valid_scores, actual_k, dim=0, sorted=True
+        )
+
+        padded_indices = torch.full(
+            (compact_k,), -1, dtype=torch.int32, device=scores.device
+        )
+        padded_scores = torch.full(
+            (compact_k,), -float("inf"), dtype=torch.float32, device=scores.device
+        )
+        padded_indices[:actual_k] = candidate_indices.to(torch.int32)
+        padded_scores[:actual_k] = candidate_scores
+
+        thresholds = torch.full(
+            (len(threshold_ranks),),
+            float("nan"),
+            dtype=torch.float32,
+            device=scores.device,
+        )
+        for threshold_index, rank in enumerate(threshold_ranks):
+            if rank <= actual_k:
+                thresholds[threshold_index] = candidate_scores[rank - 1]
+
+        block_count = (score_valid_count + block_size - 1) // block_size
+        padded_width = block_count * block_size
+        padded = torch.zeros(padded_width, dtype=torch.float32, device=scores.device)
+        padded[:score_valid_count] = valid_scores
+        blocks = padded.view(block_count, block_size)
+        counts = torch.full(
+            (block_count,), block_size, dtype=torch.int32, device=scores.device
+        )
+        counts[-1] = score_valid_count - (block_count - 1) * block_size
+        valid_mask = (
+            torch.arange(block_size, device=scores.device).unsqueeze(0)
+            < counts.unsqueeze(1)
+        )
+        count_float = counts.float()
+        block_mean = blocks.sum(dim=1) / count_float
+        centered = torch.where(valid_mask, blocks - block_mean.unsqueeze(1), 0.0)
+        block_std = torch.sqrt((centered * centered).sum(dim=1) / count_float)
+        block_min = blocks.masked_fill(~valid_mask, float("inf")).min(dim=1).values
+        block_max = blocks.masked_fill(~valid_mask, -float("inf")).max(dim=1).values
+        threshold_counts = torch.zeros(
+            (block_count, len(threshold_ranks)),
+            dtype=torch.int32,
+            device=scores.device,
+        )
+        for threshold_index, threshold in enumerate(thresholds):
+            if torch.isfinite(threshold):
+                threshold_counts[:, threshold_index] = (
+                    (blocks >= threshold) & valid_mask
+                ).sum(dim=1, dtype=torch.int32)
+
+        return {
+            "candidate_indices": padded_indices.detach().cpu(),
+            "candidate_scores": padded_scores.detach().cpu(),
+            "score_thresholds": thresholds.detach().cpu(),
+            "block_valid_counts": counts.detach().cpu(),
+            "block_score_mean": block_mean.detach().cpu(),
+            "block_score_std": block_std.detach().cpu(),
+            "block_score_min": block_min.detach().cpu(),
+            "block_score_max": block_max.detach().cpu(),
+            "block_threshold_counts": threshold_counts.detach().cpu(),
+        }
+
     def _dump_topk_sm80(
         self,
         indices: torch.Tensor,
@@ -697,7 +900,7 @@ class KeyeIndexer(MultiPlatformOp):
         trace_mode = _trace_mode()
         decode_step_limit = _trace_decode_step_limit()
         is_decode = forward_batch.forward_mode.is_decode()
-        if trace_mode in {"score", "both"} and scores is None:
+        if trace_mode in {"score", "both", "compact"} and scores is None:
             # Score traces intentionally cover decode steps only. Prefill can
             # have thousands of query rows and would dominate both I/O and
             # storage without helping the planned cross-step comparison.
@@ -824,11 +1027,23 @@ class KeyeIndexer(MultiPlatformOp):
                     if isinstance(score_valid_counts, torch.Tensor)
                     else int(scores.shape[1])
                 )
+                keep_full_score = trace_mode == "compact" and _should_trace_full_score(
+                    request_id, layer_id
+                )
                 row_score = (
                     scores[output_row, :score_valid_count]
                     .detach()
                     .to(device="cpu", dtype=torch.float32)
-                    if scores is not None and trace_mode in {"score", "both"}
+                    if scores is not None
+                    and (trace_mode in {"score", "both"} or keep_full_score)
+                    else None
+                )
+                compact_payload = (
+                    self._compact_trace_row_sm80(
+                        scores[output_row],
+                        score_valid_count,
+                    )
+                    if scores is not None and trace_mode == "compact"
                     else None
                 )
                 row_input_id = (
@@ -850,10 +1065,12 @@ class KeyeIndexer(MultiPlatformOp):
                     decode_step_id=decode_step_ids[output_row],
                     indices=(
                         indices_cpu[output_row].clone()
-                        if trace_mode in {"topk", "both"}
+                        if trace_mode in {"topk", "both", "compact"}
                         else None
                     ),
                     score=row_score,
+                    compact_payload=compact_payload,
+                    keep_full_score=keep_full_score,
                     valid_count=int(valid_counts[output_row].item()),
                     score_valid_count=score_valid_count,
                     input_id=row_input_id,
@@ -861,6 +1078,12 @@ class KeyeIndexer(MultiPlatformOp):
                     chunk_steps=chunk_steps,
                 )
             return
+
+        if trace_mode == "compact":
+            raise ValueError(
+                "KEYE_SM80_TRACE_MODE=compact requires "
+                "KEYE_SM80_TRACE_CHUNK_STEPS > 0"
+            )
 
         event_id = next(_trace_counter)
         timestamp_ns = time.time_ns()
@@ -875,6 +1098,7 @@ class KeyeIndexer(MultiPlatformOp):
             "layer_id": layer_id,
             "forward_mode": int(forward_batch.forward_mode),
             "trace_mode": trace_mode,
+            "topk_backend": "torch_exact" if _use_exact_topk_sm80() else "fast_topk_v2",
             "indices": indices_cpu if trace_mode in {"topk", "both"} else None,
             "scores": (
                 scores.detach().to(device="cpu", dtype=torch.float32)
@@ -925,13 +1149,15 @@ class KeyeIndexer(MultiPlatformOp):
         decode_step_id: int,
         indices: Optional[torch.Tensor],
         score: Optional[torch.Tensor],
+        compact_payload: Optional[dict[str, object]],
+        keep_full_score: bool,
         valid_count: int,
         score_valid_count: int,
         input_id: Optional[torch.Tensor],
         position: torch.Tensor,
         chunk_steps: int,
     ) -> None:
-        """Buffer one decode row and atomically persist a schema-v4 chunk."""
+        """Buffer one decode row and atomically persist a schema-v4/v5 chunk."""
         buffer_key = (request_id, layer_id)
         rows = _trace_chunk_buffers.setdefault(buffer_key, [])
         rows.append(
@@ -939,6 +1165,8 @@ class KeyeIndexer(MultiPlatformOp):
                 "decode_step_id": decode_step_id,
                 "indices": indices,
                 "score": score,
+                "compact_payload": compact_payload,
+                "keep_full_score": keep_full_score,
                 "valid_count": valid_count,
                 "score_valid_count": score_valid_count,
                 "input_id": input_id,
@@ -960,7 +1188,10 @@ class KeyeIndexer(MultiPlatformOp):
         )
         max_score_width = int(score_valid_counts.max().item())
         scores_cpu = None
-        if trace_mode in {"score", "both"}:
+        if trace_mode in {"score", "both"} or (
+            trace_mode == "compact"
+            and all(bool(row["keep_full_score"]) for row in rows)
+        ):
             scores_cpu = torch.zeros(
                 (chunk_steps, max_score_width), dtype=torch.float32
             )
@@ -971,11 +1202,92 @@ class KeyeIndexer(MultiPlatformOp):
                 scores_cpu[row_index, : row_score.numel()] = row_score
 
         indices_cpu = None
-        if trace_mode in {"topk", "both"}:
+        if trace_mode in {"topk", "both", "compact"}:
             index_rows = [row["indices"] for row in rows]
             if not all(isinstance(row, torch.Tensor) for row in index_rows):
                 raise RuntimeError(f"Missing top-k row for {buffer_key}")
             indices_cpu = torch.stack(index_rows).to(torch.int32)
+
+        compact_record: dict[str, object] = {}
+        if trace_mode == "compact":
+            payloads = [row["compact_payload"] for row in rows]
+            if not all(isinstance(payload, dict) for payload in payloads):
+                raise RuntimeError(f"Missing compact payload for {buffer_key}")
+            typed_payloads = [
+                payload for payload in payloads if isinstance(payload, dict)
+            ]
+            fixed_fields = [
+                "candidate_indices",
+                "candidate_scores",
+                "score_thresholds",
+            ]
+            for field in fixed_fields:
+                values = [payload[field] for payload in typed_payloads]
+                if not all(isinstance(value, torch.Tensor) for value in values):
+                    raise RuntimeError(f"Missing compact field {field} for {buffer_key}")
+                compact_record[field] = torch.stack(values)
+
+            block_fields = [
+                "block_valid_counts",
+                "block_score_mean",
+                "block_score_std",
+                "block_score_min",
+                "block_score_max",
+            ]
+            max_blocks = max(
+                int(payload["block_valid_counts"].numel())
+                for payload in typed_payloads
+            )
+            compact_record["score_block_counts"] = torch.tensor(
+                [
+                    int(payload["block_valid_counts"].numel())
+                    for payload in typed_payloads
+                ],
+                dtype=torch.int32,
+            )
+            for field in block_fields:
+                first = typed_payloads[0][field]
+                if not isinstance(first, torch.Tensor):
+                    raise RuntimeError(f"Missing compact field {field} for {buffer_key}")
+                fill_value = 0 if field == "block_valid_counts" else float("nan")
+                output = torch.full(
+                    (chunk_steps, max_blocks), fill_value, dtype=first.dtype
+                )
+                for row_index, payload in enumerate(typed_payloads):
+                    value = payload[field]
+                    if not isinstance(value, torch.Tensor):
+                        raise RuntimeError(
+                            f"Missing compact field {field} for {buffer_key}"
+                        )
+                    output[row_index, : value.numel()] = value
+                compact_record[field] = output
+
+            threshold_count_rows = [
+                payload["block_threshold_counts"] for payload in typed_payloads
+            ]
+            if not all(
+                isinstance(value, torch.Tensor) for value in threshold_count_rows
+            ):
+                raise RuntimeError(
+                    f"Missing compact block thresholds for {buffer_key}"
+                )
+            num_thresholds = int(threshold_count_rows[0].shape[1])
+            block_threshold_counts = torch.zeros(
+                (chunk_steps, max_blocks, num_thresholds), dtype=torch.int32
+            )
+            for row_index, value in enumerate(threshold_count_rows):
+                block_threshold_counts[row_index, : value.shape[0]] = value
+            compact_record["block_threshold_counts"] = block_threshold_counts
+            compact_record.update(
+                {
+                    "compact_k": _trace_compact_k(),
+                    "score_threshold_ranks": torch.tensor(
+                        _trace_compact_ranks(), dtype=torch.int32
+                    ),
+                    "score_block_size": _trace_score_block_size(),
+                    "full_scores_retained": scores_cpu is not None,
+                }
+            )
 
         input_ids = [row["input_id"] for row in rows]
         input_ids_cpu = (
@@ -1001,7 +1313,7 @@ class KeyeIndexer(MultiPlatformOp):
         final_path = trace_dir / file_name
         temp_path = trace_dir / f".{file_name}.tmp"
         record = {
-            "schema_version": 4,
+            "schema_version": 5 if trace_mode == "compact" else 4,
             "event_id": event_id,
             "timestamp_ns": timestamp_ns,
             "layer_id": layer_id,
@@ -1009,6 +1321,9 @@ class KeyeIndexer(MultiPlatformOp):
             "trace_mode": trace_mode,
             "request_id": request_id,
             "request_ids": [request_id] * chunk_steps,
+            "topk_backend": (
+                "torch_exact" if _use_exact_topk_sm80() else "fast_topk_v2"
+            ),
             "decode_step_ids": decode_step_ids,
             "indices": indices_cpu,
             "scores": scores_cpu,
@@ -1016,22 +1331,34 @@ class KeyeIndexer(MultiPlatformOp):
             "score_valid_counts": score_valid_counts,
             "input_ids": input_ids_cpu,
             "positions": positions_cpu,
+            **compact_record,
         }
         torch.save(record, temp_path)
         os.replace(temp_path, final_path)
 
         manifest_record = {
-            "schema_version": 4,
+            "schema_version": 5 if trace_mode == "compact" else 4,
             "event_id": event_id,
             "timestamp_ns": timestamp_ns,
             "file": file_name,
             "layer_id": layer_id,
             "request_id": request_id,
             "request_ids": [request_id],
+            "topk_backend": "torch_exact" if _use_exact_topk_sm80() else "fast_topk_v2",
             "num_steps": chunk_steps,
             "decode_step_ids": decode_step_ids,
             "topk_width": indices_cpu.shape[1] if indices_cpu is not None else None,
             "score_width": scores_cpu.shape[1] if scores_cpu is not None else None,
+            "compact_k": _trace_compact_k() if trace_mode == "compact" else None,
+            "score_threshold_ranks": (
+                _trace_compact_ranks() if trace_mode == "compact" else None
+            ),
+            "score_block_size": (
+                _trace_score_block_size() if trace_mode == "compact" else None
+            ),
+            "full_scores_retained": (
+                scores_cpu is not None if trace_mode == "compact" else None
+            ),
             "valid_min": int(valid_counts.min().item()),
             "valid_max": int(valid_counts.max().item()),
             "score_valid_min": int(score_valid_counts.min().item()),
@@ -1053,6 +1380,11 @@ class KeyeIndexer(MultiPlatformOp):
 
     def _topk_sm80(self, scores: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
         """Select top-k with the optimized DSA kernel when its contract applies."""
+        if _use_exact_topk_sm80():
+            # Correctness/reference path for experiments.  The optimized radix
+            # kernel can make boundary substitutions on highly clustered DSA
+            # score distributions, so it must not define the trace ground truth.
+            return self._topk_with_lengths(scores, lengths, self.topk)
         if self.topk == 2048 and scores.shape[1] >= self.topk:
             from sgl_kernel import fast_topk_v2
 
@@ -1208,7 +1540,7 @@ class KeyeIndexer(MultiPlatformOp):
         key_cache = pool.get_index_k_bf16_buffer(layer_id)
         page_table = metadata.get_page_table_1()
         seqlens = metadata.get_seqlens_int32()
-        candidate_k = _rescore_candidate_k()
+        candidate_k = _rescore_candidate_k(layer_id)
 
         from sglang.srt.layers.attention.keye_topk.ampere_indexer import (
             keye_indexer_score_candidates,
@@ -1233,6 +1565,15 @@ class KeyeIndexer(MultiPlatformOp):
         )
         self_indices = (seqlens - 1).to(torch.int32).unsqueeze(1)
         candidate_indices = torch.cat((self_indices, history_indices), dim=1)
+
+        # Measure candidate-ready -> target attention separately from the
+        # previous-step same-layer deadline. This adds events only when the
+        # explicit deadline trace environment is enabled.
+        from sglang.srt.layers.attention.keye_topk.deadline_trace import (
+            record_cross_layer_candidate_ready,
+        )
+
+        record_cross_layer_candidate_ready(forward_batch, layer_id)
 
         # Only exact current-layer K is allowed to mutate the canonical cache.
         exact_query, exact_key, exact_weights = self._get_q_k_w_bf16(
@@ -1259,9 +1600,27 @@ class KeyeIndexer(MultiPlatformOp):
         final_indices = final_indices.masked_fill(candidate_offsets < 0, -1)
 
         trace_dir = _rescore_trace_dir()
-        verify_full = trace_dir is not None or os.getenv(
-            "KEYE_RESCORE_VERIFY_FULL", "0"
-        ) == "1"
+        exact_rid_prefix = _rescore_exact_rid_prefix()
+        exact_control_mask = None
+        if exact_rid_prefix:
+            request_ids = list(getattr(forward_batch, "rids", None) or [])
+            if len(request_ids) != final_indices.shape[0]:
+                raise RuntimeError(
+                    "KEYE_RESCORE_EXACT_RID_PREFIX requires one request id per "
+                    f"decode row, got {len(request_ids)} ids for "
+                    f"{final_indices.shape[0]} rows"
+                )
+            exact_control_mask = torch.tensor(
+                [rid.startswith(exact_rid_prefix) for rid in request_ids],
+                dtype=torch.bool,
+                device=final_indices.device,
+            )
+        verify_full = (
+            trace_dir is not None
+            or os.getenv("KEYE_RESCORE_VERIFY_FULL", "0") == "1"
+            or exact_control_mask is not None
+            or bool(os.getenv("KEYE_RESCORE_ATTN_SHADOW_DIR", "").strip())
+        )
         if verify_full:
             full_scores = keye_indexer_score_paged(
                 exact_query,
@@ -1297,6 +1656,18 @@ class KeyeIndexer(MultiPlatformOp):
                 raise RuntimeError(
                     "restricted candidate scores differ from the full exact scorer: "
                     f"max_abs={float(max_score_difference.max().item())}"
+                )
+
+            self._last_rescore_candidate_indices = final_indices.detach()
+            self._last_rescore_exact_indices = exact_indices.detach()
+
+            # Paired quality experiments place identical exact and candidate
+            # requests in the same scheduler batch. Selecting per row removes
+            # cross-request launch and MoE/TP drift from the comparison while
+            # keeping both variants in one model forward.
+            if exact_control_mask is not None:
+                final_indices = torch.where(
+                    exact_control_mask.unsqueeze(1), exact_indices, final_indices
                 )
 
         return final_indices

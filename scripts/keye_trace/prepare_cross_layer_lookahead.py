@@ -37,7 +37,9 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def select_requests(source_dir: Path) -> tuple[list[dict[str, Any]], dict[str, str]]:
+def select_requests(
+    source_dir: Path, eligible_rank: int = 0
+) -> tuple[list[dict[str, Any]], dict[str, str]]:
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in read_jsonl(source_dir / "prepared_requests.jsonl"):
         grouped[row["trajectory_id"]].append(row)
@@ -47,7 +49,16 @@ def select_requests(source_dir: Path) -> tuple[list[dict[str, Any]], dict[str, s
         eligible = [row for row in rows if row.get("ground_truth_calls")]
         if not eligible:
             raise ValueError(f"{trajectory_id} has no request with a ground-truth call")
-        selected.append(max(eligible, key=lambda row: (int(row["prompt_len"]), int(row["round_id"]))))
+        eligible.sort(
+            key=lambda row: (int(row["prompt_len"]), int(row["round_id"])),
+            reverse=True,
+        )
+        if eligible_rank >= len(eligible):
+            raise ValueError(
+                f"{trajectory_id} has only {len(eligible)} tool-bearing requests; "
+                f"cannot select rank {eligible_rank}"
+            )
+        selected.append(eligible[eligible_rank])
 
     by_category: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in selected:
@@ -78,12 +89,20 @@ def main() -> None:
         choices=["calibration", "test"],
         help="optionally materialize only one pre-registered split",
     )
+    parser.add_argument(
+        "--eligible-rank",
+        type=int,
+        default=0,
+        help="0 selects the longest tool-bearing round, 1 the second-longest",
+    )
     args = parser.parse_args()
 
     source_dir = args.source_run.resolve()
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    selected, split_by_rid = select_requests(source_dir)
+    if args.eligible_rank < 0:
+        raise ValueError("eligible-rank must be non-negative")
+    selected, split_by_rid = select_requests(source_dir, args.eligible_rank)
     if args.split:
         selected = [row for row in selected if split_by_rid[row["rid"]] == args.split]
     selected_rids = {row["rid"] for row in selected}
@@ -122,7 +141,10 @@ def main() -> None:
         {
             "schema_version": 1,
             "seed": SEED,
-            "policy": "longest request with nonempty ground_truth_calls per trajectory",
+            "policy": (
+                f"rank {args.eligible_rank} by descending prompt length among "
+                "requests with nonempty ground_truth_calls per trajectory"
+            ),
             "split_policy": "within each category, pair adjacent prompt lengths and seeded-shuffle one into each split",
             "source_run": str(source_dir),
             "source_prepared_sha256": sha256(source_dir / "prepared_requests.jsonl"),

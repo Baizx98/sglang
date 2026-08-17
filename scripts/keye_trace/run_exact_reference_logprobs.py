@@ -43,9 +43,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--base-url", default="http://127.0.0.1:30000")
     parser.add_argument("--steps", type=int, default=32)
+    parser.add_argument("--max-new-tokens", type=int)
+    parser.add_argument(
+        "--respect-eos",
+        action="store_true",
+        help="stop at EOS instead of forcing a fixed decode length",
+    )
     parser.add_argument("--top-logprobs-num", type=int, default=20)
+    parser.add_argument("--variant", default="exact")
     parser.add_argument("--timeout", type=float, default=600)
     parser.add_argument("--split", choices=["calibration", "test"])
+    parser.add_argument("--max-requests", type=int)
     return parser.parse_args()
 
 
@@ -66,6 +74,8 @@ def main() -> None:
         for row in selection["selected"]
         if args.split is None or row["split"] == args.split
     ]
+    if args.max_requests is not None:
+        selected = selected[: args.max_requests]
 
     output_path = args.output_dir / "teacher_forced_steps.jsonl"
     requests_path = args.output_dir / "requests.jsonl"
@@ -78,12 +88,13 @@ def main() -> None:
         old_reference_ids = list(
             reference[rid]["response"]["output_ids"][: args.steps]
         )
+        max_new_tokens = args.max_new_tokens or len(old_reference_ids)
         payload = {
             "input_ids": prepared[rid]["input_ids"],
             "sampling_params": {
                 "temperature": 0,
-                "max_new_tokens": len(old_reference_ids),
-                "ignore_eos": True,
+                "max_new_tokens": max_new_tokens,
+                "ignore_eos": not args.respect_eos,
             },
             "stream": False,
             "rid": f"tfexact__{request_index:02d}",
@@ -95,6 +106,9 @@ def main() -> None:
         latency_s = time.perf_counter() - started
         output_ids = list(response["output_ids"])
         old_reference_match = output_ids == old_reference_ids
+        old_reference_prefix_match = (
+            output_ids[: len(old_reference_ids)] == old_reference_ids
+        )
         old_reference_mismatch_count += int(not old_reference_match)
         append_jsonl(
             requests_path,
@@ -108,6 +122,7 @@ def main() -> None:
                 "latency_s": latency_s,
                 "response": response,
                 "old_reference_match": old_reference_match,
+                "old_reference_prefix_match": old_reference_prefix_match,
             },
         )
         meta_info = response["meta_info"]
@@ -117,7 +132,7 @@ def main() -> None:
             append_jsonl(
                 output_path,
                 {
-                    "variant": "exact",
+                    "variant": args.variant,
                     "rid": rid,
                     "trajectory_id": meta["trajectory_id"],
                     "category": meta["category"],
@@ -153,7 +168,7 @@ def main() -> None:
     rows = read_jsonl(output_path)
     summary = {
         "schema_version": 1,
-        "variant": "exact",
+        "variant": args.variant,
         "request_count": len(selected),
         "step_count": len(rows),
         "top1_agreement": 1.0,

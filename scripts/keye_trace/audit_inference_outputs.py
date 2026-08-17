@@ -168,11 +168,15 @@ def audit_row(prepared: dict[str, Any], executed: dict[str, Any]) -> dict[str, A
 def audit_run(
     run_dir: Path,
     *,
+    prepared_run: Path | None = None,
+    requests_file: Path | None = None,
     min_target_mention_rate: float | None = None,
     allow_partial: bool = False,
 ) -> dict[str, Any]:
-    prepared_rows = read_jsonl(run_dir / "prepared_requests.jsonl")
-    executed_rows = read_jsonl(run_dir / "requests.jsonl")
+    prepared_rows = read_jsonl(
+        (prepared_run or run_dir) / "prepared_requests.jsonl"
+    )
+    executed_rows = read_jsonl(requests_file or run_dir / "requests.jsonl")
     prepared = {row["rid"]: row for row in prepared_rows}
     executed: dict[str, dict[str, Any]] = {}
     for row in executed_rows:
@@ -264,11 +268,15 @@ def audit_run(
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--run-dir", type=Path, required=True)
+    parser.add_argument("--prepared-run", type=Path)
+    parser.add_argument("--requests-file", type=Path)
     parser.add_argument("--min-target-mention-rate", type=float)
     parser.add_argument("--allow-partial", action="store_true")
     args = parser.parse_args()
     summary = audit_run(
         args.run_dir,
+        prepared_run=args.prepared_run,
+        requests_file=args.requests_file,
         min_target_mention_rate=args.min_target_mention_rate,
         allow_partial=args.allow_partial,
     )

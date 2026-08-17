@@ -3,8 +3,10 @@ KeyeTopKMask 模型实现 - sglang 版本
 基于 Qwen3 架构,使用 Top-K Mask 稀疏注意力机制优化推理性能
 """
 
+import json
 import logging
 import os
+from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
@@ -12,6 +14,10 @@ import torch.nn as nn
 from transformers import PretrainedConfig
 
 from sglang.srt.layers.attention.keye_topk.keye_indexer import KeyeIndexer
+from sglang.srt.layers.attention.keye_topk.deadline_trace import (
+    record_cross_layer_attention_consume,
+    record_same_layer_topk_ready,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import QKVParallelLinear, RowParallelLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -38,6 +44,7 @@ from sglang.srt.utils import (
 _is_cuda = is_cuda()
 
 logger = logging.getLogger(__name__)
+_attn_shadow_decode_counters: dict[Tuple[str, int], int] = {}
 
 
 class KeyeTopKMaskAttention(nn.Module):
@@ -274,6 +281,8 @@ class KeyeTopKMaskAttention(nn.Module):
 
         # ---- 3. 运行 Indexer 获取 top-k (如果启用) ----
         topk_indices = None
+        shadow_candidate_indices = None
+        shadow_exact_indices = None
         if self.sa_indexer is not None:
             rescore_active = bool(
                 os.getenv("KEYE_RESCORE_USE_LAYERS", "").strip()
@@ -297,6 +306,8 @@ class KeyeTopKMaskAttention(nn.Module):
                 forward_batch, "_keye_lookahead_previous_indices", None
             )
             if rescore_active and previous_x is not None:
+                self.sa_indexer._last_rescore_candidate_indices = None
+                self.sa_indexer._last_rescore_exact_indices = None
                 topk_indices = self.sa_indexer.forward_cross_layer_rescore_sm80(
                     previous_x=previous_x,
                     current_x=hidden_states,
@@ -304,6 +315,10 @@ class KeyeTopKMaskAttention(nn.Module):
                     forward_batch=forward_batch,
                     layer_id=self.layer_id,
                 )
+                shadow_candidate_indices = (
+                    self.sa_indexer._last_rescore_candidate_indices
+                )
+                shadow_exact_indices = self.sa_indexer._last_rescore_exact_indices
             if topk_indices is None:
                 topk_indices = self.sa_indexer(
                     x=hidden_states,
@@ -335,14 +350,119 @@ class KeyeTopKMaskAttention(nn.Module):
                 # Keep the baseline exact set for the next layer's direct-reuse trace.
                 forward_batch._keye_lookahead_previous_indices = exact_topk_indices.detach()
 
+            # This is both the previous-step prefetch consume point and the
+            # production point for the next step. CUDA events are resolved only
+            # after query() reports completion; no hot-path synchronize occurs.
+            record_same_layer_topk_ready(forward_batch, self.layer_id)
+            record_cross_layer_attention_consume(forward_batch, self.layer_id)
+
         # ---- 4. 使用 RadixAttention (通过kwargs传递topk_indices) ----
         # topk_indices will be handled by KeyeSparseAttnBackend
-        attn_output = self.attn(q, k, v, forward_batch, topk_indices=topk_indices)
+        shadow_dir = os.getenv("KEYE_RESCORE_ATTN_SHADOW_DIR", "").strip()
+        if (
+            shadow_dir
+            and shadow_candidate_indices is not None
+            and shadow_exact_indices is not None
+        ):
+            candidate_attn_output = self.attn(
+                q, k, v, forward_batch, topk_indices=shadow_candidate_indices
+            )
+            exact_attn_output = self.attn(
+                q, k, v, forward_batch, topk_indices=shadow_exact_indices
+            )
+            self._dump_rescore_attention_shadow(
+                candidate_output=candidate_attn_output,
+                exact_output=exact_attn_output,
+                forward_batch=forward_batch,
+            )
+            use_exact_main = (
+                os.getenv("KEYE_RESCORE_ATTN_SHADOW_EXACT_MAIN", "1").strip()
+                == "1"
+            )
+            attn_output = exact_attn_output if use_exact_main else candidate_attn_output
+        else:
+            attn_output = self.attn(
+                q, k, v, forward_batch, topk_indices=topk_indices
+            )
 
         # ---- 5. Output Projection ----
         output, _ = self.o_proj(attn_output)
 
         return output
+
+    def _dump_rescore_attention_shadow(
+        self,
+        *,
+        candidate_output: torch.Tensor,
+        exact_output: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> None:
+        """Compare exact and candidate attention on the same hidden state."""
+        from sglang.srt.layers.dp_attention import (
+            attn_tp_all_reduce,
+            get_attention_tp_rank,
+        )
+
+        candidate = candidate_output.float().reshape(candidate_output.shape[0], -1)
+        exact = exact_output.float().reshape(exact_output.shape[0], -1)
+        difference = candidate - exact
+        local_stats = torch.stack(
+            (
+                (candidate * exact).sum(dim=1),
+                candidate.square().sum(dim=1),
+                exact.square().sum(dim=1),
+                difference.square().sum(dim=1),
+            ),
+            dim=1,
+        )
+        stats = attn_tp_all_reduce(local_stats)
+        if get_attention_tp_rank() != 0:
+            return
+
+        request_ids = list(getattr(forward_batch, "rids", None) or [])
+        if len(request_ids) != stats.shape[0]:
+            raise RuntimeError(
+                "attention shadow requires one request id per decode row, got "
+                f"{len(request_ids)} ids for {stats.shape[0]} rows"
+            )
+        trace_prefix = os.getenv(
+            "KEYE_RESCORE_ATTN_SHADOW_RID_PREFIX", ""
+        ).strip()
+        step_limit = int(
+            os.getenv("KEYE_RESCORE_ATTN_SHADOW_DECODE_STEPS", "32").strip()
+        )
+        trace_dir = Path(os.environ["KEYE_RESCORE_ATTN_SHADOW_DIR"])
+        trace_dir.mkdir(parents=True, exist_ok=True)
+        output_path = trace_dir / "attention_shadow.jsonl"
+        stats_cpu = stats.detach().cpu()
+        for row_index, request_id in enumerate(request_ids):
+            if trace_prefix and not request_id.startswith(trace_prefix):
+                continue
+            counter_key = (request_id, self.layer_id)
+            decode_step = _attn_shadow_decode_counters.get(counter_key, 0)
+            _attn_shadow_decode_counters[counter_key] = decode_step + 1
+            if decode_step >= step_limit:
+                continue
+            dot, candidate_sq, exact_sq, difference_sq = (
+                float(value) for value in stats_cpu[row_index]
+            )
+            cosine = dot / max((candidate_sq * exact_sq) ** 0.5, 1e-30)
+            relative_l2 = (difference_sq / max(exact_sq, 1e-30)) ** 0.5
+            record = {
+                "schema_version": 1,
+                "request_id": request_id,
+                "layer_id": self.layer_id,
+                "decode_step_id": decode_step,
+                "attention_cosine": cosine,
+                "attention_relative_l2": relative_l2,
+                "candidate_norm": candidate_sq**0.5,
+                "exact_norm": exact_sq**0.5,
+            }
+            with output_path.open("a", encoding="utf-8") as file:
+                file.write(
+                    json.dumps(record, ensure_ascii=False, separators=(",", ":"))
+                    + "\n"
+                )
 
 
 class KeyeTopKMaskDecoderLayer(Qwen3DecoderLayer):

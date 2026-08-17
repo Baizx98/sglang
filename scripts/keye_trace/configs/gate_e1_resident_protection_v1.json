@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "policy_name": "gate-e1-k4096-resident-protection-v1",
+  "status": "frozen_before_gate_e1_evaluation",
+  "frozen_at": "2026-08-10T10:49:23+08:00",
+  "selection_inputs": [
+    "current HBM residency",
+    "exact top-2048 page membership in the previous four completed decode steps",
+    "current previous-score top-4096 page rank"
+  ],
+  "uses_task_label": false,
+  "uses_dataset_label": false,
+  "uses_future_trace": false,
+  "uses_test_trace_for_tuning": false,
+  "history_window_steps": 4,
+  "minimum_hits_in_window": 2,
+  "baseline_candidate_k": 4096,
+  "target_k": 2048,
+  "admission_rule": "start from the capacity-truncated K4096 page set; replace its lowest-priority unprotected pages with recurrent pages already resident in HBM; never admit more initially nonresident pages than baseline",
+  "priority_rule": "protected pages by descending recent-hit count then recency; remaining pages by K4096 score rank",
+  "simulation_contract": {
+    "page_size_tokens": 4,
+    "hbm_logical_gib": 1.19970703125,
+    "dram_logical_gib": 3.0,
+    "sampled_layers": [
+      0,
+      7,
+      15,
+      23,
+      31,
+      39,
+      47
+    ],
+    "scaled_model_layers": 48,
+    "tensor_parallel_size": 2,
+    "kv_bytes_per_token_layer": 2048,
+    "correction": "all exact top-2048 misses are promoted before attention"
+  },
+  "gate": {
+    "mean_correction_byte_delta_request_bootstrap_ci95_high_max": 0,
+    "mean_total_pcie_byte_delta_max": 0,
+    "request_hbm_page_recall_no_worse_fraction_min": 0.9,
+    "worst_request_hbm_page_recall_delta_pp_min": -0.5
+  },
+  "freeze_note": "The rule and thresholds were fixed before any Gate E1 resident-protection replay. Gate E0 traces already being collected were not inspected with this policy before freezing."
+}

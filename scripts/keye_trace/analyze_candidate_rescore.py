@@ -25,12 +25,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--events-dir", type=Path)
     parser.add_argument("--output-dir", type=Path)
+    parser.add_argument("--requests-file", type=Path)
     return parser.parse_args()
 
 
-def request_metadata(run_dir: Path) -> dict[str, dict[str, Any]]:
+def request_metadata(
+    run_dir: Path, requests_file: Path | None = None
+) -> dict[str, dict[str, Any]]:
     metadata: dict[str, dict[str, Any]] = {}
-    requests_path = run_dir / "requests.jsonl"
+    requests_path = requests_file or run_dir / "requests.jsonl"
     if requests_path.exists():
         for row in read_jsonl(requests_path):
             metadata[row.get("rid", row.get("prepared_rid", ""))] = row
@@ -52,7 +55,7 @@ def main() -> None:
     events_dir = (args.events_dir or run_dir / "events").resolve()
     output_dir = (args.output_dir or run_dir / "analysis").resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    metadata = request_metadata(run_dir)
+    metadata = request_metadata(run_dir, args.requests_file)
 
     rows: list[dict[str, Any]] = []
     for path in sorted(events_dir.glob("*.pt")):
