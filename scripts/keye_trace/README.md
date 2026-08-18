@@ -77,6 +77,76 @@ On the current mixed-GPU host, select the L40S and A6000 by UUID rather than
 `CUDA_VISIBLE_DEVICES=0,2`: CUDA ordinal 2 resolves to the RTX 3090 here even
 though `nvidia-smi` labels the A6000 as index 2.
 
+## GPU attention saturation profile for G2.5 Figure 1(b)
+
+`profile_gpu_attention_saturation.py` compares the validated Keye exact-token
+DSA Triton kernel with SGLang's dense Triton decode kernel using the same BF16
+Keye GQA tensors. This is explicitly a GPU kernel proxy, not a GLM-5.2
+FlashMLA measurement. Each point runs in an isolated process, records CUDA-event
+latency plus a PyTorch Profiler trace, and preserves OOM points as
+`capacity_infeasible`.
+
+Smoke test one point before the full sweep:
+
+```bash
+.venv/bin/python scripts/keye_trace/profile_gpu_attention_saturation.py \
+  --contexts 65536 \
+  --batches 1 \
+  --run-id <smoke-run-id>
+```
+
+Full Figure 1(b) sweep:
+
+```bash
+.venv/bin/python scripts/keye_trace/profile_gpu_attention_saturation.py \
+  --contexts 65536,262144,1048576 \
+  --batches 1,2,4,8,16,32,64,128 \
+  --warmups 16 \
+  --repeats 64 \
+  --profiler-repeats 5 \
+  --run-id <run-id>
+```
+
+The output CSV, per-point JSON, manifest, and profiler traces are written below
+`data/gpu-attention-profile/<run-id>/` and remain outside Git.
+
+Large flattened KV buffers require 64-bit K/V pointer offsets in both dense and
+sparse Triton kernels. With 32-bit address multiplication, configurations at
+or above 2^31 tensor elements can fail with an illegal memory access before HBM
+is exhausted. The Figure 1 sweep also uses chunked tensor initialization to
+avoid the corresponding large-fill limit in PyTorch 2.9.1+cu130.
+
+On this host, the Kineto `torch.profiler` interface returns zero CUDA device
+time, while the autograd profiler provides event-correlated device time. The
+script therefore uses CUDA-event median/p10/p90 as the plotted metric and the
+autograd profiler trace as an independent audit artifact.
+
+### GLM-5.2-shape utilization profile
+
+`profile_glm52_dsa_utilization.py` is the current Figure 1(b) protocol. It
+aligns both paths to GLM-5.2 absorbed MLA (Hq=64, Hkv=1, Q/K=576, V=512,
+BF16): Dense reads the full token index, while the DSA proxy reads a
+top-2048 token index through the same SGLang Triton decode kernel. The shared
+kernel and KV buffer isolate the full-history versus sparse-gather difference.
+
+```bash
+PYTHONPATH=python .venv/bin/python \
+  scripts/keye_trace/profile_glm52_dsa_utilization.py \
+  --contexts 65536,262144,524288,1048576 \
+  --batches 1,8,32,64 \
+  --warmups 8 \
+  --independent-repeats 5 \
+  --window-seconds 1.5 \
+  --sample-interval-ms 100 \
+  --run-id <run-id>
+```
+
+The metric is NVIDIA NVML `utilization.gpu`, sampled by `nvidia-smi` during
+five independent continuous-launch windows. It is a GPU compute duty-cycle
+proxy, not occupancy, theoretical/effective TFLOPS, per-SM active cycles, or
+target-NPU utilization. Both paths retain OOM points instead of filling or
+extrapolating them.
+
 ## Replay
 
 `run_bfcl_teacher_forced.py` selects one BFCL v4 `multi_turn_base` case and one

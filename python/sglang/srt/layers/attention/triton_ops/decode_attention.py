@@ -342,8 +342,12 @@ def _fwd_grouped_kernel_stage1(
                 mask=offs_n < split_kv_end,
                 other=0,
             )
+            # A flattened multi-request KV buffer can exceed 2^31 elements
+            # before exhausting modern GPU memory.  Promote token offsets so
+            # address arithmetic does not wrap at large batch x context.
+            kv_loc_i64 = kv_loc.to(tl.int64)
             offs_buf_k = (
-                kv_loc[None, :] * stride_buf_kbs
+                kv_loc_i64[None, :] * stride_buf_kbs
                 + cur_kv_head * stride_buf_kh
                 + offs_d[:, None]
             )
@@ -355,7 +359,7 @@ def _fwd_grouped_kernel_stage1(
             qk = tl.dot(q, k.to(q.dtype))
             if BLOCK_DPE > 0:
                 offs_buf_kpe = (
-                    kv_loc[None, :] * stride_buf_kbs
+                    kv_loc_i64[None, :] * stride_buf_kbs
                     + cur_kv_head * stride_buf_kh
                     + offs_dpe[:, None]
                 )
@@ -378,7 +382,7 @@ def _fwd_grouped_kernel_stage1(
             )
 
             offs_buf_v = (
-                kv_loc[:, None] * stride_buf_vbs
+                kv_loc_i64[:, None] * stride_buf_vbs
                 + cur_kv_head * stride_buf_vh
                 + offs_dv[None, :]
             )

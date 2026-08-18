@@ -125,12 +125,14 @@ def _load_logits(
     ).to(tl.int32)
     valid = in_topk & (selected_idx >= 0) & (selected_idx < kv_len)
     safe_idx = tl.maximum(0, tl.minimum(selected_idx, kv_len - 1))
+    batch_offset = b.to(tl.int64) * stride_kb
+    token_offset = safe_idx.to(tl.int64) * stride_ks
 
     k = tl.load(
         k_ptr
-        + b * stride_kb
+        + batch_offset
         + kv_head * stride_kh
-        + safe_idx[:, None] * stride_ks
+        + token_offset[:, None]
         + offs_d[None, :] * stride_kd,
         mask=valid[:, None] & (offs_d[None, :] < HEAD_DIM),
         other=0.0,
@@ -169,11 +171,13 @@ def _load_v(
     BLOCK_D: tl.constexpr,
 ):
     offs_d = tl.arange(0, BLOCK_D)
+    batch_offset = b.to(tl.int64) * stride_vb
+    token_offset = safe_idx.to(tl.int64) * stride_vs
     return tl.load(
         v_ptr
-        + b * stride_vb
+        + batch_offset
         + kv_head * stride_vh
-        + safe_idx[:, None] * stride_vs
+        + token_offset[:, None]
         + offs_d[None, :] * stride_vd,
         mask=valid[:, None] & (offs_d[None, :] < HEAD_DIM),
         other=0.0,
