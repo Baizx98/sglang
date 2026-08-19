@@ -77,7 +77,44 @@ On the current mixed-GPU host, select the L40S and A6000 by UUID rather than
 `CUDA_VISIBLE_DEVICES=0,2`: CUDA ordinal 2 resolves to the RTX 3090 here even
 though `nvidia-smi` labels the A6000 as index 2.
 
-## GPU attention saturation profile for G2.5 Figure 1(b)
+## GLM-5.1 DSA motivation experiment
+
+`profile_glm51_dsa_motivation.py` supersedes the older Figure 1 capacity and
+dense-versus-sparse protocols below. It measures one TP=8 rank of a
+GLM-5.1-shaped active top-2048 MLA working set with FlashInfer on the L40S, and
+independently probes the exact allocation bytes of the 78-layer BF16 MLA plus
+FP8 index-K state. The 30-GiB per-rank KV budget is a declared nominal H200
+deployment assumption; 25/35/40 GiB sensitivity rows are emitted as modeled
+capacity, not measured H200 configurations.
+
+```bash
+.venv/bin/python scripts/keye_trace/profile_glm51_dsa_motivation.py \
+  --batches 1,2,4,8,9,16,32,48,64,96,128 \
+  --contexts 32768,65536,131072,200000 \
+  --capacity-budgets-gib 25,30,35,40 \
+  --physical-probe-budget-gib 30 \
+  --warmup-steps 100 \
+  --measured-steps 500 \
+  --independent-repeats 5 \
+  --device 0 \
+  --run-id <run-id>
+```
+
+Each performance point runs in an isolated process. The CUDA-event window is a
+CUDA-graph replay of the FlashInfer BF16 MLA paged-decode kernel; planning,
+index scoring, top-k selection, full-history allocation, communication, and
+the rest of the transformer are excluded. The useful-FLOP numerator is
+`2*B*8*2048*(576+512)`. Capacity workers really allocate all in-budget bytes,
+but classify points beyond the declared budget as `over_budget`, never OOM.
+Outputs remain under ignored `data/motivation/<run-id>/`.
+
+### Deprecated Figure 1 GPU profiles
+
+The following protocols are retained only for traceability. They supported the
+superseded GLM-5.2 dense-versus-DSA Figure 1 and must not be mixed into the new
+GLM-5.1 capacity-concurrency claim.
+
+#### GPU attention saturation profile for G2.5 Figure 1(b)
 
 `profile_gpu_attention_saturation.py` compares the validated Keye exact-token
 DSA Triton kernel with SGLang's dense Triton decode kernel using the same BF16
@@ -121,7 +158,7 @@ time, while the autograd profiler provides event-correlated device time. The
 script therefore uses CUDA-event median/p10/p90 as the plotted metric and the
 autograd profiler trace as an independent audit artifact.
 
-### GLM-5.2-shape utilization profile
+#### GLM-5.2-shape utilization profile
 
 `profile_glm52_dsa_utilization.py` is the current Figure 1(b) protocol. It
 aligns both paths to GLM-5.2 absorbed MLA (Hq=64, Hkv=1, Q/K=576, V=512,
