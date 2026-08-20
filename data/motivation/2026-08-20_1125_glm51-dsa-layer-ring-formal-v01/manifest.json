@@ -1,0 +1,32 @@
+{
+  "command": [
+    "scripts/keye_trace/profile_glm51_dsa_layer_ring.py",
+    "--batches",
+    "1,2,4,8,9,12,16,20,24,28,32,48,64",
+    "--independent-repeats",
+    "5",
+    "--dispatch-target",
+    "16",
+    "--run-id",
+    "2026-08-20_1125_glm51-dsa-layer-ring-formal-v01"
+  ],
+  "created": "2026-08-20T11:30:14.243550+08:00",
+  "dispatch": {
+    "definition": "resident batch is split into the minimum number of nearly equal microbatches, each no larger than the target",
+    "mode": "balanced microbatch",
+    "target": 16
+  },
+  "excluded": [
+    "index scoring and top-k selection",
+    "active-KV gather or prefetch",
+    "full-history KV residency",
+    "communication and non-attention layers"
+  ],
+  "flop_formula_per_layer": "2*B*8*2048*((512+64)+512)",
+  "jobs_randomized": true,
+  "repository_commit": "63c33602cad3948bbfc8d3bf81ade72f958b991a",
+  "scope": "one TP=8 GLM-5.1-shaped rank; 78-layer BF16 active top-2048 FlashInfer FA2 MLA attention ring",
+  "seed": 20260820,
+  "status": "formal",
+  "timing": "CUDA-event elapsed time for one CUDA-graph replay containing 78 distinct-layer attention kernels"
+}
