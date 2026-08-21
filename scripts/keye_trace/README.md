@@ -108,6 +108,50 @@ the rest of the transformer are excluded. The useful-FLOP numerator is
 but classify points beyond the declared budget as `over_budget`, never OOM.
 Outputs remain under ignored `data/motivation/<run-id>/`.
 
+## Figure 2 sparse-MLA SSD critical-path experiment
+
+`profile_sparse_mla_ssd_path.py` measures the 78-layer GLM-5.1-shaped sparse
+MLA path at fixed `B=8`. For each layer it submits the active-KV miss volume as
+4-KiB random `O_DIRECT` reads through raw Linux `io_uring` at QD 128, waits for
+the final completion, and then times one real FlashInfer FA2 BF16 top-2048 MLA
+kernel. The path metric is the sum of those measured SSD waits and CUDA-event
+kernel times. It is not full-model or end-to-end decode latency.
+
+The host lacks liburing, so `io_uring_direct_reader.c` uses the stable kernel
+ABI directly and is compiled into each run directory with `-Werror`. Prepare
+the fully allocated 8-GiB NVMe backing file and run a short diagnostic with:
+
+```bash
+.venv/bin/python scripts/keye_trace/profile_sparse_mla_ssd_path.py \
+  --diagnostic \
+  --hit-rates 0,90,95,97,99,99.5,100 \
+  --path-samples 3 \
+  --independent-repeats 1 \
+  --warmup-paths 5 \
+  --io-warmup-layers 3 \
+  --prepare-ssd-file \
+  --run-id <diagnostic-run-id>
+```
+
+The formal protocol requires five isolated repeats and 100 path samples per
+hit rate:
+
+```bash
+.venv/bin/python scripts/keye_trace/profile_sparse_mla_ssd_path.py \
+  --hit-rates 0,90,95,97,99,99.5,100 \
+  --path-samples 100 \
+  --independent-repeats 5 \
+  --warmup-paths 20 \
+  --io-warmup-layers 10 \
+  --run-id <formal-run-id>
+```
+
+Raw per-path samples, the pooled mean/P99 summary, job-level CSVs, compiled I/O
+helper, and manifest are written under ignored `data/motivation/<run-id>/`.
+Mean and P99 are normalized independently to their corresponding 100%-hit
+compute-only values. The experiment excludes index scoring, top-k selection,
+SSD-to-GPU transfer, communication, MoE, and other transformer work.
+
 ### Deprecated Figure 1 GPU profiles
 
 The following protocols are retained only for traceability. They supported the
