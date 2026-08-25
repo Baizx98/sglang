@@ -920,3 +920,39 @@ explanation table, not permission to retune the frozen external-test policy.
 Gate E0 is complete at p4, retained-output quality passes, both Gate E1 runs
 pass the independent output audit, all 48 layers are present in the paired
 run, and all request pairs are matched in the layer-sampling calibration.
+
+## Figure 3: tau3-bench Top-k predictability
+
+Figure 3 uses the current official tau3-bench `base` workload, not legacy
+tau-bench. `prepare_tau3bench_figure3.py` admits only official trial-0
+trajectories whose `user_scenario` and `initial_state` exactly match the
+current task definitions, then rebuilds each prompt with the pinned current
+policy and tool schemas. Hidden environment state is never synthesized into
+the prompt.
+
+```bash
+.venv/bin/python scripts/keye_trace/prepare_tau3bench_figure3.py \
+  --tau-root /Tan/keye_sglang/datasets/tau3-bench \
+  --model-path /Tan/model/Keye-VL-2.0-30B-A3B \
+  --output-dir /Tan/keye_sglang/figure3/<run-id>
+
+.venv/bin/python scripts/keye_trace/run_tau3bench_figure3.py \
+  --prepared-requests /Tan/keye_sglang/figure3/<run-id>/prepared_requests.jsonl \
+  --output /Tan/keye_sglang/figure3/<run-id>/replay_responses.jsonl \
+  --decode-steps 20
+
+.venv/bin/python scripts/keye_trace/analyze_tau3bench_figure3.py \
+  --run-dir /Tan/keye_sglang/figure3/<run-id> \
+  --output-dir /Tan/keye_sglang/figure3/<run-id>/analysis
+
+.venv/bin/python scripts/keye_trace/plot_tau3bench_figure3.py \
+  --data-dir /Tan/keye_sglang/figure3/<run-id>/analysis \
+  --output-dir /Tan/keye_sglang/figure3/<run-id>/figures
+```
+
+Collection requires `KEYE_SM80_EXACT_TOPK=1`, all 48 trace layers, at least
+20 decode steps, and a request-ID prefix matching `fig3tau3__`. The analyzer
+rejects incomplete request/layer/step coverage and any backend other than
+`torch_exact`. Raw `.pt` chunks and the full `topk_trace.parquet` remain on
+`/Tan`; only compact, validated plotting data belongs in the research-note
+repository.
