@@ -15,7 +15,7 @@ from mpl_toolkits.axes_grid1 import make_axes_locatable
 
 
 AGE_BINS = ["0", "1", "2", "3", "4-7", "8+"]
-AGE_TICK_LABELS = ["0", "1", "2", "3", "4–7", "8+"]
+AGE_TICK_LABELS = ["0", "1", "2", "3", r"$4^{+}$", r"$8^{+}$"]
 TYPE_ORDER = [
     "system_instruction",
     "tool_schema",
@@ -253,9 +253,6 @@ def draw_instances(
         rasterized=True,
     )
     ax.set_xticks(range(len(AGE_BINS)), AGE_TICK_LABELS)
-    # The two widest labels share a compact axis; lower only 4–7 slightly so
-    # both remain horizontal and readable without widening the heatmap.
-    ax.get_xticklabels()[4].set_y(-0.045)
     ax.set_xlabel("Region age (turns)")
     if label_instances:
         labels = [f"{row.session_id} · {row.region_label}" for row in regions.itertuples()]
