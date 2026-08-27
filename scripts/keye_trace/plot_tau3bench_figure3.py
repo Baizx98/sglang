@@ -15,7 +15,7 @@ from mpl_toolkits.axes_grid1 import make_axes_locatable
 
 
 AGE_BINS = ["0", "1", "2", "3", "4-7", "8+"]
-AGE_TICK_LABELS = ["0", "1", "2", "3", r"$4^{+}$", r"$8^{+}$"]
+AGE_TICK_LABELS = ["0", "1", "2", "3", "4⁺", "8⁺"]
 TYPE_ORDER = [
     "system_instruction",
     "tool_schema",
