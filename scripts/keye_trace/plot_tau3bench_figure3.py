@@ -11,9 +11,11 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from matplotlib.colors import TwoSlopeNorm
+from mpl_toolkits.axes_grid1 import make_axes_locatable
 
 
 AGE_BINS = ["0", "1", "2", "3", "4-7", "8+"]
+AGE_TICK_LABELS = ["0", "1", "2", "3", "4–7", "8+"]
 TYPE_ORDER = [
     "system_instruction",
     "tool_schema",
@@ -26,25 +28,44 @@ TYPE_LABELS = {
     "system_instruction": "System",
     "tool_schema": "Tool schema",
     "user_turn": "User turn",
-    "assistant_tool_call": "Asst. tool call",
+    "assistant_tool_call": "Tool call",
     "tool_result": "Tool result",
-    "assistant_response": "Asst. response",
+    "assistant_response": "Response",
 }
+
+# Standalone panels are designed in physical inches so their plot frames have
+# exactly the same height.  Their widths intentionally differ: panel (b) is
+# narrow to avoid stretching 205 instance rows into very long rectangles.
+PANEL_HEIGHT = 2.50
+PLOT_BOTTOM = 0.68
+PLOT_HEIGHT = 1.50
+COLORBAR_WIDTH = 0.06
+COLORBAR_PAD = 0.04
+A_WIDTH = 2.60
+A_PLOT_LEFT = 0.45
+A_PLOT_WIDTH = 1.45
+B_WIDTH = 3.38
+B_PLOT_LEFT = 1.33
+B_PLOT_WIDTH = 1.25
+COMBINED_GAP = 0.08
 
 
 def configure_style() -> None:
     mpl.rcParams.update(
         {
             "font.family": "DejaVu Sans",
-            "font.size": 9,
-            "axes.labelsize": 9,
-            "xtick.labelsize": 8,
-            "ytick.labelsize": 8,
+            # The two standalone PDFs are expected to be scaled by about 0.56x
+            # when placed side by side in a FAST single column.  These source
+            # sizes therefore render at roughly 9 pt / 8 pt in the paper.
+            "font.size": 16.0,
+            "axes.labelsize": 16.0,
+            "xtick.labelsize": 14.0,
+            "ytick.labelsize": 14.0,
             "axes.linewidth": 0.7,
             "xtick.major.width": 0.7,
             "ytick.major.width": 0.7,
-            "xtick.major.size": 3.0,
-            "ytick.major.size": 3.0,
+            "xtick.major.size": 0.0,
+            "ytick.major.size": 0.0,
             "pdf.fonttype": 42,
             "ps.fonttype": 42,
             "savefig.facecolor": "white",
@@ -57,7 +78,60 @@ def style_axes(ax: plt.Axes) -> None:
         spine.set_visible(True)
         spine.set_linewidth(0.7)
         spine.set_color("#555555")
-    ax.tick_params(direction="in", top=False, right=False)
+    # Retain tick labels, but remove tick marks from both heatmap frames.
+    ax.tick_params(axis="both", which="both", length=0, top=False, right=False)
+
+
+def style_colorbar(colorbar: mpl.colorbar.Colorbar, *, labelsize: float = 12.5) -> None:
+    """Place colorbar ticks outside on the right without changing its height."""
+
+    colorbar.ax.yaxis.set_ticks_position("right")
+    colorbar.ax.yaxis.set_label_position("right")
+    colorbar.ax.tick_params(
+        axis="y",
+        which="both",
+        direction="out",
+        left=False,
+        right=True,
+        length=3.0,
+        width=0.7,
+        labelsize=labelsize,
+        pad=2.0,
+    )
+    colorbar.ax.yaxis.label.set_size(13.0)
+    colorbar.outline.set_linewidth(0.6)
+
+
+def add_panel_axes(
+    fig: plt.Figure,
+    *,
+    x_offset: float,
+    plot_left: float,
+    plot_width: float,
+) -> tuple[plt.Axes, plt.Axes]:
+    """Create a plot frame and an exactly height-aligned colorbar axis."""
+
+    figure_width = fig.get_figwidth()
+    figure_height = fig.get_figheight()
+    plot_x = x_offset + plot_left
+    colorbar_x = plot_x + plot_width + COLORBAR_PAD
+    ax = fig.add_axes(
+        [
+            plot_x / figure_width,
+            PLOT_BOTTOM / figure_height,
+            plot_width / figure_width,
+            PLOT_HEIGHT / figure_height,
+        ]
+    )
+    colorbar_ax = fig.add_axes(
+        [
+            colorbar_x / figure_width,
+            PLOT_BOTTOM / figure_height,
+            COLORBAR_WIDTH / figure_width,
+            PLOT_HEIGHT / figure_height,
+        ]
+    )
+    return ax, colorbar_ax
 
 
 def recall_matrix(data_dir: Path) -> tuple[np.ndarray, list[int], list[int]]:
@@ -80,7 +154,8 @@ def draw_recall(
     data_dir: Path,
     *,
     add_colorbar: bool = True,
-    colorbar_label: str = "Top-k recall",
+    colorbar_ax: plt.Axes | None = None,
+    colorbar_label: str = "Recall",
 ) -> None:
     matrix, x_values, y_values = recall_matrix(data_dir)
     cmap = mpl.colormaps["YlGnBu"].copy()
@@ -88,8 +163,8 @@ def draw_recall(
     image = ax.imshow(matrix, cmap=cmap, vmin=0.54, vmax=0.82, aspect="auto")
     ax.set_xticks(range(len(x_values)), [str(value) for value in x_values])
     ax.set_yticks(range(len(y_values)), [str(value) for value in y_values])
-    ax.set_xlabel(r"Past step distance  $\Delta t$")
-    ax.set_ylabel(r"Past layer distance  $\Delta l$")
+    ax.set_xlabel(r"Step gap  $\Delta t$")
+    ax.set_ylabel(r"Layer gap  $\Delta l$")
     for row in range(matrix.shape[0]):
         for column in range(matrix.shape[1]):
             value = matrix[row, column]
@@ -104,14 +179,18 @@ def draw_recall(
                 ha="center",
                 va="center",
                 color=color,
-                fontsize=7.2,
+                fontsize=11.5,
             )
     style_axes(ax)
     if add_colorbar:
-        colorbar = ax.figure.colorbar(image, ax=ax, fraction=0.045, pad=0.035)
+        if colorbar_ax is None:
+            divider = make_axes_locatable(ax)
+            colorbar_ax = divider.append_axes(
+                "right", size=COLORBAR_WIDTH, pad=COLORBAR_PAD
+            )
+        colorbar = ax.figure.colorbar(image, cax=colorbar_ax)
         colorbar.set_label(colorbar_label)
-        colorbar.ax.tick_params(direction="in", labelsize=7.5)
-        colorbar.outline.set_linewidth(0.6)
+        style_colorbar(colorbar)
 
 
 def instance_matrix(data_dir: Path) -> tuple[pd.DataFrame, np.ndarray, list[tuple[str, int, int]]]:
@@ -158,8 +237,8 @@ def draw_instances(
     data_dir: Path,
     *,
     add_colorbar: bool = True,
+    colorbar_ax: plt.Axes | None = None,
     label_instances: bool = False,
-    show_ylabel: bool = True,
 ) -> None:
     regions, matrix, groups = instance_matrix(data_dir)
     log_matrix = np.log2(matrix)
@@ -173,7 +252,10 @@ def draw_instances(
         aspect="auto",
         rasterized=True,
     )
-    ax.set_xticks(range(len(AGE_BINS)), AGE_BINS)
+    ax.set_xticks(range(len(AGE_BINS)), AGE_TICK_LABELS)
+    # The two widest labels share a compact axis; lower only 4–7 slightly so
+    # both remain horizontal and readable without widening the heatmap.
+    ax.get_xticklabels()[4].set_y(-0.045)
     ax.set_xlabel("Region age (turns)")
     if label_instances:
         labels = [f"{row.session_id} · {row.region_label}" for row in regions.itertuples()]
@@ -182,24 +264,31 @@ def draw_instances(
     else:
         centers = [(start + end - 1) / 2 for _, start, end in groups]
         ax.set_yticks(centers, [TYPE_LABELS[name] for name, _, _ in groups])
-    ax.set_ylabel("Region instances" if show_ylabel else "")
+    # The grouped y tick labels already identify the instance rows; omitting a
+    # redundant y-axis title preserves readable type labels at column scale.
+    ax.set_ylabel("")
     for _, _, end in groups[:-1]:
         ax.axhline(end - 0.5, color="white", linewidth=1.0)
         ax.axhline(end - 0.5, color="#777777", linewidth=0.35)
     style_axes(ax)
     if add_colorbar:
-        colorbar = ax.figure.colorbar(image, ax=ax, fraction=0.032, pad=0.025)
+        if colorbar_ax is None:
+            divider = make_axes_locatable(ax)
+            colorbar_ax = divider.append_axes(
+                "right", size=COLORBAR_WIDTH, pad=COLORBAR_PAD
+            )
+        colorbar = ax.figure.colorbar(image, cax=colorbar_ax)
         ticks = np.arange(-3, 4)
         colorbar.set_ticks(ticks)
-        colorbar.set_ticklabels(["0.125×", "0.25×", "0.5×", "1×", "2×", "4×", "8×"])
-        colorbar.set_label("Activation enrichment")
-        colorbar.ax.tick_params(direction="in", labelsize=7.2)
-        colorbar.outline.set_linewidth(0.6)
+        colorbar.set_ticklabels(["⅛×", "¼×", "½×", "1×", "2×", "4×", "8×"])
+        colorbar.set_label("Enrichment")
+        style_colorbar(colorbar, labelsize=12.0)
 
 
-def save(fig: plt.Figure, stem: Path) -> None:
-    fig.savefig(stem.with_suffix(".pdf"), bbox_inches="tight", pad_inches=0.02)
-    fig.savefig(stem.with_suffix(".png"), dpi=300, bbox_inches="tight", pad_inches=0.02)
+def save(fig: plt.Figure, stem: Path, *, tight: bool = False) -> None:
+    save_kwargs = {"bbox_inches": "tight", "pad_inches": 0.02} if tight else {}
+    fig.savefig(stem.with_suffix(".pdf"), **save_kwargs)
+    fig.savefig(stem.with_suffix(".png"), dpi=300, **save_kwargs)
     plt.close(fig)
 
 
@@ -211,45 +300,82 @@ def main() -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     configure_style()
 
-    fig_a, ax_a = plt.subplots(figsize=(3.25, 2.55))
-    fig_a.subplots_adjust(left=0.18, right=0.89, bottom=0.22, top=0.97)
-    draw_recall(ax_a, args.data_dir)
+    fig_a = plt.figure(figsize=(A_WIDTH, PANEL_HEIGHT))
+    ax_a, colorbar_a = add_panel_axes(
+        fig_a,
+        x_offset=0.0,
+        plot_left=A_PLOT_LEFT,
+        plot_width=A_PLOT_WIDTH,
+    )
+    draw_recall(ax_a, args.data_dir, colorbar_ax=colorbar_a)
     save(fig_a, args.output_dir / "figure3a_recent_topk_recall")
 
-    fig_b, ax_b = plt.subplots(figsize=(4.75, 3.10))
-    fig_b.subplots_adjust(left=0.22, right=0.91, bottom=0.18, top=0.97)
-    draw_instances(ax_b, args.data_dir)
+    fig_b = plt.figure(figsize=(B_WIDTH, PANEL_HEIGHT))
+    ax_b, colorbar_b = add_panel_axes(
+        fig_b,
+        x_offset=0.0,
+        plot_left=B_PLOT_LEFT,
+        plot_width=B_PLOT_WIDTH,
+    )
+    draw_instances(ax_b, args.data_dir, colorbar_ax=colorbar_b)
     save(fig_b, args.output_dir / "figure3b_region_instance_activation")
 
     fig_full, ax_full = plt.subplots(figsize=(8.0, 15.0))
     fig_full.subplots_adjust(left=0.42, right=0.91, bottom=0.06, top=0.99)
     draw_instances(ax_full, args.data_dir, label_instances=True)
-    save(fig_full, args.output_dir / "figure3b_region_instance_activation_labeled")
+    save(fig_full, args.output_dir / "figure3b_region_instance_activation_labeled", tight=True)
 
-    combined = plt.figure(figsize=(7.15, 3.12))
-    grid = combined.add_gridspec(
-        1, 2, width_ratios=[0.83, 1.45], left=0.075, right=0.985, bottom=0.18, top=0.96, wspace=0.58
+    combined_width = A_WIDTH + COMBINED_GAP + B_WIDTH
+    combined = plt.figure(figsize=(combined_width, PANEL_HEIGHT))
+    combined_a, combined_colorbar_a = add_panel_axes(
+        combined,
+        x_offset=0.0,
+        plot_left=A_PLOT_LEFT,
+        plot_width=A_PLOT_WIDTH,
     )
-    combined_a = combined.add_subplot(grid[0, 0])
-    combined_b = combined.add_subplot(grid[0, 1])
-    draw_recall(combined_a, args.data_dir, colorbar_label="Recall")
-    draw_instances(combined_b, args.data_dir, show_ylabel=False)
-    combined_a.text(-0.30, 1.04, "(a)", transform=combined_a.transAxes, fontsize=9)
-    combined_b.text(-0.25, 1.04, "(b)", transform=combined_b.transAxes, fontsize=9)
+    combined_b, combined_colorbar_b = add_panel_axes(
+        combined,
+        x_offset=A_WIDTH + COMBINED_GAP,
+        plot_left=B_PLOT_LEFT,
+        plot_width=B_PLOT_WIDTH,
+    )
+    draw_recall(
+        combined_a,
+        args.data_dir,
+        colorbar_ax=combined_colorbar_a,
+        colorbar_label="Recall",
+    )
+    draw_instances(
+        combined_b,
+        args.data_dir,
+        colorbar_ax=combined_colorbar_b,
+    )
     save(combined, args.output_dir / "figure3_tau3_topk_predictability")
 
-    regions, matrix, _ = instance_matrix(args.data_dir)
-    regions.assign(figure_row=np.arange(len(regions))).to_csv(
-        args.output_dir / "figure3b_row_order.csv", index=False
-    )
-    matrix_rows = regions[
-        ["session_id", "domain", "region_id", "region_type", "region_label", "created_turn"]
-    ].copy()
-    for column_index, age in enumerate(AGE_BINS):
-        matrix_rows[f"age_{age}"] = matrix[:, column_index]
-    matrix_rows.to_csv(args.output_dir / "figure3b_instance_heatmap.csv", index=False)
     activation_path = args.data_dir / "region_activation.parquet"
     if activation_path.exists():
+        # Only regenerate compact data artifacts from the authoritative raw
+        # parquet.  A figure-only rerender from copied CSVs must not round or
+        # drop provenance columns in those inputs.
+        regions, matrix, _ = instance_matrix(args.data_dir)
+        regions.assign(figure_row=np.arange(len(regions))).to_csv(
+            args.output_dir / "figure3b_row_order.csv", index=False
+        )
+        matrix_rows = regions[
+            [
+                "session_id",
+                "domain",
+                "region_id",
+                "region_type",
+                "region_label",
+                "created_turn",
+            ]
+        ].copy()
+        for column_index, age in enumerate(AGE_BINS):
+            matrix_rows[f"age_{age}"] = matrix[:, column_index]
+        matrix_rows.to_csv(
+            args.output_dir / "figure3b_instance_heatmap.csv", index=False
+        )
         activations = pd.read_parquet(activation_path)
         type_age = (
             activations.groupby(["region_type", "turn_age_bin"])["activation_enrichment"]
