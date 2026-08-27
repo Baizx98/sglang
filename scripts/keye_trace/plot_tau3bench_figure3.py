@@ -15,7 +15,8 @@ from mpl_toolkits.axes_grid1 import make_axes_locatable
 
 
 AGE_BINS = ["0", "1", "2", "3", "4-7", "8+"]
-AGE_TICK_LABELS = ["0", "1", "2", "3", "4⁺", "8⁺"]
+AGE_TICK_LABELS = ["0", "1", "2", "3", "4", "8"]
+AGE_PLUS_COLUMNS = (4, 5)
 TYPE_ORDER = [
     "system_instruction",
     "tool_schema",
@@ -253,6 +254,20 @@ def draw_instances(
         rasterized=True,
     )
     ax.set_xticks(range(len(AGE_BINS)), AGE_TICK_LABELS)
+    # Keep the base digits centered on their heatmap columns.  Draw the compact
+    # plus signs separately so their width does not shift the 4/8 tick labels.
+    for column in AGE_PLUS_COLUMNS:
+        ax.annotate(
+            "+",
+            xy=(column, 0.0),
+            xycoords=ax.get_xaxis_transform(),
+            xytext=(5.0, -1.5),
+            textcoords="offset points",
+            ha="center",
+            va="top",
+            fontsize=9.0,
+            annotation_clip=False,
+        )
     ax.set_xlabel("Region age (turns)")
     if label_instances:
         labels = [f"{row.session_id} · {row.region_label}" for row in regions.itertuples()]
