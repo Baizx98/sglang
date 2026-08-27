@@ -37,9 +37,10 @@ TYPE_LABELS = {
 # Standalone panels are designed in physical inches so their plot frames have
 # exactly the same height.  Their widths intentionally differ: panel (b) is
 # narrow to avoid stretching 205 instance rows into very long rectangles.
-PANEL_HEIGHT = 2.50
 PLOT_BOTTOM = 0.68
 PLOT_HEIGHT = 1.50
+PLOT_TOP_MARGIN = 0.14
+PANEL_HEIGHT = PLOT_BOTTOM + PLOT_HEIGHT + PLOT_TOP_MARGIN
 COLORBAR_WIDTH = 0.06
 COLORBAR_PAD = 0.04
 A_WIDTH = 2.60
