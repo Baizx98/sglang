@@ -981,7 +981,7 @@ LongBench v2 Parquet 和 LongBench v1 ZIP 生成冻结请求，使用 Keye chat 
 
 ```bash
 .venv/bin/python scripts/keye_trace/run_horizonkv_motivation.py \
-  --requests data/horizonkv-motivation/2026-10-14_pilot-v01/workloads/requests.jsonl \
+  --requests data/horizonkv-motivation/2026-10-14_pilot-v01/workloads-v02/requests.jsonl \
   --run-dir data/horizonkv-motivation/2026-10-14_multitype-pilot-v01 \
   --pilot --storage-configs hbm,dram,lru4096 \
   --concurrencies 1 --repetitions 1 --max-new-tokens 32

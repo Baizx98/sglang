@@ -86,6 +86,10 @@ def run_wave(url, rows, prefix, max_tokens, timeout):
 
 
 def main():
+    def stop_owned_job(_signum, _frame):
+        raise KeyboardInterrupt("Owned motivation job interrupted")
+
+    signal.signal(signal.SIGTERM, stop_owned_job)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--requests", type=Path, required=True)
     parser.add_argument("--run-dir", type=Path, required=True)
@@ -192,6 +196,10 @@ def main():
             if output.exists()
             else []
         )
+        if any(value.get("output_ids_equal_hbm") is False for value in existing):
+            raise RuntimeError(
+                "This run contains a failed exact-output gate; investigate and use a new directory"
+            )
         completed_groups = defaultdict(set)
         for v in existing:
             completed_groups[(v["wave_index"], v["repetition"], v["phase"])].add(
@@ -222,6 +230,16 @@ def main():
         pending = [v for v in tasks if v not in done]
         if not pending:
             continue
+        live_commit = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=REPO, text=True
+        ).strip()
+        dirty = subprocess.check_output(
+            ["git", "status", "--porcelain"], cwd=REPO, text=True
+        ).strip()
+        if live_commit != plan["source_commit"] or dirty:
+            raise RuntimeError(
+                "Source checkout changed; stop before mixing code versions in a run"
+            )
         env = os.environ.copy()
         for k in list(env):
             if k.startswith(("KEYE_", "SGLANG_")):
