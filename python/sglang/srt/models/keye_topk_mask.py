@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
+from sglang.srt.layers.attention.keye_topk.horizonkv_probe import profiled
 import torch.nn as nn
 from transformers import PretrainedConfig
 
@@ -246,6 +247,7 @@ class KeyeTopKMaskAttention(nn.Module):
         k = k_by_head.view(k.shape)
         return q, k
 
+    @profiled("self_attention_total")
     def forward(
         self,
         positions: torch.Tensor,

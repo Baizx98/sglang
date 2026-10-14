@@ -56,6 +56,8 @@ from sglang.srt.layers.attention.nsa.transform_index import (
     transform_index_page_table_prefill,
 )
 
+from sglang.srt.layers.attention.keye_topk.horizonkv_probe import span, storage_mode
+
 logger = logging.getLogger(__name__)
 _use_sm80_dsa = os.getenv("KEYE_SM80_DSA", "0") == "1"
 
@@ -329,6 +331,10 @@ class KeyeSparseAttnBackend(AttentionBackend):
             ragged_offsets_size = chunked_prefill_size if chunked_prefill_size is not None else 16384
             self.zero_ragged_offset = torch.zeros((ragged_offsets_size,), device=self.device, dtype=torch.int32)
 
+        if storage_mode() != "hbm":
+            args = model_runner.server_args
+            if not args.disable_cuda_graph or not args.disable_radix_cache or self.deterministic_topk:
+                raise ValueError("Horizon host prototype requires eager execution, disabled radix cache and logical top-k")
         self.use_sm80_dsa = _use_sm80_dsa
         self.sm80_workspace = KeyeDSAWorkspace() if self.use_sm80_dsa else None
         if self.use_sm80_dsa:
@@ -710,8 +716,12 @@ class KeyeSparseAttnBackend(AttentionBackend):
                     extend_lens_cpu=metadata.sa_extend_seq_lens_list,
                     page_size=1,
                 )
-            k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
-            v_cache = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
+            pool = forward_batch.token_to_kv_pool
+            if hasattr(pool, "horizon_store"):
+                k_cache, v_cache, token_slots = pool.horizon_store.prefill(layer.layer_id, metadata, token_slots)
+            else:
+                k_cache = pool.get_key_buffer(layer.layer_id)
+                v_cache = pool.get_value_buffer(layer.layer_id)
             return keye_dsa_paged_attention(
                 q,
                 k_cache,
@@ -769,38 +779,52 @@ class KeyeSparseAttnBackend(AttentionBackend):
                 if not layer.is_cross_attention
                 else forward_batch.encoder_out_cache_loc
             )
-            forward_batch.token_to_kv_pool.set_kv_buffer(
-                layer, cache_loc, k, v, layer.k_scale, layer.v_scale
-            )
+            component = "kv_d2h_writeback" if storage_mode() != "hbm" else "kv_buffer_write"
+            with span(forward_batch, layer.layer_id, component, bytes=k.numel()*k.element_size()+v.numel()*v.element_size()):
+                forward_batch.token_to_kv_pool.set_kv_buffer(
+                    layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+                )
 
         metadata = self.forward_metadata
         q = q.view(-1, self.num_q_heads, self.head_dim)
 
-        k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
-        v_cache = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
+        pool = forward_batch.token_to_kv_pool
+        k_cache = v_cache = None
+        if not hasattr(pool, "horizon_store"):
+            k_cache = pool.get_key_buffer(layer.layer_id)
+            v_cache = pool.get_value_buffer(layer.layer_id)
 
         # Sparse path: use token-level page_table_1 (page_size=1), mirroring NSA _forward_fa3.
         # kv_cache is viewed with page_size=1 so each page_table entry is a physical slot id.
         token_slots = topk_indices
         if not self.deterministic_topk:
-            token_slots = transform_index_page_table_decode(
-                page_table=metadata.page_table_1,
-                topk_indices=topk_indices,
-                page_size=1,
-            )
+            with span(forward_batch, layer.layer_id, "kv_lookup_device"):
+                token_slots = transform_index_page_table_decode(
+                    page_table=metadata.page_table_1,
+                    topk_indices=topk_indices,
+                    page_size=1,
+                )
 
         if self.use_sm80_dsa:
-            return keye_dsa_paged_attention(
-                q,
-                k_cache,
-                v_cache,
-                token_slots,
-                num_q_heads=self.num_q_heads,
-                head_dim=self.head_dim,
-                sm_scale=layer.scaling,
-                is_decode=True,
-                workspace=self.sm80_workspace,
-            )
+            if hasattr(pool, "horizon_store"):
+                with span(forward_batch, layer.layer_id, "kv_selection_to_cpu"):
+                    cpu_slots = token_slots.cpu()
+                    cpu_indices = topk_indices.cpu()
+                k_cache, v_cache, token_slots = pool.horizon_store.layers[layer.layer_id-pool.start_layer].stage(
+                    cpu_slots, forward_batch, layer.layer_id, cpu_indices
+                )
+            with span(forward_batch, layer.layer_id, "attention_compute"):
+                return keye_dsa_paged_attention(
+                    q,
+                    k_cache,
+                    v_cache,
+                    token_slots,
+                    num_q_heads=self.num_q_heads,
+                    head_dim=self.head_dim,
+                    sm_scale=layer.scaling,
+                    is_decode=True,
+                    workspace=self.sm80_workspace,
+                )
 
         k_cache_view = k_cache.view(-1, 1, self.num_kv_heads, self.head_dim)
         v_cache_view = v_cache.view(-1, 1, self.num_kv_heads, self.head_dim)

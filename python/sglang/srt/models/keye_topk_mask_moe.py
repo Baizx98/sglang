@@ -15,6 +15,7 @@ import logging
 from typing import Iterable, Optional, Tuple
 
 import torch
+from sglang.srt.layers.attention.keye_topk.horizonkv_probe import profiled
 from transformers import PretrainedConfig
 
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
@@ -81,6 +82,12 @@ class KeyeTopKMaskMoeDecoderLayer(Qwen3MoeDecoderLayer):
                 sa_config=sa_config,
             )
 
+    @profiled("layer_total")
+    def forward(self, positions, hidden_states, forward_batch, residual,
+                captured_last_layer_outputs=None, **kwargs):
+        return super().forward(positions, hidden_states, forward_batch, residual,
+                               captured_last_layer_outputs, **kwargs)
+
 
 class KeyeTopKMaskMoeModel(Qwen3MoeModel):
     def __init__(
@@ -128,6 +135,10 @@ class KeyeVL2MoeForConditionalGeneration(KeyeVL1_5ForConditionalGeneration):
             prefix=prefix,
             language_model_cls=KeyeTopKMaskMoeModel,
         )
+
+    @profiled("model_total")
+    def forward(self, input_ids, positions, forward_batch, get_embedding=False):
+        return super().forward(input_ids, positions, forward_batch, get_embedding)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [

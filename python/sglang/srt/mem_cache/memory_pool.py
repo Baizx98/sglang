@@ -2133,6 +2133,33 @@ class KeyeTokenToKVPool(MHATokenToKVPool):
         torch.bfloat16 if use_sm80_dsa else torch.uint8
     )
 
+    def _create_buffers(self):
+        from sglang.srt.layers.attention.keye_topk.horizonkv_probe import HostStore, storage_mode
+        if storage_mode() == "hbm":
+            return super()._create_buffers()
+        self.horizon_store = HostStore(self)
+        self.k_buffer = [layer.k for layer in self.horizon_store.layers]
+        self.v_buffer = [layer.v for layer in self.horizon_store.layers]
+        # Host pointers must never be exposed to the GPU cache-copy kernels.
+        self.k_data_ptrs = torch.zeros(self.layer_num, dtype=torch.uint64, device=self.device)
+        self.v_data_ptrs = torch.zeros_like(self.k_data_ptrs)
+        self.data_ptrs = torch.cat([self.k_data_ptrs, self.v_data_ptrs])
+        self.data_strides = torch.zeros(self.layer_num * 2, dtype=torch.int64, device=self.device)
+
+    def set_kv_buffer(self, layer, loc, cache_k, cache_v, k_scale=None, v_scale=None,
+                      layer_id_override=None):
+        if not hasattr(self, "horizon_store"):
+            return super().set_kv_buffer(layer, loc, cache_k, cache_v, k_scale, v_scale, layer_id_override)
+        if k_scale is not None or v_scale is not None or cache_k.dtype != self.dtype:
+            raise ValueError("Horizon host prototype requires unscaled native KV dtype")
+        self.horizon_store.write(layer.layer_id if layer_id_override is None else layer_id_override,
+                                 loc, cache_k, cache_v)
+
+    def move_kv_cache(self, tgt_loc, src_loc):
+        if hasattr(self, "horizon_store"):
+            raise RuntimeError("Horizon host storage does not support prefix-cache KV relocation")
+        return super().move_kv_cache(tgt_loc, src_loc)
+
     def _should_finalize_in_init(self) -> bool:
         return False
 
@@ -2153,6 +2180,9 @@ class KeyeTokenToKVPool(MHATokenToKVPool):
         enable_alt_stream: bool = True,
         enable_kv_cache_copy: bool = False,
     ):
+        from sglang.srt.layers.attention.keye_topk.horizonkv_probe import storage_mode
+        if storage_mode() != "hbm" and enable_kv_cache_copy:
+            raise ValueError("Disable GPU-only KV cache copy with Horizon host storage")
         assert page_size == 64, (
             f"KeyeTokenToKVPool requires page_size=64 for FP8 kernels, got {page_size}"
         )

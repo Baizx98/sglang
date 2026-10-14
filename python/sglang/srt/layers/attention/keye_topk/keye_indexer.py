@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
+from sglang.srt.layers.attention.keye_topk.horizonkv_probe import profiled, span
 from sglang.srt.layers.attention.nsa.nsa_indexer import BaseIndexerMetadata
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
@@ -608,6 +609,7 @@ class KeyeIndexer(MultiPlatformOp):
     # Main forward
     # ------------------------------------------------------------------
 
+    @profiled("indexer_total")
     def forward_cuda(
         self,
         x: torch.Tensor,
@@ -1448,15 +1450,13 @@ class KeyeIndexer(MultiPlatformOp):
             )
 
             seqlens = metadata.get_seqlens_int32()
-            scores = keye_indexer_score_paged(
-                query,
-                key_cache,
-                page_table,
-                weights,
-                seqlens,
-                self.softmax_scale,
-            )
-            return self._topk_sm80(scores, seqlens), scores
+            with span(forward_batch, layer_id, "indexer_score"):
+                scores = keye_indexer_score_paged(
+                    query, key_cache, page_table, weights, seqlens, self.softmax_scale,
+                )
+            with span(forward_batch, layer_id, "indexer_topk"):
+                indices = self._topk_sm80(scores, seqlens)
+            return indices, scores
 
         result = torch.full(
             (x.shape[0], self.topk), -1, dtype=torch.int32, device=x.device

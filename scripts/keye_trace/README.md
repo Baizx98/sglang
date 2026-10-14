@@ -956,3 +956,49 @@ rejects incomplete request/layer/step coverage and any backend other than
 `torch_exact`. Raw `.pt` chunks and the full `topk_trace.parquet` remain on
 `/Tan`; only compact, validated plotting data belongs in the research-note
 repository.
+
+## HorizonKV HBM–DRAM 动机实验
+
+分支 `codex/horizonkv-motivation` 使用 `horizonkv_probe.py` 做真实 Keye 对照：
+`KEYE_HORIZON_STORAGE=hbm|dram|lru`。DRAM 保存完整 Main KV，Indexer keys
+继续驻留 GPU；chunked prefill 只暂存当前层，Decode 按原生精确 Top-k 回取。
+LRU 是 CPU/Python 管理、每层全请求共享预算、token 粒度的按需原型，
+不是 HiSparse/ECHO 的优化实现；禁止前瞻、精排、预取、SSD 与跨请求 prefix 共享。
+`KEYE_HORIZON_CACHE_TOKENS` 是每层、每个 TP rank 的总 KV token 容量。
+同时访问按物理 token 槽位升序打破 LRU 时间戳平局；槽位重用时失效旧缓存。
+
+先执行实际 GPU 验证：
+
+```bash
+CUDA_VISIBLE_DEVICES=GPU-4eac01c5-47d1-3958-95bb-98d357b8b9c3 \
+  .venv/bin/python scripts/keye_trace/test_horizonkv_host_store.py
+```
+
+`prepare_horizonkv_workloads.py` 从已核验 RULER generation manifest、
+LongBench v2 Parquet 和 LongBench v1 ZIP 生成冻结请求，使用 Keye chat template。
+种子 20261014，每子任务×实际长度桶最多 20 条，不足如实记录，不截断/拼接自然输入。
+模型与数据下载、原始 prompt、trace、日志均留在忽略的 `data/`。
+
+```bash
+.venv/bin/python scripts/keye_trace/run_horizonkv_motivation.py \
+  --requests data/horizonkv-motivation/2026-10-14_pilot-v01/workloads/requests.jsonl \
+  --run-dir data/horizonkv-motivation/2026-10-14_multitype-pilot-v01 \
+  --pilot --storage-configs hbm,dram,lru4096 \
+  --concurrencies 1 --repetitions 1 --max-new-tokens 32
+```
+
+正式范围使用完整 manifest、5 次重复、最大生成 256 tokens，按实际资源分阶段展开。
+同一 run-dir 可恢复已完成请求；请求清单、代码提交或参数变化必须使用新 run-dir。
+批量 SSE 一次提交整个 wave，保留正常 EOS、实际 active batch 和不可行点。
+先等待服务器**完成自动暖机**，避免把待测请求与暖机请求混批。
+
+计时轮 `horizon__` 只记录 CUDA events；集合轮 `selection__` 记录同一 LRU
+执行中的 Top-k 与加载前 Miss，二者均与 `control__` 无 instrumentation 的原生输出对拍。
+CUDA stream spans 包括主机造成的 GPU 空闲，不能叫累计 kernel 时间；
+按嵌套关系扣除重复项，使用同 rank 的相对时间还原 lookup→回取→Attention 依赖。
+无 trace 控制轮用于评估计时扰动，集合轮的延迟不能当性能数据。
+过滤预测位置超过实际输出的 in-flight 尾部 step；缓存冷态、暖态分别报告。
+原始集合默认只保留前两步供审计，逐步交集/真实 Miss 计数保留完整。
+
+阶段报告与绘图直接数据进入 `my_research_note/projects/horizonkv/branches/main/`；
+此处生成的单次功能诊断或 pilot 不构成论文正式性能结论。
