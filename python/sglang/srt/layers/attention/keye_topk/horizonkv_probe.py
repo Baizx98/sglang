@@ -224,6 +224,10 @@ class HostLayer:
                 for token in selected
                 if token in self.resident
             }
+            if os.getenv("KEYE_HORIZON_CAPACITY_DIR"):
+                from .capacity_trace import observe_hits
+
+                observe_hits(batch, layer_id, slots, hits)
             miss_positions = [
                 i
                 for i, token in enumerate(flat.tolist())

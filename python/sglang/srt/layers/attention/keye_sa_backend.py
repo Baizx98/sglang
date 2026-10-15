@@ -694,6 +694,7 @@ class KeyeSparseAttnBackend(AttentionBackend):
     ) -> torch.Tensor:
         """Prefill forward using the selected sparse-attention implementation."""
         topk_indices = kwargs["topk_indices"]
+
         if k is not None and v is not None and save_kv_cache:
             cache_loc = (
                 forward_batch.out_cache_loc
@@ -773,6 +774,11 @@ class KeyeSparseAttnBackend(AttentionBackend):
             assert _has_flash_attn, "flash_attn is required for decode"
         topk_indices = kwargs["topk_indices"]
 
+        if os.getenv("KEYE_HORIZON_CAPACITY_DIR"):
+            from sglang.srt.layers.attention.keye_topk.capacity_trace import begin_layer
+
+            begin_layer(forward_batch, layer.layer_id, forward_batch.token_to_kv_pool)
+
         if k is not None and v is not None and save_kv_cache:
             cache_loc = (
                 forward_batch.out_cache_loc
@@ -806,6 +812,7 @@ class KeyeSparseAttnBackend(AttentionBackend):
                 )
 
         if self.use_sm80_dsa:
+            capacity_slots = token_slots
             if hasattr(pool, "horizon_store"):
                 with span(forward_batch, layer.layer_id, "kv_selection_to_cpu"):
                     cpu_slots = token_slots.cpu()
@@ -813,6 +820,10 @@ class KeyeSparseAttnBackend(AttentionBackend):
                 k_cache, v_cache, token_slots = pool.horizon_store.layers[layer.layer_id-pool.start_layer].stage(
                     cpu_slots, forward_batch, layer.layer_id, cpu_indices
                 )
+            if os.getenv("KEYE_HORIZON_CAPACITY_DIR"):
+                from sglang.srt.layers.attention.keye_topk.capacity_trace import record
+
+                record(forward_batch, layer.layer_id, topk_indices, capacity_slots, forward_batch.out_cache_loc)
             with span(forward_batch, layer.layer_id, "attention_compute"):
                 return keye_dsa_paged_attention(
                     q,

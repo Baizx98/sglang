@@ -1027,3 +1027,27 @@ CUDA stream spans 包括主机造成的 GPU 空闲，不能叫累计 kernel 时�
 不同 batch size 下生成历史相同。
 计时存在明显扰动或 CPU 缓存管理占主导时，诊断表不能用于正式瓶颈结论。
 清洗验证后将 CSV 和阶段报告归档研究笔记，不迁移原始日志或完整 trace。
+
+
+### 固定 C4 的 LRU 容量扫描
+
+`run_horizonkv_capacity.py` 冻结 RULER multikey 32K 的 20 个不同请求，采集
+五个四请求 wave（最大生成 256 tokens、正常 EOS），再回放 11 个容量点。
+`capacity_trace.py` 在原生后端同时记录逻辑 Top-K、物理槽位和当前 KV 写入，
+逐 wave 显式清空 Main KV LRU，二进制 trace 不记录 CUDA spans 或全量 scores。
+两 rank 分开审计；回放保留 batch 的加载前快照、命中 recency、按物理槽位排序
+的 Miss 准入和写回失效，不能替换成普通逐 token LRU。
+
+```bash
+CUDA_VISIBLE_DEVICES=GPU-4eac01c5-47d1-3958-95bb-98d357b8b9c3 \
+  .venv/bin/python scripts/keye_trace/test_horizonkv_capacity.py --gpu
+.venv/bin/python scripts/keye_trace/run_horizonkv_capacity.py \
+  --requests data/horizonkv-motivation/2026-10-14_pilot-v01/workloads-v02/requests.jsonl \
+  --run-dir data/horizonkv-motivation/2026-10-15_capacity-c4-v01
+```
+
+主曲线来自冻结 HBM 访问 trace 的 CPU 回放，不能称在线性能实测。
+另在 B=2048/8192/32768 各运行首个四请求组，以该次真实 trace 逐层/step
+核对线上 hit 计数；不同运行的生成轨迹变化单独记录，不混入主曲线。
+`--phase collect|replay|online` 可分阶段执行；已有采集文件拒绝覆盖。
+所有 trace 和分析中间文件留在 data/；清洗的制图数据归档研究笔记。
