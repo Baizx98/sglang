@@ -1023,5 +1023,7 @@ CUDA stream spans 包括主机造成的 GPU 空闲，不能叫累计 kernel 时�
 `exclude_first_decode` 只排除首个 Decode，不宣称已进入缓存暖态；`last16`
 是后 16 个输出间隔，不能替代完整 TPOT 或严格吞吐量测量。
 不同 rank 的选择可能不同，必须保留差异，不将两 rank 当成独立样本。
+另核验冻结请求 hash 和跨并发输出轨迹；同 wave 的 HBM 对拍通过，不代表
+不同 batch size 下生成历史相同。
 计时存在明显扰动或 CPU 缓存管理占主导时，诊断表不能用于正式瓶颈结论。
 清洗验证后将 CSV 和阶段报告归档研究笔记，不迁移原始日志或完整 trace。

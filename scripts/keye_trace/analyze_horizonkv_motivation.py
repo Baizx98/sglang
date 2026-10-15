@@ -148,6 +148,10 @@ def main():
                 error_examples.append({"error": name, "detail": detail})
 
     check(load(run / "state.json")["status"] == "completed", "run_not_completed")
+    request_path = Path(launch["command"][launch["command"].index("--requests") + 1])
+    with request_path.open("rb") as stream:
+        frozen_request_sha256 = hashlib.file_digest(stream, "sha256").hexdigest()
+    check(frozen_request_sha256 == plan["requests_sha256"], "frozen_request_hash")
     all_records, requests, latency = [], {}, []
     for config in plan["configs"]:
         current = list(rows(run / config / "requests.jsonl"))
@@ -244,6 +248,33 @@ def main():
             "independent_output_mismatch",
             v["rid"],
         )
+    by_case = defaultdict(list)
+    for value in all_records:
+        if value["config"] == "hbm" and value["phase"] == "control":
+            by_case[value["case_id"]].append(value)
+    cross_concurrency = {}
+    for case, values in by_case.items():
+        reference_ids = min(values, key=lambda v: v["requested_concurrency"])[
+            "response"
+        ]["output_ids"]
+        variants = {tuple(v["response"]["output_ids"]) for v in values}
+        if len(variants) > 1:
+            cross_concurrency[case] = {
+                "distinct_output_sequences": len(variants),
+                "first_difference_zero_based_by_concurrency": {
+                    v["requested_concurrency"]: next(
+                        (
+                            i
+                            for i, (a, b) in enumerate(
+                                zip(reference_ids, v["response"]["output_ids"])
+                            )
+                            if a != b
+                        ),
+                        None,
+                    )
+                    for v in values
+                },
+            }
     paired_latency = {
         (v["config"], v["wave_index"], v["repetition"], v["case_id"], v["phase"]): v
         for v in latency
@@ -613,10 +644,13 @@ def main():
         "error_examples": error_examples,
         "events": event_audit,
         "cross_rank_selection": cross_rank,
+        "cross_concurrency_output_changes": cross_concurrency,
+        "frozen_request_sha256": frozen_request_sha256,
         "warnings": [
             "Timing/control perturbation must be assessed before using breakdown as performance evidence.",
             "Mixed-GPU rank selections differ; preserve ranks separately and investigate numerics before formal runs.",
             "CPU/Python LRU management overhead must not be attributed to PCIe.",
+            "HBM outputs can differ across batch sizes; per-wave equivalence does not establish identical trajectories across concurrency.",
         ],
         "input_sha256": hashes,
         "contract": "pilot diagnostics only; one repetition; stream TPOT may include prefill; last16 is a window, not proof of steady state; ranks are not independent samples",
