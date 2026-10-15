@@ -1002,3 +1002,26 @@ CUDA stream spans 包括主机造成的 GPU 空闲，不能叫累计 kernel 时�
 
 阶段报告与绘图直接数据进入 `my_research_note/projects/horizonkv/branches/main/`；
 此处生成的单次功能诊断或 pilot 不构成论文正式性能结论。
+
+
+### HorizonKV pilot 结果审计
+
+完成采集后用 CPU 审计，不启动模型：
+
+```bash
+.venv/bin/python scripts/keye_trace/analyze_horizonkv_motivation.py \
+  --run-dir data/horizonkv-motivation/2026-10-14_multitype-pilot-v01 \
+  --output-dir data/horizonkv-motivation/2026-10-14_multitype-pilot-v01/analysis \
+  --prefix 2026-10-15_1420
+```
+
+核对完整执行矩阵与独立 HBM-control 输出、31 个有效 Decode step、48 层、
+已保存集合的交集和 Miss 计数、两 rank 差异，以及 CUDA 父子区间/独占分解。
+32-token 输出的 step=31 是未返回给用户的尾部推测计算，剔除后仍保留排除数量。
+`audit-results.json` 保存原始输入 SHA256、代码与审计脚本 hash 和异常。
+三张 CSV 分别保存逐请求流式延迟、逐 wave/rank 的集合统计和计时诊断。
+`exclude_first_decode` 只排除首个 Decode，不宣称已进入缓存暖态；`last16`
+是后 16 个输出间隔，不能替代完整 TPOT 或严格吞吐量测量。
+不同 rank 的选择可能不同，必须保留差异，不将两 rank 当成独立样本。
+计时存在明显扰动或 CPU 缓存管理占主导时，诊断表不能用于正式瓶颈结论。
+清洗验证后将 CSV 和阶段报告归档研究笔记，不迁移原始日志或完整 trace。
