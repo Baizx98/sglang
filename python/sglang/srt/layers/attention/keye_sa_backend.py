@@ -774,7 +774,7 @@ class KeyeSparseAttnBackend(AttentionBackend):
             assert _has_flash_attn, "flash_attn is required for decode"
         topk_indices = kwargs["topk_indices"]
 
-        if os.getenv("KEYE_HORIZON_CAPACITY_DIR"):
+        if os.getenv("KEYE_HORIZON_CAPACITY_DIR") or os.getenv("KEYE_HORIZON_COLD_WAVES"):
             from sglang.srt.layers.attention.keye_topk.capacity_trace import begin_layer
 
             begin_layer(forward_batch, layer.layer_id, forward_batch.token_to_kv_pool)

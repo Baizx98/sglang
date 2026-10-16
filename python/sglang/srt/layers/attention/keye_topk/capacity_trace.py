@@ -92,7 +92,13 @@ def writer():
 
 def begin_layer(batch, layer_id, pool):
     global _wave
-    if not enabled(batch) or layer_id != 0:
+    tracing = enabled(batch)
+    cold_wave = (
+        os.getenv("KEYE_HORIZON_COLD_WAVES") == "1"
+        and batch.forward_mode.is_decode()
+        and bool(getattr(batch, "rids", None))
+    )
+    if layer_id != 0 or not (tracing or cold_wave):
         return
     waves = {"__".join(rid.split("__")[:3]) for rid in batch.rids}
     if len(waves) != 1:
@@ -106,17 +112,20 @@ def begin_layer(batch, layer_id, pool):
                 host.free = deque(range(host.capacity))
             if any(host.resident for host in store.layers):
                 raise RuntimeError("Main KV LRU reset failed")
-        writer().submit(
-            {
-                "kind": "reset",
-                "wave": wave,
-                "resident_after_reset": 0,
-                "storage_mode": os.getenv("KEYE_HORIZON_STORAGE", "hbm"),
-                "capacity": int(os.getenv("KEYE_HORIZON_CACHE_TOKENS", "0")),
-                "gpu_name": torch.cuda.get_device_name(),
-            }
-        )
+        if tracing:
+            writer().submit(
+                {
+                    "kind": "reset",
+                    "wave": wave,
+                    "resident_after_reset": 0,
+                    "storage_mode": os.getenv("KEYE_HORIZON_STORAGE", "hbm"),
+                    "capacity": int(os.getenv("KEYE_HORIZON_CACHE_TOKENS", "0")),
+                    "gpu_name": torch.cuda.get_device_name(),
+                }
+            )
         _wave = wave
+    if not tracing:
+        return
     batch._capacity_steps = [_steps.get(rid, 0) for rid in batch.rids]
     for rid in batch.rids:
         _steps[rid] = _steps.get(rid, 0) + 1

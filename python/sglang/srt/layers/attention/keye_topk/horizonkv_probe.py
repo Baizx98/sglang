@@ -124,6 +124,13 @@ def batch_metadata(batch, prefix=None):
 
 @contextmanager
 def span(batch, layer_id, component, **fields):
+    if os.getenv("KEYE_HORIZON_KERNEL_DIR"):
+        from .horizonkv_kernel_profile import active, component_scope
+
+        if active():
+            with component_scope(component, layer_id, fields):
+                yield
+            return
     metadata = batch_metadata(batch) if os.getenv("KEYE_HORIZON_PROBE_DIR") else None
     if metadata is None:
         yield
@@ -163,6 +170,20 @@ def profiled(component, batch_arg=3):
     def decorate(function):
         @wraps(function)
         def wrapper(self, *args, **kwargs):
+            if os.getenv("KEYE_HORIZON_KERNEL_DIR"):
+                from .horizonkv_kernel_profile import begin, end
+
+                batch = kwargs.get("forward_batch")
+                if batch is None:
+                    batch = args[batch_arg - 1]
+                if component == "model_total":
+                    begin(batch)
+                try:
+                    with span(batch, getattr(self, "layer_id", -1), component):
+                        return function(self, *args, **kwargs)
+                finally:
+                    if component == "model_total":
+                        end(batch)
             if not os.getenv("KEYE_HORIZON_PROBE_DIR"):
                 return function(self, *args, **kwargs)
             batch = kwargs.get("forward_batch")

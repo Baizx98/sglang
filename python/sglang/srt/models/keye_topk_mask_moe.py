@@ -12,6 +12,7 @@ KeyeTopKMaskMoe 模型实现 - sglang 版本
 """
 
 import logging
+import os
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -81,6 +82,11 @@ class KeyeTopKMaskMoeDecoderLayer(Qwen3MoeDecoderLayer):
                 alt_stream=alt_stream,
                 sa_config=sa_config,
             )
+        if os.getenv("KEYE_HORIZON_KERNEL_DIR"):
+            # Apply only to this Keye model; avoid changing the shared Qwen path.
+            self.mlp.forward = profiled("moe_ffn_compute", batch_arg=2)(
+                type(self.mlp).forward
+            ).__get__(self.mlp, type(self.mlp))
 
     @profiled("layer_total")
     def forward(self, positions, hidden_states, forward_batch, residual,
