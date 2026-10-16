@@ -38,16 +38,25 @@ def compile_collector(root):
     return target
 
 
-def inventory():
+def inventory(require_idle=False):
     text = subprocess.check_output([
-        "nvidia-smi", "--query-gpu=name,uuid,memory.total,memory.free,pci.bus_id,driver_version",
+        "nvidia-smi", "--query-gpu=name,uuid,memory.total,memory.free,pci.bus_id,driver_version,gpu_recovery_action",
         "--format=csv,noheader,nounits",
-    ], text=True)
-    rows = [dict(zip(["name", "uuid", "memory_mib", "free_mib", "pci_bus", "driver"],
+    ], text=True, timeout=15)
+    rows = [dict(zip(["name", "uuid", "memory_mib", "free_mib", "pci_bus", "driver", "recovery_action"],
                      [v.strip() for v in row])) for row in csv.reader(text.splitlines())]
     selected = [next(r for r in rows if r["uuid"] == uid) for uid in GPU_IDS]
     if len({r["uuid"] for r in selected}) != 2 or any(r["name"] != "NVIDIA RTX A6000" for r in selected):
         raise RuntimeError("Paper evidence requires exactly the frozen two RTX A6000 GPUs")
+    if any(r["recovery_action"] != "None" for r in selected):
+        raise RuntimeError("An A6000 requires driver recovery; no GPU workload may start")
+    if require_idle:
+        apps = subprocess.check_output(["nvidia-smi", "--query-compute-apps=gpu_uuid,pid",
+            "--format=csv,noheader,nounits"], text=True, timeout=15)
+        if any(line.split(",")[0].strip() in GPU_IDS for line in apps.splitlines()):
+            raise RuntimeError("A selected A6000 has another compute process")
+        if any(int(r["free_mib"]) < 45000 for r in selected):
+            raise RuntimeError("A selected A6000 has insufficient free memory")
     return selected
 
 
@@ -84,8 +93,11 @@ def monitor(root, owner):
             message = (f"HorizonKV 双 A6000: {state['status']}; {state.get('phase', '-')}; "
                 f"完成 wave={state.get('completed_waves', 0)}/{state.get('total_waves', '?')}; "
                 f"当前={state.get('current', '-')}{detail}")
-            item = {"checked_unix_s": time.time(), "state": state, "ntfy_sent": notify(message),
-                    "gpu_inventory": inventory()}
+            item = {"checked_unix_s": time.time(), "state": state, "ntfy_sent": notify(message)}
+            try:
+                item["gpu_inventory"] = inventory()
+            except (OSError, subprocess.SubprocessError, StopIteration, RuntimeError) as exc:
+                item["gpu_inventory_error"] = type(exc).__name__
             save(root / "monitor-status.json", item)
             with (root / "monitor.jsonl").open("a") as stream:
                 stream.write(json.dumps(item, ensure_ascii=False) + "\n")
@@ -177,7 +189,7 @@ class StartupError(RuntimeError):
 
 
 def start_server(root, job, mode, state, port):
-    inventory()
+    hardware = inventory(require_idle=True)
     live = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=REPO, text=True).strip()
     dirty = subprocess.check_output(["git", "status", "--porcelain"], cwd=REPO, text=True).strip()
     if live != state["source_commit"] or dirty:

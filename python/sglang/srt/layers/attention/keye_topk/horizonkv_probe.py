@@ -128,6 +128,9 @@ def span(batch, layer_id, component, **fields):
         from .horizonkv_kernel_profile import active, component_scope
 
         if active():
+            if component == "model_total":
+                fields.update(active_batch=len(batch.rids), request_ids=list(batch.rids),
+                              context_tokens=batch.seq_lens_cpu.tolist())
             with component_scope(component, layer_id, fields):
                 yield
             return

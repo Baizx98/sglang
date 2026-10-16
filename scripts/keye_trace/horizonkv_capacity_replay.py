@@ -61,7 +61,7 @@ def replay(function, capacity, slots, writes):
     ]
 
 
-def access_groups(directory, requests):
+def access_groups(directory, requests, allow_padding=False):
     """Yield verified raw events per rank/wave/layer, including audit-only tails."""
     lookup = {v["rid"]: v for v in requests}
     for rank in (0, 1):
@@ -103,13 +103,19 @@ def access_groups(directory, requests):
             ):
                 request = lookup[rid]
                 assert context == request["prompt_tokens"] + step + 1
-                assert np.all((logical[i] >= 0) & (logical[i] < context))
-                assert np.unique(logical[i]).size == 2048
+                valid_slots = logical[i] >= 0
+                assert np.all(logical[i] >= -1)
+                assert np.all(logical[i][valid_slots] < context)
+                assert np.unique(logical[i][valid_slots]).size == min(2048, context)
+                if not allow_padding:
+                    assert valid_slots.all()
+                assert np.array_equal(valid_slots, physical[i] >= 0)
                 key = (rid, step, record["layer_id"])
                 assert key not in seen
                 seen.add(key)
                 valid.append(step < len(request["response"]["output_ids"]) - 1)
-            assert np.unique(physical).size == physical.size and np.all(physical >= 0)
+            assert np.all(physical >= -1)
+            assert np.unique(physical[physical >= 0]).size == np.count_nonzero(physical >= 0)
             record["valid_returned"] = valid
             groups[(record["wave"], record["layer_id"])].append(
                 (record, logical, physical, writes)

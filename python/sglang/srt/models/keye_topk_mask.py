@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
-from sglang.srt.layers.attention.keye_topk.horizonkv_probe import profiled
+from sglang.srt.layers.attention.keye_topk.horizonkv_probe import profiled, span
 import torch.nn as nn
 from transformers import PretrainedConfig
 
@@ -272,14 +272,17 @@ class KeyeTopKMaskAttention(nn.Module):
             attn_output: Same shape as input hidden_states
         """
         # ---- 1. Compute Q, K, V ----
-        qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        with span(forward_batch, self.layer_id, "qkv_projection"):
+            qkv, _ = self.qkv_proj(hidden_states)
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         # Apply Q/K normalization
-        q, k = self._apply_qk_norm(q, k)
+        with span(forward_batch, self.layer_id, "qk_norm"):
+            q, k = self._apply_qk_norm(q, k)
 
         # ---- 2. Apply RoPE ----
-        q, k = self.rotary_emb(positions, q, k)
+        with span(forward_batch, self.layer_id, "rope"):
+            q, k = self.rotary_emb(positions, q, k)
 
         # ---- 3. 运行 Indexer 获取 top-k (如果启用) ----
         topk_indices = None
@@ -388,7 +391,8 @@ class KeyeTopKMaskAttention(nn.Module):
             )
 
         # ---- 5. Output Projection ----
-        output, _ = self.o_proj(attn_output)
+        with span(forward_batch, self.layer_id, "output_projection"):
+            output, _ = self.o_proj(attn_output)
 
         return output
 

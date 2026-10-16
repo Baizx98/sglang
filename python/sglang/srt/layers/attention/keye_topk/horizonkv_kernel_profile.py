@@ -89,6 +89,10 @@ def finish():
             raise RuntimeError("Invalid CUPTI activity timestamp")
         if event["external_id"] in by_id:
             by_id[event["external_id"]]["gpu_activity_us"] += (event["end_ns"]-event["start_ns"])/1000
+    unknown = sum((e["end_ns"]-e["start_ns"])/1000 for e in activities if e["external_id"] not in by_id)
+    if unknown:
+        _ranges.append({"id": 0, "parent": None, "component": "unattributed", "layer": -1,
+                        "gpu_activity_us": unknown, "cpu_range_exclusive_us": 0.})
     value = {
         "rank": rank, "gpu_name": torch.cuda.get_device_name(), "wave": _wave,
         "decode_start": int(os.getenv("KEYE_HORIZON_KERNEL_START", "32")),

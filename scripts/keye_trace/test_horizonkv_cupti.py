@@ -23,7 +23,7 @@ def main():
         torch.manual_seed(20261014)
         x = torch.randn(256, 256, device="cuda")
         host = torch.randn(1024, 1024, pin_memory=True)
-        batch = SimpleNamespace(forward_mode=SimpleNamespace(is_decode=lambda: True), rids=[])
+        batch = SimpleNamespace(forward_mode=SimpleNamespace(is_decode=lambda: True), rids=[], seq_lens_cpu=torch.tensor([4096]))
 
         class Model:
             @profiled("model_total", batch_arg=1)
