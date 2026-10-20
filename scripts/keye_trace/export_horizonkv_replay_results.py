@@ -4,6 +4,7 @@ import argparse
 import csv
 import hashlib
 import json
+import re
 import statistics
 from pathlib import Path
 
@@ -38,7 +39,10 @@ def main():
         base_us = statistics.median(baseline["elapsed_us"]) if baseline else None
         common = {"case": name, "window": value["window"], "wave": value["wave"],
                   "layer": value["layer"], "snapshot": value["snapshot"], "mode": value["mode"],
-                  "capacity_per_request_tokens": value["capacity"], "b_over_k": value["capacity"] / 2048,
+                  "experiment_cache_tokens_per_request": value["capacity"],
+                  "capacity_per_request_tokens": value.get("cache_tokens_per_request"),
+                  "b_over_k": value.get("cache_per_request_topk_multiple"),
+                  "B_over_k": value.get("cache_layer_total_topk_multiple"),
                   "concurrency": len(value["request_ids"]), "request_count": len(value["request_ids"]),
                   "input_min_tokens": min(value["lengths"]), "input_max_tokens": max(value["lengths"]),
                   "sampled_decode_step_min": min(value["decode_steps"]), "sampled_decode_step_max": max(value["decode_steps"])}
@@ -67,7 +71,10 @@ def main():
         span_by_key = {f"layer{s['layer']}/{s['component']}": s for s in value["probe_component_spans"]}
         for component in sorted(set(work["component_gpu_work_us"]) | set(span_by_key)):
             span = span_by_key.get(component, {})
+            parsed = re.match(r"layer(\d+)/(.*)", component)
             components.append(dict(common, component=component,
+                                   component_layer=int(parsed[1]) if parsed else None,
+                                   component_name=parsed[2] if parsed else component,
                                    actual_gpu_work_us=work["component_gpu_work_us"].get(component, 0) if work["gpu_work_total_us"] else None,
                                    gpu_activity_count=work["activity_counts"].get(component, 0),
                                    probe_stream_span_us=span.get("stream_span_us"),
