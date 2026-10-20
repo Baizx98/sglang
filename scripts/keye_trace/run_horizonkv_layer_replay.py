@@ -100,6 +100,15 @@ def main():
         raise RuntimeError("A6000 is shared with another compute process; do not time it")
     update(root, phase="exclusive_a6000_layer_replay", child_pid=os.getpid(),
            detail="健康 A6000 独占，真实层/相邻层 CUDA Graph 计时；原始采集已暂停。")
+    manifest = [json.loads(line) for line in (root / "fixtures/manifest_rank00.jsonl").read_text().splitlines()]
+    total_cases = 0
+    for wave in args.waves:
+        for target_id in (12, 24):
+            active = [r for r in manifest if r["layer"] == target_id and len(r["request_ids"]) == 4
+                      and r["request_ids"][0].startswith(f"replay__wave{wave:03d}__")]
+            snapshots = int(bool(active)) + int(args.extended and any(min(r["steps"]) >= 32 for r in active))
+            total_cases += snapshots * (6 + (18 if args.extended else 6))
+    update(root, completed_cases=0, total_cases=total_cases)
     notify("HorizonKV：输入与四路径/ECHO-style数值核对及CUDA Graph回放已通过，开始健康A6000独占M1/M3/M5代表点计时。")
     metadata = {"measurement_gpu_uuid": GPU, "gpu_name": torch.cuda.get_device_name(),
                 "torch": torch.__version__, "cuda": torch.version.cuda,

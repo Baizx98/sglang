@@ -63,9 +63,10 @@ def monitor(root):
             record["child_alive"] = bool(pid and Path(f"/proc/{pid}").exists())
             # File counts and timestamps supplement process liveness.
             record["fixture_files"] = len(list((root / "fixtures").glob("*.pt")))
-            record["result_files"] = len(list((root / "results").glob("*.json")))
+            record["result_files"] = len(list(root.glob("**/results/*.json")))
             age = int(time.time() - state["updated_unix_s"])
             message = (f"HorizonKV v05：{state.get('status')}；{state.get('phase')}；"
+                       f"当前阶段={state.get('completed_cases', 0)}/{state.get('total_cases', '?')}组；"
                        f"输入文件={record['fixture_files']}，结果文件={record['result_files']}；"
                        f"状态更新距今 {age}s。{state.get('detail', '')}")
             record["ntfy_sent"] = notify(message)
