@@ -53,6 +53,30 @@ def check_output(expected, reference):
     return all(torch.equal(a, b) for a, b in zip(expected, reference))
 
 
+def resource_counts(runner):
+    def nbytes(*values):
+        return sum(v.numel() * v.element_size() for v in values)
+    data, cache = runner.data, runner.cache
+    persistent = nbytes(runner.k, runner.v) if runner.k is not None else 0
+    metadata = nbytes(runner.prefmap, runner.prefcounts)
+    reset_snapshot = 0
+    if cache is not None:
+        persistent = nbytes(cache.k, cache.v)
+        metadata += nbytes(cache.map, cache.tag, cache.age, cache.slots, cache.rank, cache.misses)
+        reset_snapshot = nbytes(*runner.initial_cache.values())
+    return {"layer_parameter_bytes": nbytes(*runner.layer.parameters()),
+            "host_history_allocated_bytes": nbytes(data.hostk, data.hostv),
+            "host_history_logical_bytes": int(data.lengths.sum()) * 2048,
+            "gpu_index_k_bytes": nbytes(data.index),
+            "gpu_persistent_main_kv_bytes": persistent,
+            "benchmark_stage_and_prefetch_scratch_bytes": nbytes(runner.stagek, runner.stagev, runner.prefk, runner.prefv),
+            "gpu_cache_metadata_bytes": metadata,
+            "measurement_reset_snapshot_bytes": reset_snapshot,
+            "cache_tokens_per_request": cache.capacity if cache is not None else None,
+            "cache_per_request_topk_multiple": cache.capacity / runner.topk if cache is not None else None,
+            "cache_layer_total_topk_multiple": cache.batch * cache.capacity / runner.topk if cache is not None else None}
+
+
 @torch.inference_mode()
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -118,7 +142,8 @@ def main():
                     result.update(window="single_layer", wave=wave, layer=target_id,
                                   snapshot=snapshot, mode=mode, request_ids=frame["request_ids"],
                                   decode_steps=frame["steps"], lengths=frame["seq_lens"].tolist(),
-                                  capacity=4096, topk=2048, output_matches=True, **io_counts(runner))
+                                  capacity=4096, topk=2048, output_matches=True,
+                                  **io_counts(runner), **resource_counts(runner))
                     save(out / "results" / f"{label}.json", result)
                     completed += 1
                     print(label, round(statistics.median(result["elapsed_us"]), 3), flush=True)
@@ -150,7 +175,7 @@ def main():
                                       snapshot=snapshot, mode=mode, capacity=capacity, topk=2048,
                                       request_ids=frame["request_ids"], decode_steps=frame["steps"],
                                       lengths=frame["seq_lens"].tolist(), output_matches=True,
-                                      **io_counts(target))
+                                      **io_counts(target), **resource_counts(target))
                         save(out / "results" / f"{label}.json", result)
                         completed += 1
                         print(label, round(statistics.median(result["elapsed_us"]), 3), flush=True)
