@@ -390,9 +390,8 @@ def graph_measure(call, reset, runners, repeats=5, profile_path=None, transfer_e
             call()
             torch.cuda.synchronize()
         prof.export_chrome_trace(str(profile_path))
-        for event in prof.key_averages():
-            if event.key.startswith("layer"):
-                work[event.key] = event.device_time_total
+        from horizonkv_trace_work import kernel_work_from_trace
+        work = kernel_work_from_trace(profile_path)["component_gpu_work_us"]
         for runner in runners:
             runner.record_stages = False
     return {"elapsed_us": times, "probe_elapsed_us": a.elapsed_time(b) * 1000,

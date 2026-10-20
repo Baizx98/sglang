@@ -59,10 +59,13 @@ def main():
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--waves", type=int, nargs="+", default=[0, 5])
     parser.add_argument("--extended", action="store_true")
+    parser.add_argument("--output-dir", type=Path)
     args = parser.parse_args()
     root = args.run_dir.resolve()
-    (root / "results").mkdir(exist_ok=True)
-    (root / "timelines").mkdir(exist_ok=True)
+    out = args.output_dir.resolve() if args.output_dir else root
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "results").mkdir(exist_ok=True)
+    (out / "timelines").mkdir(exist_ok=True)
     initialize_config = initialize()
     actual_uuid = str(torch.cuda.get_device_properties(0).uuid)
     if actual_uuid != GPU.removeprefix("GPU-"):
@@ -84,7 +87,7 @@ def main():
                 "echo": "EMA alpha=0.5; Ampere fused tile score/recall; bounded k-slot scratch; no TMA warp specialization",
                 "moe": "SGLang Triton default config, not A6000 tuned",
                 "started_unix_s": time.time()}
-    save(root / "measurement-environment.json", metadata)
+    save(out / "measurement-environment.json", metadata)
     layers = {}
     completed = 0
     for wave in args.waves:
@@ -107,7 +110,7 @@ def main():
                         runner.prepare_echo()
                     label = f"wave{wave:03d}-l{target_id:02d}-{snapshot}-{mode}"
                     result, output = graph_measure(runner.forward, runner.reset, [runner],
-                                                   profile_path=root / "timelines" / f"{label}.json")
+                                                   profile_path=out / "timelines" / f"{label}.json")
                     if baseline is None:
                         baseline, truth = output, runner.last_topk.clone()
                     if not check_output(output, baseline) or not torch.equal(runner.last_topk, truth):
@@ -116,7 +119,7 @@ def main():
                                   snapshot=snapshot, mode=mode, request_ids=frame["request_ids"],
                                   decode_steps=frame["steps"], lengths=frame["seq_lens"].tolist(),
                                   capacity=4096, topk=2048, output_matches=True, **io_counts(runner))
-                    save(root / "results" / f"{label}.json", result)
+                    save(out / "results" / f"{label}.json", result)
                     completed += 1
                     print(label, round(statistics.median(result["elapsed_us"]), 3), flush=True)
                     update(root, completed_cases=completed, detail=label)
@@ -137,7 +140,7 @@ def main():
                         call, reset, transfer_events = pair_call(previous, target, mode, pair_truth)
                         label = f"wave{wave:03d}-pair{target_id-1:02d}-{target_id:02d}-{snapshot}-b{capacity}-{mode}"
                         result, output = graph_measure(call, reset, [previous, target],
-                                                       profile_path=root / "timelines" / f"{label}.json",
+                                                       profile_path=out / "timelines" / f"{label}.json",
                                                        transfer_events=transfer_events if mode in {"ahead", "query-ready"} else None)
                         if reference is None:
                             reference, pair_truth = output, target.last_topk.clone()
@@ -148,7 +151,7 @@ def main():
                                       request_ids=frame["request_ids"], decode_steps=frame["steps"],
                                       lengths=frame["seq_lens"].tolist(), output_matches=True,
                                       **io_counts(target))
-                        save(root / "results" / f"{label}.json", result)
+                        save(out / "results" / f"{label}.json", result)
                         completed += 1
                         print(label, round(statistics.median(result["elapsed_us"]), 3), flush=True)
                         update(root, completed_cases=completed, detail=label)
