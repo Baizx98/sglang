@@ -91,6 +91,12 @@ def main():
     (out / "results").mkdir(exist_ok=True)
     (out / "timelines").mkdir(exist_ok=True)
     initialize_config = initialize()
+    # CUPTI initialization can leave the first profiler pass CPU-only.
+    # Warm the collector separately, rather than publishing zero GPU work.
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU,
+                                           torch.profiler.ProfilerActivity.CUDA]):
+        torch.ones(16, device="cuda").add_(1)
+        torch.cuda.synchronize()
     actual_uuid = str(torch.cuda.get_device_properties(0).uuid)
     if actual_uuid != GPU.removeprefix("GPU-"):
         raise RuntimeError(f"unexpected measurement GPU {actual_uuid}")

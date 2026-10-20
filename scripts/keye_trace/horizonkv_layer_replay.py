@@ -396,6 +396,8 @@ def graph_measure(call, reset, runners, repeats=5, profile_path=None, transfer_e
         prof.export_chrome_trace(str(profile_path))
         from horizonkv_trace_work import kernel_work_from_trace
         work = kernel_work_from_trace(profile_path)["component_gpu_work_us"]
+        if not sum(work.values()):
+            raise RuntimeError("CUPTI captured no GPU activities; profile must be repeated")
         for runner in runners:
             runner.record_stages = False
     return {"elapsed_us": times, "probe_elapsed_us": a.elapsed_time(b) * 1000,
