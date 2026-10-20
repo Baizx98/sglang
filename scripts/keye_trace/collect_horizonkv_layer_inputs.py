@@ -22,8 +22,16 @@ def main():
     parser.add_argument("--samples", type=int, default=20)
     parser.add_argument("--port", type=int, default=31120)
     parser.add_argument("--smoke-only", action="store_true")
+    parser.add_argument("--wave-start", type=int, default=0)
+    parser.add_argument("--skip-smoke", action="store_true")
     args = parser.parse_args()
     root = args.run_dir.resolve()
+    save(root / "collection-source.json", {
+        "source_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=REPO, text=True).strip(),
+        "python": sys.executable, "input_gpus": INPUT_GPUS,
+        "wave_start": args.wave_start, "samples_per_task": args.samples,
+        "max_output_tokens": args.steps, "timing_evidence": False,
+    })
     source = REPO / "data/horizonkv-motivation/2026-10-14_pilot-v01/workloads-v02/requests.jsonl"
     groups = defaultdict(list)
     tasks = {"niah_multikey_1", "Single-Document QA", "gov_report", "repobench-p"}
@@ -74,19 +82,22 @@ def main():
                 time.sleep(3)
         else:
             raise TimeoutError("input server startup")
-        smoke = dict(waves[0][1][0])
-        smoke["input_ids"] = smoke["input_ids"][:512]
-        smoke["case_id"] = "input-smoke-512"
-        results = run_wave(url, [smoke], "replay__smoke", 2, 300)
-        save(root / "input-smoke-response.json", results)
-        paths = list((root / "fixtures").glob("replay__smoke*history.pt"))
-        if len(paths) != 8:
-            raise RuntimeError(f"smoke history count {len(paths)}, expected four layers x two ranks")
-        notify("HorizonKV：真实输入采集 smoke 通过，四层×两 rank 的历史 KV 与层输入已保存；开始32K四类负载。")
+        if not args.skip_smoke:
+            smoke = dict(waves[0][1][0])
+            smoke["input_ids"] = smoke["input_ids"][:512]
+            smoke["case_id"] = "input-smoke-512"
+            results = run_wave(url, [smoke], "replay__smoke", 2, 300)
+            save(root / "input-smoke-response.json", results)
+            paths = list((root / "fixtures").glob("replay__smoke*history.pt"))
+            if len(paths) != 8:
+                raise RuntimeError(f"smoke history count {len(paths)}, expected four layers x two ranks")
+            notify("HorizonKV：真实输入采集 smoke 通过，四层×两 rank 的历史 KV 与层输入已保存；开始32K四类负载。")
         if args.smoke_only:
             update(root, phase="input_smoke_ready", detail="真实512-token smoke完成；性能测量尚未开始。")
             return
         for index, (task, rows) in enumerate(waves):
+            if index < args.wave_start:
+                continue
             update(root, phase="collecting_real_inputs", completed_waves=index,
                    total_waves=len(waves), detail=f"{task} wave {index + 1}/{len(waves)}")
             result = run_wave(url, rows, f"replay__wave{index:03d}", args.steps, 7200)
@@ -95,6 +106,9 @@ def main():
                 notify(f"HorizonKV：真实32K输入采集 {index + 1}/{len(waves)} wave 完成；{task}。")
         update(root, phase="real_inputs_ready", completed_waves=len(waves),
                detail="真实输入采集完成；下一阶段仅健康 A6000 回放计时。")
+        save(root / "input-collection-complete.json", {"wave_start": args.wave_start,
+                                                      "completed_waves": len(waves),
+                                                      "total_waves": len(waves)})
     except Exception as exc:
         update(root, phase="input_capture_error", detail=f"{type(exc).__name__}: {exc}")
         notify(f"HorizonKV 输入采集失败：{type(exc).__name__}: {exc}；日志已保存，检查后继续。")

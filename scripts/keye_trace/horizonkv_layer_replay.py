@@ -341,6 +341,10 @@ def graph_measure(call, reset, runners, repeats=5, profile_path=None, transfer_e
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         output = call()
+    for _ in range(25):
+        reset()
+        graph.replay()
+    torch.cuda.synchronize()
     times = []
     for _ in range(repeats):
         reset()

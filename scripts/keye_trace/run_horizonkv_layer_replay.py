@@ -114,7 +114,7 @@ def main():
                 "torch": torch.__version__, "cuda": torch.version.cuda,
                 "source_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=REPO, text=True).strip(),
                 "tp": 1, "dtype": "bfloat16", "seed": 20261014,
-                "timing": "uninstrumented CUDA Graph, 5 repeats; event-node graph and Kineto separate",
+                "timing": "3 eager compile warmups, 25 graph warmups, 5 timed graph repeats; event-node graph and Kineto separate",
                 "source": "healthy A6000 + L40S TP2 model-derived inputs",
                 "cache": "per-request HiSparse recency refinement; GPU touch/sort/gather port",
                 "echo": "EMA alpha=0.5; Ampere fused tile score/recall; bounded k-slot scratch; no TMA warp specialization",
