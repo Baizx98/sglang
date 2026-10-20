@@ -1,5 +1,37 @@
 # Keye DSA Trace Pilot
 
+## HorizonKV single-A6000 motivation replay (2026-10-20)
+
+`collect_horizonkv_layer_inputs.py` collects real Decode inputs on the healthy
+A6000 + L40S, saving histories once and per-step KV deltas for layers
+11/12/23/24. Set `KEYE_LAYER_REPLAY_DIR` only for collection; capture overhead
+is excluded from all performance results. The failed A6000 is never selected.
+
+`horizonkv_layer_replay.py` loads original full-layer BF16 weights, reconstructs
+logical histories, and checks native/staged/Host/cache/EMA-prefetch paths.
+`horizonkv_host_kernels.py` implements GPU-driven pinned Host access without
+copying dynamic Top-K to Python. Its cache and EMA-prefetch are Ampere mechanism
+ports, not verbatim HiSparse/ECHO implementations; default MoE tuning is recorded.
+
+After input collection releases both GPUs, execute the v05 representative loop:
+
+```sh
+CUDA_VISIBLE_DEVICES=GPU-19717dbe-cbf8-b0b8-744d-1cb9a9365822 \
+  .venv/bin/python scripts/keye_trace/run_horizonkv_layer_replay.py \
+  --run-dir data/horizonkv-motivation/2026-10-20_single-a6000-v01
+```
+
+Use `--extended` for the after32 snapshot and per-request 1/2/4-times-k pair
+capacities. Five uninstrumented CUDA Graph repetitions, an event-node probe
+graph, and Kineto activities are kept separately. Pair timings include both
+layers; exact early transfer preserves target scoring, and a query-start
+perfect-demand control isolates the extra earlier-layer window. Correct output
+is required before a result is saved. Raw fixtures/timelines remain in `data/`.
+
+`horizonkv_single_runtime.py --monitor <run-dir>` checks run state, process and
+result files every 20 minutes and sends authorized ntfy notifications. It reads
+the local credentials at use time; credentials are never experiment artifacts.
+
 These scripts reproduce the BFCL multi-turn score/top-k pilot used by the
 `codex/keye-sm80-support` branch.
 

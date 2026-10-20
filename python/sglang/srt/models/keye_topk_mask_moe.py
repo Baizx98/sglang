@@ -91,6 +91,13 @@ class KeyeTopKMaskMoeDecoderLayer(Qwen3MoeDecoderLayer):
     @profiled("layer_total")
     def forward(self, positions, hidden_states, forward_batch, residual,
                 captured_last_layer_outputs=None, **kwargs):
+        if os.getenv("KEYE_LAYER_REPLAY_DIR"):
+            from sglang.srt.layers.attention.keye_topk.layer_replay_capture import begin, end
+            begin(self, positions, hidden_states, residual, forward_batch)
+            output = super().forward(positions, hidden_states, forward_batch, residual,
+                                     captured_last_layer_outputs, **kwargs)
+            end(self.layer_id, output)
+            return output
         return super().forward(positions, hidden_states, forward_batch, residual,
                                captured_last_layer_outputs, **kwargs)
 

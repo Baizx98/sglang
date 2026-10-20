@@ -825,7 +825,7 @@ class KeyeSparseAttnBackend(AttentionBackend):
 
                 record(forward_batch, layer.layer_id, topk_indices, capacity_slots, forward_batch.out_cache_loc)
             with span(forward_batch, layer.layer_id, "attention_compute"):
-                return keye_dsa_paged_attention(
+                output = keye_dsa_paged_attention(
                     q,
                     k_cache,
                     v_cache,
@@ -836,6 +836,12 @@ class KeyeSparseAttnBackend(AttentionBackend):
                     is_decode=True,
                     workspace=self.sm80_workspace,
                 )
+            if os.getenv("KEYE_LAYER_REPLAY_DIR"):
+                from sglang.srt.layers.attention.keye_topk.layer_replay_capture import attention_output
+                attention_output(layer.layer_id, q, topk_indices, token_slots,
+                                 k_cache, v_cache, output, forward_batch,
+                                 metadata.page_table_1)
+            return output
 
         k_cache_view = k_cache.view(-1, 1, self.num_kv_heads, self.head_dim)
         v_cache_view = v_cache.view(-1, 1, self.num_kv_heads, self.head_dim)

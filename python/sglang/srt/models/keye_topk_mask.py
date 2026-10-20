@@ -271,6 +271,9 @@ class KeyeTopKMaskAttention(nn.Module):
         Returns:
             attn_output: Same shape as input hidden_states
         """
+        if os.getenv("KEYE_LAYER_REPLAY_DIR"):
+            from sglang.srt.layers.attention.keye_topk.layer_replay_capture import attention_input
+            attention_input(self.layer_id, hidden_states)
         # ---- 1. Compute Q, K, V ----
         with span(forward_batch, self.layer_id, "qkv_projection"):
             qkv, _ = self.qkv_proj(hidden_states)
