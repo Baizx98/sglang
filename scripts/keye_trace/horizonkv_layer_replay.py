@@ -162,6 +162,7 @@ class ReplayLayer:
         self.record_stages = False
         self.stage_events = []
         self.prefetch_done = None
+        self.prefetch_stream = None
         self.fixed_topk = None
         self.threshold = torch.zeros(self.batch, device="cuda", dtype=torch.float32)
 
@@ -287,8 +288,10 @@ class ReplayLayer:
                                                           topk_indices=indices, page_size=1)
                 cachek, cachev = self.k, self.v
             else:
-                if self.prefetch_done is not None:
-                    torch.cuda.current_stream().wait_event(self.prefetch_done)
+                if self.prefetch_stream is not None:
+                    # An internal wait joins the fork into the capture graph.
+                    # External timing events alone do not close stream capture.
+                    torch.cuda.current_stream().wait_stream(self.prefetch_stream)
                 if self.cache is None:
                     sourcek, sourcev = (self.k, self.v) if self.k is not None else (self.hostk, self.hostv)
                     gather(sourcek, sourcev, indices, self.stagek, self.stagev, data.lengths, data.maxlen)
@@ -407,6 +410,7 @@ def pair_call(previous, target, mode, truth=None):
     end = torch.cuda.Event(enable_timing=True, external=True)
     if mode in {"ahead", "query-ready"}:
         target.prefetch_done = end
+        target.prefetch_stream = stream
 
     def transfer():
         stream.wait_stream(torch.cuda.current_stream())
