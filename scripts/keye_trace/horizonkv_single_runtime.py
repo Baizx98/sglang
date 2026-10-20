@@ -65,8 +65,15 @@ def monitor(root):
             record["fixture_files"] = len(list((root / "fixtures").glob("*.pt")))
             record["result_files"] = len(list(root.glob("**/results/*.json")))
             age = int(time.time() - state["updated_unix_s"])
+            phase = state.get("phase", "")
+            if "input" in phase or "collect" in phase:
+                progress = f"输入wave={state.get('completed_waves', 0)}/{state.get('total_waves', '?')}"
+            elif phase.startswith("m4_"):
+                progress = "离线缓存回放"
+            else:
+                progress = f"计时组={state.get('completed_cases', 0)}/{state.get('total_cases', '?')}"
             message = (f"HorizonKV v05：{state.get('status')}；{state.get('phase')}；"
-                       f"当前阶段={state.get('completed_cases', 0)}/{state.get('total_cases', '?')}组；"
+                       f"{progress}；"
                        f"输入文件={record['fixture_files']}，结果文件={record['result_files']}；"
                        f"状态更新距今 {age}s。{state.get('detail', '')}")
             record["ntfy_sent"] = notify(message)

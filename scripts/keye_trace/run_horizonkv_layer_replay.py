@@ -191,7 +191,10 @@ def main():
                         update(root, completed_cases=completed, detail=label)
                         del previous, target
                         gc.collect()
-                notify(f"HorizonKV：wave{wave} 层{target_id} 的M1/M3/M5闭环完成，已核对 {completed} 组；原始时间线已保存。")
+                milestones = {0, len(args.waves)//4, len(args.waves)//2, 3*len(args.waves)//4}
+                final_snapshot = "after32" if args.extended else "first-c4"
+                if target_id == 24 and snapshot == final_snapshot and args.waves.index(wave) in milestones:
+                    notify(f"HorizonKV：M1/M3/M5 已核对 {completed}/{total_cases} 组；原始时间线已保存。")
     update(root, phase="representative_loop_completed", completed_cases=completed, child_pid=None,
            detail="代表点闭环完成；等待汇总及扩展采集/容量扫描。")
     notify(f"HorizonKV：首轮单A6000代表点完成，共 {completed} 组，正在审计与整理。")
