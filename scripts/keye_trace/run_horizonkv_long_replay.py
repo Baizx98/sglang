@@ -6,6 +6,7 @@ import gc
 import hashlib
 import json
 from pathlib import Path
+import random
 import subprocess
 import time
 
@@ -71,6 +72,7 @@ def main():
     responses = {r["rid"]: r for f in root.glob("input-wave*.json") for r in json.loads(f.read_text())}
     params = [(g, wave, 1) for g in groups for wave in g["waves"]]
     params += [(g, g["first_wave"], 4) for g in groups]
+    random.Random(20261014).shuffle(params)
     # Every selected cohort is retained; short natural outputs use a separate view.
     modes = [("native", "h-native", 4096, False, False),
              ("native-unsorted", "h-native", 4096, False, False),
@@ -89,6 +91,7 @@ def main():
                seed=20261014, k=2048, modes=modes, input_source="A6000+L40S real C1 model inputs",
                replay="C1 and actual C4 layer compute from four independent C1 histories; not full-model serving",
                timing="3 eager +25 graph warmups; 5 graph timing repetitions; independent event/Kernel profile",
+               ordering="Fixed-seed shuffled cohort order; native first for truth, remaining modes shuffled per point",
                comparison="Known-query/selection/KV oracles omit work; frozen-residency omits online replacement; not deployable baselines",
                model_config_sha256=hashlib.sha256(Path('/Tan/model/Keye-VL-2.0-30B-A3B/config.json').read_bytes()).hexdigest())
     save(out / "environment.json", env)
@@ -110,7 +113,9 @@ def main():
             layer, indexer = layers[layer_id], layers[layer_id].self_attn.sa_indexer
             reference = truth = fixed_query = None
             routing = None
-            for label, mode, capacity, selected_ready, query_ready in modes:
+            tail = list(modes[1:])
+            random.Random(20261014 + wave*100 + batch*10 + layer_id).shuffle(tail)
+            for label, mode, capacity, selected_ready, query_ready in [modes[0], *tail]:
                 runner = ReplayLayer(layer, data, mode, capacity)
                 if mode == "no-io":
                     runner.prepare_no_io(truth)
