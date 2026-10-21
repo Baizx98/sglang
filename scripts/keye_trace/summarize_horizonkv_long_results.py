@@ -24,7 +24,8 @@ def main(root):
     rows=list(csv.DictReader((src/'latency-and-dependencies.csv').open()))
     component_rows=list(csv.DictReader((src/'component-work.csv').open()))
     audit=json.loads((src/'audit.json').read_text())
-    assert len(rows)==audit['cases']==2250 and len(component_rows)==27000
+    assert len(rows)==audit['cases']
+    assert len(component_rows)==12*len(rows)
     for name,expected in audit['case_sha256'].items():
         assert digest(root/'long-replay-v01/results'/name)==expected,name
     components=collections.defaultdict(dict)
@@ -74,13 +75,14 @@ def main(root):
     write_csv(out/'point-components.csv',wide)
     write_csv(out/'group-summary.csv',summary)
     checks=dict(cases=len(rows),component_rows=len(component_rows),summary_rows=len(summary),
-                exact_cases=2000,optimized_diagnostic_cases=250,usable_cases=audit['usable_cases'],
+                exact_cases=sum(r['mode'] not in {'native-unsorted','native-fast-topk-v2'} for r in rows),
+                optimized_diagnostic_cases=sum(r['mode'] in {'native-unsorted','native-fast-topk-v2'} for r in rows),usable_cases=audit['usable_cases'],
                 kernel_checks=dict(kernel_counts),all_case_hashes_verified=True,
                 all_component_sums_verified=True,all_repeat_medians_verified=True,
                 source_files={n:digest(src/n) for n in ['latency-and-dependencies.csv','component-work.csv','audit.json']},
                 environment=audit['environment'],
                 direct_files={n:digest(out/n) for n in ['point-components.csv','group-summary.csv']},
-                aggregation='Each point retains five graph repeats. Group medians across 4 C1 requests x 5 layers or one distinct-request C4 cohort x 5 layers; not independent request counts or confidence intervals.',
+                aggregation='Each point retains five graph repeats. Group medians across recorded input/layer points; merged larger batches use distinct C1 requests; not independent request counts or confidence intervals.',
                 units='Times and component GPU work: us; *_ratio and recall: dimensionless; storage/payload: bytes; capacities: token slots per layer; counts: integers.',
                 caveats='Single A6000 TP1 layer replay; C4 merges four independently collected C1 histories. Mixed A6000+L40S timings excluded. Reference exact TopK and current GPU cache implementation; fused Host gather includes transfer. Oracles omit work, not method gains. Sparse kernels checked on every profile. Diagnostic failures retained, not task-quality evidence.',
                 paper_ready=False)

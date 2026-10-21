@@ -29,7 +29,16 @@ def main():
         python=str(REPO/".venv/bin/python")
         jobs=[("frozen_residency_kernel_check",[python,"scripts/keye_trace/test_horizonkv_layer_replay.py"],GPU),
               ("long_context_a6000_replay",[python,"scripts/keye_trace/run_horizonkv_long_replay.py","--run-dir",str(root),"--batches",*map(str,args.batches)],GPU),
-              ("long_context_export",[python,"scripts/keye_trace/export_horizonkv_long_replay.py","--run-dir",str(root)],"")]
+              ("long_context_export",[python,"scripts/keye_trace/export_horizonkv_long_replay.py","--run-dir",str(root)],""),
+              ("long_context_summary",[python,"scripts/keye_trace/summarize_horizonkv_long_results.py","--run-dir",str(root)],"")]
+        notes=REPO.parent/"my_research_note/projects/horizonkv/branches/main/data"
+        pipeline=root/"report-long-replay-v01/pipeline-events.csv"
+        jobs += [("pipeline_export",[python,"scripts/keye_trace/export_horizonkv_pipeline.py","--run-dir",str(root),"--output",str(pipeline),"--batch",str(args.batches[-1])],""),
+                 ("figure_preview",[python,str(REPO.parent/"horizonkv-paper/scripts/plot_motivation.py"),
+                    "--points",str(root/"report-long-replay-v01/point-components.csv"),
+                    "--moe",str(notes/"2026-10-21_1050_moe-tile-audit_v01_reviewed.csv"),
+                    "--pipeline",str(pipeline),"--plot-data",str(root/"report-long-replay-v01/figure-data.csv"),
+                    "--output-dir",str(root/"figure-preview"),"--batch",str(args.batches[-1]),"--core-only"],"")]
         save(root/"continuation-jobs.json",[{"phase":p,"command":c} for p,c,_ in jobs])
         for phase,command,devices in jobs:
             update(root,phase=phase,detail="只用健康A6000做实际计时；控制组不作为在线系统或方法收益。")
