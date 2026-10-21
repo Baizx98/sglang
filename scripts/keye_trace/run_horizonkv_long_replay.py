@@ -27,12 +27,15 @@ def unsorted_topk(scores, lengths, k):
 
 
 @contextmanager
-def indexer_override(indexer, fixed_query=None, unsorted=False):
+def indexer_override(indexer, fixed_query=None, topk_backend=None):
     original_query, original_topk = indexer._get_q_k_w_bf16, indexer._topk_sm80
     if fixed_query is not None:
         indexer._get_q_k_w_bf16 = lambda *args, **kwargs: fixed_query
-    if unsorted:
+    if topk_backend == "unsorted":
         indexer._topk_sm80 = lambda scores, lengths: unsorted_topk(scores, lengths, indexer.topk)
+    elif topk_backend == "fast-v2":
+        from sgl_kernel import fast_topk_v2
+        indexer._topk_sm80 = lambda scores, lengths: fast_topk_v2(scores, lengths.int(), indexer.topk)
     try:
         yield
     finally:
@@ -76,6 +79,7 @@ def main():
     # Every selected cohort is retained; short natural outputs use a separate view.
     modes = [("native", "h-native", 4096, False, False),
              ("native-unsorted", "h-native", 4096, False, False),
+             ("native-fast-topk-v2", "h-native", 4096, False, False),
              ("native-selection-ready", "h-native", 4096, True, False),
              ("native-indexer-ready", "h-native", 4096, True, True),
              ("h-staged", "h-staged", 4096, False, False),
@@ -124,30 +128,39 @@ def main():
                 if label.startswith("frozen"):
                     freeze_residency(runner)
                 name = f"{group['label']}-w{wave:03d}-c{batch}-l{layer_id:02d}-{snapshot}-{label}"
-                with indexer_override(indexer, fixed_query if query_ready else None, label == "native-unsorted"):
+                backend = {"native-unsorted": "unsorted", "native-fast-topk-v2": "fast-v2"}.get(label)
+                diagnostic = backend is not None
+                with indexer_override(indexer, fixed_query if query_ready else None, backend):
                     result, output = graph_measure(runner.forward, runner.reset, [runner],
                                                    profile_path=out / "timelines" / f"{name}.json")
-                if label == "native":
-                    reference, truth = output, runner.last_topk.clone()
-                    fixed_query = tuple(t.clone() for t in indexer._get_q_k_w_bf16(
-                        runner.last_attention_input, data.positions, False))
-                    captured = []
-                    hook = layer.mlp.register_forward_pre_hook(lambda _, inputs: captured.append(inputs[0].detach().clone()))
-                    runner.reset(); runner.forward(); torch.cuda.synchronize(); hook.remove()
-                    logits, _ = layer.mlp.gate(captured[-1])
-                    routes = layer.mlp.topk(captured[-1], logits)
-                    ids = routes.topk_ids.cpu()
-                    byte_count = sum(v.numel()*v.element_size()//v.shape[0] for _,v in layer.mlp.experts.named_parameters())
-                    routing = dict(unique_experts=int(ids.unique().numel()), expert_ids=ids.tolist(),
-                                   bytes_per_expert=byte_count, unique_expert_weight_bytes=int(ids.unique().numel())*byte_count)
+                    if label == "native":
+                        reference, truth = output, runner.last_topk.clone()
+                        fixed_query = tuple(t.clone() for t in indexer._get_q_k_w_bf16(
+                            runner.last_attention_input, data.positions, False))
+                    mode_routing = routing
+                    if label == "native" or diagnostic:
+                        captured = []
+                        hook = layer.mlp.register_forward_pre_hook(lambda _, inputs: captured.append(inputs[0].detach().clone()))
+                        runner.reset(); runner.forward(); torch.cuda.synchronize(); hook.remove()
+                        logits, _ = layer.mlp.gate(captured[-1])
+                        routes = layer.mlp.topk(captured[-1], logits)
+                        ids = routes.topk_ids.cpu()
+                        byte_count = sum(v.numel()*v.element_size()//v.shape[0] for _,v in layer.mlp.experts.named_parameters())
+                        mode_routing = dict(unique_experts=int(ids.unique().numel()), expert_ids=ids.tolist(),
+                                            bytes_per_expert=byte_count, unique_expert_weight_bytes=int(ids.unique().numel())*byte_count)
+                        if label == "native":
+                            routing = mode_routing
                 set_equal = torch.equal(runner.last_topk.sort(dim=-1).values, truth.sort(dim=-1).values)
+                predicted = [set(row) - {-1} for row in runner.last_topk.cpu().tolist()]
+                actual = [set(row) - {-1} for row in truth.cpu().tolist()]
+                recall = sum(len(p & a) for p, a in zip(predicted, actual)) / sum(map(len, actual))
                 exact_equal = check_output(output, reference)
                 errors = [float((a.float()-b.float()).abs().max()) for a,b in zip(output, reference)]
-                if label != "native-unsorted":
+                if not diagnostic:
                     assert exact_equal and torch.equal(runner.last_topk, truth), name
                     numerical_close = True
                 else:
-                    # This exact-set backend may reorder BF16 attention reductions.
+                    # Retain optimized-kernel diagnostics even when boundary choices differ.
                     numerical_close = all(torch.allclose(a, b, rtol=.02, atol=.005) for a,b in zip(output, reference))
                 result.update(case=name, group=group["label"], window="single_layer", wave=wave,
                               layer=layer_id, concurrency=batch, snapshot=snapshot, mode=label,
@@ -155,8 +168,9 @@ def main():
                               request_ids=frame["request_ids"], decode_steps=frame["steps"],
                               lengths=frame["seq_lens"].tolist(), output_matches=exact_equal,
                               selected_set_matches=set_equal, output_max_abs_errors=errors,
+                              selected_recall=recall, topk_backend=backend or "torch-exact-sorted",
                               numerical_close=numerical_close, usable_comparison=set_equal and numerical_close,
-                              routing=routing, **io_counts(runner), **resource_counts(runner))
+                              routing=mode_routing, **io_counts(runner), **resource_counts(runner))
                 save(out / "results" / f"{name}.json", result)
                 completed += 1
                 update(root, completed_cases=completed, detail=name)

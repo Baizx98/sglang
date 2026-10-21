@@ -26,7 +26,7 @@ def export(root):
     query = ("indexer_query_prepare", "indexer_score", "indexer_topk")
     pipeline = query + ("kv_writeback", "kv_resolve_gather")
     for name, d in values.items():
-        assert d["usable_comparison"] or d["mode"] == "native-unsorted"
+        assert d["usable_comparison"] or d["mode"] in {"native-unsorted", "native-fast-topk-v2"}
         assert len(d["elapsed_us"]) == 5 and min(d["elapsed_us"]) > 0
         trace = kernel_work_from_trace(source / "timelines" / f"{name}.json")
         assert trace["gpu_work_total_us"] > 0, name
@@ -66,6 +66,7 @@ def export(root):
                    unique_experts=d["routing"]["unique_experts"],
                    unique_expert_weight_bytes=d["routing"]["unique_expert_weight_bytes"],
                    max_abs_output_error=max(d["output_max_abs_errors"]),
+                   topk_backend=d["topk_backend"], selected_recall=d["selected_recall"],
                    output_bitwise_equal=d["output_matches"], selected_set_equal=d["selected_set_matches"])
         row.update({f"repeat_{i+1}_us":v for i,v in enumerate(d["elapsed_us"])})
         rows.append(row)
