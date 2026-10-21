@@ -52,9 +52,13 @@ def update(root, **changes):
 
 def monitor(root):
     root = Path(root)
-    next_notice = time.time() + 1200
+    previous = root / "monitor-status.json"
+    started = (root / "collector-launch.json").stat().st_mtime if (root / "collector-launch.json").exists() else time.time()
+    next_notice = (json.loads(previous.read_text())["checked_unix_s"] if previous.exists() else started) + 1200
     while True:
         state = json.loads((root / "state.json").read_text())
+        if (root / "long-input-manifest.json").exists() and ("input" in state.get("phase", "") or "collect" in state.get("phase", "")):
+            state["completed_waves"] = len(list(root.glob("input-wave*.json")))
         terminal = state.get("status") in {"completed", "failed", "interrupted"}
         if time.time() >= next_notice or terminal:
             record = {"checked_unix_s": time.time(), "state": state,
