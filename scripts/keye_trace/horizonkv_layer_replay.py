@@ -69,12 +69,13 @@ def load_layer(config, layer_id):
     return layer
 
 
-def read_frames(root, wave, layer):
+def read_frames(root, wave, layer, batch=None):
     fixtures = Path(root) / "fixtures"
     records = [json.loads(line) for line in (fixtures / "manifest_rank00.jsonl").read_text().splitlines()]
     frames = []
     for record in records:
-        if record["layer"] == layer and record["request_ids"][0].startswith(f"replay__wave{wave:03d}__"):
+        if (record["layer"] == layer and record["request_ids"][0].startswith(f"replay__wave{wave:03d}__")
+                and (batch is None or len(record["request_ids"]) == batch)):
             value = torch.load(fixtures / record["file"], weights_only=False)
             peer = torch.load(fixtures / record["file"].replace("rank00", "rank01"), weights_only=False)
             value["peer"] = peer

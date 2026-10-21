@@ -50,6 +50,47 @@ def gather(k, v, indices, outk, outv, lengths, maxlen):
 
 
 @triton.jit
+def _resident_gather(HK, HV, CK, CV, MAP, IDX, OUTK, OUTV, LENGTHS,
+                     PREFMAP, PK, PV, MAXLEN: tl.constexpr, CAP: tl.constexpr,
+                     TOPK: tl.constexpr, WIDTH: tl.constexpr, HAS_PREF: tl.constexpr,
+                     NT: tl.constexpr, ND: tl.constexpr):
+    b = tl.program_id(0)
+    n = tl.program_id(1) * NT + tl.arange(0, NT)
+    d = tl.arange(0, ND)
+    idx = tl.load(IDX + b * TOPK + n, n < TOPK, -1)
+    valid = (n < TOPK) & (idx >= 0) & (idx < tl.load(LENGTHS + b))
+    slot = tl.load(MAP + b * MAXLEN + tl.maximum(idx, 0), valid, -1)
+    hit = valid & (slot >= 0)
+    prefslot = tl.full((NT,), -1, tl.int32)
+    if HAS_PREF:
+        prefslot = tl.load(PREFMAP + b * MAXLEN + tl.maximum(idx, 0), valid & ~hit, -1)
+    pref = valid & ~hit & (prefslot >= 0)
+    miss = valid & ~hit & ~pref
+    hd = (b * MAXLEN + tl.maximum(idx, 0))[:, None] * WIDTH + d[None, :]
+    cd = (b * CAP + tl.maximum(slot, 0))[:, None] * WIDTH + d[None, :]
+    pd = (b * TOPK + tl.maximum(prefslot, 0))[:, None] * WIDTH + d[None, :]
+    dm = d[None, :] < WIDTH
+    k = tl.load(CK + cd, hit[:, None] & dm, 0) + tl.load(HK + hd, miss[:, None] & dm, 0)
+    v = tl.load(CV + cd, hit[:, None] & dm, 0) + tl.load(HV + hd, miss[:, None] & dm, 0)
+    if HAS_PREF:
+        k += tl.load(PK + pd, pref[:, None] & dm, 0)
+        v += tl.load(PV + pd, pref[:, None] & dm, 0)
+    out = (b * TOPK + n)[:, None] * WIDTH + d[None, :]
+    tl.store(OUTK + out, k, (n[:, None] < TOPK) & dm)
+    tl.store(OUTV + out, v, (n[:, None] < TOPK) & dm)
+
+
+def resident_gather(cache, hostk, hostv, indices, outk, outv, lengths, maxlen, prefetch=None):
+    """Diagnostic frozen-residency gather; no online replacement or metadata sort."""
+    prefmap, pk, pv = prefetch if prefetch else (cache.map, cache.k, cache.v)
+    width = outk.shape[-2] * outk.shape[-1]
+    _resident_gather[(indices.shape[0], triton.cdiv(indices.shape[1], 8))](
+        hostk, hostv, cache.k, cache.v, cache.map, indices, outk, outv, lengths,
+        prefmap, pk, pv, maxlen, cache.capacity, indices.shape[1], width,
+        prefetch is not None, NT=8, ND=triton.next_power_of_2(width), num_warps=4)
+
+
+@triton.jit
 def _write_current(K, V, NEWK, NEWV, LENGTHS,
                    MAXLEN: tl.constexpr, WIDTH: tl.constexpr,
                    SK: tl.constexpr, SV: tl.constexpr, ND: tl.constexpr):

@@ -4,7 +4,7 @@ from collections import OrderedDict
 
 import torch
 
-from horizonkv_host_kernels import DeviceLRU, HostPointer, gather, write_current
+from horizonkv_host_kernels import DeviceLRU, HostPointer, gather, resident_gather, write_current
 
 
 def main():
@@ -30,6 +30,12 @@ def main():
         # Recurrent demand plus new positions exercises hits, eviction and return.
         selected = torch.stack([torch.randperm(length)[:topk] for _ in range(batch)])
         ids = selected.int().cuda()
+        # Frozen-residency diagnostics must read correct hits/misses without eviction.
+        before = cache.map.clone()
+        resident_gather(cache, hk, hv, ids, outk, outv, lengths, length)
+        assert torch.equal(cache.map, before)
+        assert torch.equal(outk.cpu(), torch.stack([hostk[b, selected[b]] for b in range(batch)]))
+        assert torch.equal(outv.cpu(), torch.stack([hostv[b, selected[b]] for b in range(batch)]))
         misses = cache.resolve(hk, hv, ids, outk, outv, lengths, step).cpu().tolist()
         for b in range(batch):
             old = reference[b]
