@@ -7,7 +7,8 @@ p.add_argument('--run-dir',type=Path,required=True);p.add_argument('--output',ty
 p.add_argument('--batch',type=int,default=4);p.add_argument('--layer',type=int,default=12)
 a=p.parse_args();folder=a.run_dir/'long-replay-v01/results';rows=[]
 for mode in ['lru-b4096','data-ready-b4096','indexer-data-ready-b4096']:
- candidates=list(folder.glob(f'RULER128K-*-c{a.batch}-l{a.layer:02d}-*-{mode}.json'));assert len(candidates)==1,candidates
+ candidates=[f for f in folder.glob(f'RULER128K-*-c{a.batch}-l{a.layer:02d}-*.json') if json.loads(f.read_text())['mode']==mode]
+ assert len(candidates)==1,candidates
  f=candidates[0];d=json.loads(f.read_text());assert d['usable_comparison']
  for s in d['probe_component_spans']:
   rows.append(dict(case=f.stem,mode=mode,group=d['group'],batch=a.batch,layer=a.layer,component=s['component'],
