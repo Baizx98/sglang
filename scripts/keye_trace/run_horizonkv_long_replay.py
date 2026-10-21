@@ -55,12 +55,15 @@ def main():
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--layers", nargs="+", type=int, default=[12, 24, 1, 36, 47])
     parser.add_argument("--groups", nargs="+")
+    parser.add_argument("--batches", nargs="+", type=int, default=[1,4])
     args = parser.parse_args()
     root = args.run_dir.resolve()
     out = root / "long-replay-v01"
     (out / "results").mkdir(parents=True, exist_ok=True)
     (out / "timelines").mkdir(exist_ok=True)
-    merge(root)
+    for batch in args.batches:
+        if batch > 1:
+            merge(root, batch)
     config = initialize()
     assert str(torch.cuda.get_device_properties(0).uuid) == GPU.removeprefix("GPU-")
     apps = subprocess.check_output(["nvidia-smi", "--query-compute-apps=pid,gpu_uuid",
@@ -73,8 +76,8 @@ def main():
     manifest = json.loads((root / "long-input-manifest.json").read_text())
     groups = [g for g in manifest["groups"] if not args.groups or g["label"] in args.groups]
     responses = {r["rid"]: r for f in root.glob("input-wave*.json") for r in json.loads(f.read_text())}
-    params = [(g, wave, 1) for g in groups for wave in g["waves"]]
-    params += [(g, g["first_wave"], 4) for g in groups]
+    params = [(g, wave, 1) for g in groups for wave in g["waves"]] if 1 in args.batches else []
+    params += [(g, g["first_wave"], b) for g in groups for b in args.batches if b > 1]
     random.Random(20261014).shuffle(params)
     # Every selected cohort is retained; short natural outputs use a separate view.
     modes = [("native", "h-native", 4096, False, False),
@@ -93,7 +96,7 @@ def main():
     env = dict(gpu_uuid=GPU, torch=torch.__version__, cuda=torch.version.cuda, tp=1,
                source_commit=subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=REPO, text=True).strip(),
                seed=20261014, k=2048, modes=modes, input_source="A6000+L40S real C1 model inputs",
-               replay="C1 and actual C4 layer compute from four independent C1 histories; not full-model serving",
+               replay=f"Actual layer compute for batches {args.batches} from distinct C1 histories; not full-model serving",
                timing="3 eager +25 graph warmups; 5 graph timing repetitions; independent event/Kernel profile",
                ordering="Fixed-seed shuffled cohort order; native first for truth, remaining modes shuffled per point",
                comparison="Known-query/selection/KV oracles omit work; frozen-residency omits online replacement; not deployable baselines",

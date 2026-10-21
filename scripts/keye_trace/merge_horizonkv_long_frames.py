@@ -9,9 +9,9 @@ import torch
 from horizonkv_single_runtime import save
 
 
-def merge(root):
+def merge(root, batch=4):
     root = Path(root)
-    done = root / "merged-c4.json"
+    done = root / f"merged-c{batch}.json"
     if done.exists():
         return json.loads(done.read_text())
     groups = json.loads((root / "long-input-manifest.json").read_text())["groups"]
@@ -22,7 +22,7 @@ def merge(root):
         records = [json.loads(s) for s in path.read_text().splitlines()]
         additions = []
         for group in groups:
-            if len(group["waves"]) != 4:
+            if len(group["waves"]) != batch:
                 continue
             for layer in (1, 12, 24, 36, 47):
                 parts = []
@@ -44,16 +44,16 @@ def merge(root):
                         else:
                             assert all(v == value for v in vals), key
                             result[key] = value
-                    assert len(set(result["request_ids"])) == 4 and len(result["deltas"]) == 4
-                    name = f"{result['request_ids'][0]}_layer{layer:02d}_rank{rank:02d}_mergedC4_step{step:03d}.pt"
+                    assert len(set(result["request_ids"])) == batch and len(result["deltas"]) == batch
+                    name = f"{result['request_ids'][0]}_layer{layer:02d}_rank{rank:02d}_mergedC{batch}_step{step:03d}.pt"
                     torch.save(result, fixtures / name)
                     additions.append(dict(file=name, request_ids=result["request_ids"], steps=result["steps"], layer=layer))
                     total += 1
         with path.open("a") as stream:
             for record in additions:
                 stream.write(json.dumps(record) + "\n")
-    value = dict(frames=total, source="four distinct C1 requests per length/task group",
-                 scope="C4 layer compute only; no full-model C4 serving/throughput claim")
+    value = dict(frames=total, source=f"{batch} distinct C1 requests per length/task group",
+                 scope=f"C{batch} layer compute only; no full-model serving/throughput claim")
     save(done, value)
     return value
 

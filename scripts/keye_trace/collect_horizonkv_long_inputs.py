@@ -92,17 +92,19 @@ def main():
             time.sleep(3)
         else:
             raise TimeoutError("long input server startup")
-        for item in manifest["waves"]:
+        for ordinal, item in enumerate(manifest["waves"]):
             wave = item["wave"]
+            if (root / f"input-wave{wave:03d}.json").exists():
+                continue
             if wave < args.start_wave:
                 continue
-            update(root, phase="collecting_long_inputs", completed_waves=wave,
-                   detail=f"{item['group']} C1 wave {wave+1}/{len(manifest['waves'])}; L={item['rows'][0]['prompt_tokens']}")
+            update(root, phase="collecting_long_inputs", completed_waves=ordinal,
+                   detail=f"{item['group']} C1 wave {ordinal+1}/{len(manifest['waves'])}; L={item['rows'][0]['prompt_tokens']}")
             result = run_wave(url, item["rows"], f"replay__wave{wave:03d}", 48, 1800)
             assert len(result) == 1 and result[0]["response"]["output_ids"]
             save(root / f"input-wave{wave:03d}.json", result)
-            if (wave+1) % args.samples == 0:
-                notify(f"HorizonKV长输入：{item['group']}真实输入{wave+1}/{len(manifest['waves'])}完成；采集耗时不作性能结果。")
+            if (ordinal+1) % args.samples == 0:
+                notify(f"HorizonKV长输入：{item['group']}真实输入{ordinal+1}/{len(manifest['waves'])}完成；采集耗时不作性能结果。")
         save(root / "long-input-complete.json", dict(waves=len(manifest["waves"])))
         update(root, phase="long_inputs_completed", completed_waves=len(manifest["waves"]),
                detail="长输入采集完成，释放两卡后单A6000层计时。")

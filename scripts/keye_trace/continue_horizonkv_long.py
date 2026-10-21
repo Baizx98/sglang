@@ -14,6 +14,7 @@ from horizonkv_single_runtime import GPU, REPO, notify, save, update
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-dir",type=Path,required=True)
+    parser.add_argument("--batches",nargs="+",type=int,default=[1,4])
     args=parser.parse_args()
     root=args.run_dir.resolve()
     pid=json.loads((root/"collector-launch.json").read_text())["pid"]
@@ -27,7 +28,7 @@ def main():
         assert (root/"long-input-complete.json").exists(), "input collector did not finish"
         python=str(REPO/".venv/bin/python")
         jobs=[("frozen_residency_kernel_check",[python,"scripts/keye_trace/test_horizonkv_layer_replay.py"],GPU),
-              ("long_context_a6000_replay",[python,"scripts/keye_trace/run_horizonkv_long_replay.py","--run-dir",str(root)],GPU),
+              ("long_context_a6000_replay",[python,"scripts/keye_trace/run_horizonkv_long_replay.py","--run-dir",str(root),"--batches",*map(str,args.batches)],GPU),
               ("long_context_export",[python,"scripts/keye_trace/export_horizonkv_long_replay.py","--run-dir",str(root)],"")]
         save(root/"continuation-jobs.json",[{"phase":p,"command":c} for p,c,_ in jobs])
         for phase,command,devices in jobs:
@@ -45,7 +46,7 @@ def main():
         assert audit["cases"]==complete["cases"]==complete["expected_cases"]
         update(root,status="completed",phase="long_context_completed",child_pid=None,
                detail=f"{audit['cases']}组长上下文实际层测量与导出完成；待检查趋势和基线局限，不自动写入论文结论。")
-        notify(f"HorizonKV长上下文完成：{audit['cases']}组，含约100K/128K、C1/C4、5个采样层；原始时间线与直接表已保存，待审计结论。")
+        notify(f"HorizonKV长上下文完成：{audit['cases']}组，batch={args.batches}、5个采样层；原始时间线与直接表已保存，待审计结论。")
     except BaseException as exc:
         if child is not None and child.poll() is None:
             os.killpg(child.pid,signal.SIGTERM)
