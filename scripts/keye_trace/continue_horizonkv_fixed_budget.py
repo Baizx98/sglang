@@ -5,7 +5,8 @@ from horizonkv_single_runtime import REPO,GPU,save,update,notify
 
 
 def execute(root,name,command,env):
-    with (root/(name+'.log')).open('w') as log:
+    save(root/(name+'-launch.json'),dict(command=command,code_commit=subprocess.check_output(['git','rev-parse','HEAD'],cwd=REPO,text=True).strip(),started_unix_s=time.time()))
+    with (root/(name+'.log')).open('a') as log:
         child=subprocess.Popen(command,cwd=REPO,env=env,stdin=subprocess.DEVNULL,stdout=log,stderr=subprocess.STDOUT,start_new_session=True)
         update(root,child_pid=child.pid,phase=name,detail=' '.join(command[2:]))
         code=child.wait()
@@ -51,10 +52,11 @@ def main():
         save(root/'pilot-audit.json',dict(records=len(records),workspace_envelope_violations=violations,
              topk_all_equal=True,scope='TP2-shaped single-rank layer replay, no communication or plots'))
         if violations:raise RuntimeError('Provisional workspace envelope exceeded; revise ledger before expanding')
-        # Mark the first stage explicitly, never the entire requested study.
+        # Mark the first stage explicitly, then run the remaining authorized matrix.
         update(root,status='running',phase='pilot_completed_extension_pending',child_pid=None,
                completed_cases=len(records),detail='Pilot measured; 8K/16K and C>16 require additional distinct real input capture; extension runner will follow.')
-        notify(f'HorizonKV固定预算pilot完成：{len(records)}组；workspace预算核验通过。主矩阵扩展仍需新输入，尚未宣称全实验完成。')
+        notify(f'HorizonKV固定预算pilot完成：{len(records)}组；workspace预算核验通过。继续生成/采集新输入和扩展矩阵。')
+        execute(root,'expanded_data_queue',[str(REPO/'.venv/bin/python'),'scripts/keye_trace/extend_horizonkv_fixed_budget.py','--run-dir',str(root)],env)
     except Exception as exc:
         save(root/'failure.json',dict(error=str(exc),traceback=traceback.format_exc()))
         export(root);update(root,status='failed',phase='fixed_budget_queue_failed',child_pid=None,detail=str(exc));notify('HorizonKV固定预算实验异常：'+str(exc));raise

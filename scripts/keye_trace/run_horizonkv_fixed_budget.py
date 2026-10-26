@@ -63,7 +63,8 @@ def assemble(root,group,c,layer_id,step,rank):
     """Merge distinct real C1 frames in memory, never repeat an input request."""
     m=json.loads((root/'long-input-manifest.json').read_text())
     group=next(g for g in m['groups'] if g['label']==group)
-    waves=group['waves'][:c];assert len(waves)==c
+    waves=group['waves'][:c]
+    if len(waves)<c:raise LookupError(f'Only {len(waves)} distinct requests available for C={c}')
     parts=[cached_frames(root,w,layer_id) for w in waves]
     common=set.intersection(*({f['steps'][0] for f in fs} for fs in parts))
     if step not in common:
@@ -105,6 +106,10 @@ def main():
     p.add_argument('--steps',type=int,nargs='+',default=[32]);p.add_argument('--validate-only',action='store_true')
     args=p.parse_args();root=args.run_dir;root.mkdir(parents=True,exist_ok=True)
     for d in ['results','timelines']:(root/d).mkdir(exist_ok=True)
+    source_info=dict(commit=subprocess.check_output(['git','rev-parse','HEAD'],cwd=REPO,text=True).strip(),
+        dirty=subprocess.check_output(['git','status','--porcelain'],cwd=REPO,text=True).strip(),
+        sha256={n:hashlib.sha256((Path(__file__).parent/n).read_bytes()).hexdigest() for n in ['run_horizonkv_fixed_budget.py','horizonkv_layer_replay.py','horizonkv_tp2_local.py','horizonkv_fixed_budget_ledger.py','horizonkv_host_kernels.py']})
+    save(root/f'rank{args.rank}-process-source.json',source_info)
     config=initialize();torch.manual_seed(20261014)
     with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU,torch.profiler.ProfilerActivity.CUDA]):
         torch.ones(16,device="cuda").add_(1);torch.cuda.synchronize()
@@ -120,6 +125,11 @@ def main():
                     case=f'{group}-c{c}-l{lid}-r{args.rank}-s{step}';target=root/'results'/f'{case}.json'
                     if target.exists():done+=1;continue
                     update(root,status='running',phase='tp2_local_validation' if args.validate_only else 'fixed_budget_pilot',child_pid=__import__('os').getpid(),total_cases=total,completed_cases=done,detail=case)
+                    group_meta=next(g for g in json.loads((args.source/'long-input-manifest.json').read_text())['groups'] if g['label']==group)
+                    if len(group_meta['waves'])<c and (root/'budget.json').exists():
+                        from horizonkv_fixed_budget_ledger import point_budget
+                        early=point_budget(json.loads((root/'budget.json').read_text()),c,max(group_meta['actual_input_tokens'])+step,args.rank)
+                        save(target,dict(case=case,timed=False,capacity_status=early['status'] if early['status'].startswith('X') else 'insufficient-distinct-inputs',budget=early));done+=1;continue
                     try:
                         frames,frame=assemble(args.source,group,c,lid,step,args.rank)
                     except LookupError as exc:
@@ -195,8 +205,7 @@ def main():
                         del runner
                     save(target,dict(case=case,group=group,concurrency=c,layer=lid,rank=args.rank,step=step,lengths=frame['seq_lens'].tolist(),
                          shape=record[str(lid)],results=results,timed=True,input_ids=frame['request_ids'],
-                         source_commit=subprocess.check_output(['git','rev-parse','HEAD'],cwd=REPO,text=True).strip(),
-                         implementation_sha256={n:hashlib.sha256((Path(__file__).parent/n).read_bytes()).hexdigest() for n in ['run_horizonkv_fixed_budget.py','horizonkv_layer_replay.py','horizonkv_tp2_local.py','horizonkv_fixed_budget_ledger.py']},
+                         source_commit=source_info['commit'],implementation_sha256=source_info['sha256'],source_dirty_at_start=source_info['dirty'],
                          scope='one A6000, actual TP2 rank-local kernels; true reduced O injected; NCCL omitted; not full-model latency'))
                     done+=1;del data,frames,frame;gc.collect();torch.cuda.empty_cache()
         del layer,peer_layer;gc.collect();torch.cuda.empty_cache()
