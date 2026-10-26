@@ -6,6 +6,7 @@ not the original fused HiSparse implementation.
 """
 
 import torch
+from contextlib import nullcontext
 import triton
 import triton.language as tl
 
@@ -248,20 +249,23 @@ class DeviceLRU:
 
     def resolve(self, hostk, hostv, indices, outk, outv, lengths, step, prefetch=None):
         epoch = step * (2 * self.topk + 1)
-        _touch[(self.batch,)](self.map, self.age, indices, self.slots, self.rank,
-                             self.misses, lengths, self.maxlen, self.capacity,
-                             self.topk, epoch, N=triton.next_power_of_2(self.topk))
-        victims = torch.argsort(self.age, dim=-1, stable=True)
+        span = getattr(self, "profile_span", None)
+        with span("kv_diff") if span else nullcontext():
+            _touch[(self.batch,)](self.map, self.age, indices, self.slots, self.rank,
+                                 self.misses, lengths, self.maxlen, self.capacity,
+                                 self.topk, epoch, N=triton.next_power_of_2(self.topk))
+            victims = torch.argsort(self.age, dim=-1, stable=True)
         if prefetch is None:
             prefmap, prefk, prefv = self.map, self.k, self.v
         else:
             prefmap, prefk, prefv = prefetch
         width = self.k.shape[-2] * self.k.shape[-1]
-        _cache_gather[(self.batch, triton.cdiv(self.topk, 8))](
-            hostk, hostv, self.k, self.v, self.map, self.tag, self.age,
-            indices, self.slots, self.rank, victims, outk, outv, lengths,
-            prefmap, prefk, prefv, self.maxlen, self.capacity, self.topk, width,
-            epoch, prefetch is not None, NT=8, ND=triton.next_power_of_2(width), num_warps=4)
+        with span("kv_fetch") if span else nullcontext():
+            _cache_gather[(self.batch, triton.cdiv(self.topk, 8))](
+                hostk, hostv, self.k, self.v, self.map, self.tag, self.age,
+                indices, self.slots, self.rank, victims, outk, outv, lengths,
+                prefmap, prefk, prefv, self.maxlen, self.capacity, self.topk, width,
+                epoch, prefetch is not None, NT=8, ND=triton.next_power_of_2(width), num_warps=4)
         return self.misses
 
     def clear(self):

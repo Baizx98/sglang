@@ -158,6 +158,7 @@ class ReplayLayer:
         if mode in {"l-cached", "no-io", "ahead", "query-ready", "echo", "topk-ready"}:
             self.cache = DeviceLRU(self.batch, data.maxlen, capacity, self.topk, heads=self.kv_heads)
             self.prime_cache()
+            self.cache.profile_span = self.span
         self.prefmap = torch.full((self.batch, data.maxlen), -1, device="cuda", dtype=torch.int32)
         self.prefk = torch.empty_like(self.stagek)
         self.prefv = torch.empty_like(self.stagev)
