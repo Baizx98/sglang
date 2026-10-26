@@ -22,6 +22,11 @@ def export(root):
             record={k:d[k] for k in ['case','group','concurrency','layer','rank','step']}
             record.update({k:v[k] for k in ['mode','cache_tokens_per_request','selected','miss_tokens','host_read_payload_bytes','host_write_payload_bytes','elapsed_median_us','front_probe_us','front_probe_share','indexer_probe_us','postselect_kv_probe_us','incremental_peak_bytes']})
             record['topk_equal']=v['topk_equal'];record['graph_output_bitwise_equal']=v['graph_output_bitwise_equal']
+            spans={s['component']:s for s in v['timing']['probe_component_spans']}
+            for component in ['indexer_query_prepare','indexer_score','indexer_topk','kv_diff','kv_fetch','kv_resolve_gather','kv_writeback','attention','qkv_projection','qk_norm_rope','output_projection','input_norm','post_attention_norm','moe_ffn']:
+                record[component+'_probe_us']=spans[component]['stream_span_us'] if component in spans else None
+            record['budget_is_provisional']=True
+            record['communication_measured']=False
             record['gpu_work_us']=v['gpu_profile']['gpu_work_total_us']
             record['source_file']=str(p.resolve());records.append(record)
     if records:
