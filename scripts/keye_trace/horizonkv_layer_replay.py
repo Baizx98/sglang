@@ -86,14 +86,16 @@ def read_frames(root, wave, layer, batch=None):
 class ReplayData:
     """Logical request histories reconstructed from real initial KV and deltas."""
 
-    def __init__(self, root, frames, frame):
+    def __init__(self, root, frames, frame, local_rank=None):
         self.frame = frame
+        self.local_rank = local_rank
+        self.num_kv_heads = 4 if local_rank is None else 2
         self.batch = len(frame["request_ids"])
         self.lengths = frame["seq_lens"].int().cuda()
         self.maxlen = int(frame["seq_lens"].max())
         self.prior = {rid: [] for rid in frame["request_ids"]}
         self.prior_inputs = {rid: [] for rid in frame["request_ids"]}
-        self.hostk = torch.zeros(self.batch, self.maxlen, 4, 128, dtype=torch.bfloat16).pin_memory()
+        self.hostk = torch.zeros(self.batch, self.maxlen, self.num_kv_heads, 128, dtype=torch.bfloat16).pin_memory()
         self.hostv = torch.zeros_like(self.hostk).pin_memory()
         index = torch.zeros(self.batch, self.maxlen, 64, dtype=torch.bfloat16)
         root = Path(root) / "fixtures"
@@ -102,8 +104,8 @@ class ReplayData:
             a = torch.load(root / f"{prefix}00_history.pt", weights_only=False)
             b = torch.load(root / f"{prefix}01_history.pt", weights_only=False)
             length = a["length"]
-            self.hostk[row, :length] = torch.cat((a["main_k"], b["main_k"]), dim=1)
-            self.hostv[row, :length] = torch.cat((a["main_v"], b["main_v"]), dim=1)
+            self.hostk[row, :length] = torch.cat((a["main_k"], b["main_k"]), dim=1) if local_rank is None else (a if local_rank == 0 else b)["main_k"]
+            self.hostv[row, :length] = torch.cat((a["main_v"], b["main_v"]), dim=1) if local_rank is None else (a if local_rank == 0 else b)["main_v"]
             index[row, :length] = a["index_k"]
             current_step = frame["steps"][row]
             for f in frames:
@@ -116,8 +118,8 @@ class ReplayData:
                 if pos >= self.maxlen:
                     continue
                 d, p = f["deltas"][i], f["peer"]["deltas"][i]
-                self.hostk[row, pos] = torch.cat((d["main_k"], p["main_k"]), dim=0)
-                self.hostv[row, pos] = torch.cat((d["main_v"], p["main_v"]), dim=0)
+                self.hostk[row, pos] = torch.cat((d["main_k"], p["main_k"]), dim=0) if local_rank is None else d["main_k"]
+                self.hostv[row, pos] = torch.cat((d["main_v"], p["main_v"]), dim=0) if local_rank is None else d["main_v"]
                 index[row, pos] = d["index_k"]
                 if f["steps"][i] < current_step:
                     self.prior[rid].append((f["steps"][i], f["topk"][i]))
@@ -132,8 +134,8 @@ class ReplayData:
         if frame["needs_allreduce"]:
             self.hidden = (frame["hidden"] + frame["peer"]["hidden"]).cuda()
         self.source_attention_input = frame["attention_input"].cuda()
-        self.source_query = torch.cat((frame["query"], frame["peer"]["query"]), dim=1).reshape(self.batch, -1).cuda()
-        self.source_attention_output = torch.cat((frame["attention_output"], frame["peer"]["attention_output"]), dim=-1).cuda()
+        self.source_query = (torch.cat((frame["query"], frame["peer"]["query"]), dim=1) if local_rank is None else frame["query"]).reshape(self.batch, -1).cuda()
+        self.source_attention_output = (torch.cat((frame["attention_output"], frame["peer"]["attention_output"]), dim=-1) if local_rank is None else frame["attention_output"]).cuda()
 
 
 class ReplayLayer:
@@ -143,17 +145,18 @@ class ReplayLayer:
 
         self.layer, self.data, self.mode = layer, data, mode
         self.batch, self.topk = data.batch, layer.self_attn.sa_topk
+        self.kv_heads, self.q_heads = layer.self_attn.num_kv_heads, layer.self_attn.num_heads
         self.hostk, self.hostv = HostPointer(data.hostk), HostPointer(data.hostv)
         self.k = self.v = None
         if mode in {"h-native", "h-staged"}:
-            self.k = data.hostk.view(-1, 4, 128).cuda()
-            self.v = data.hostv.view(-1, 4, 128).cuda()
-        self.stagek = torch.empty(self.batch, self.topk, 4, 128, device="cuda", dtype=torch.bfloat16)
+            self.k = data.hostk.view(-1, self.kv_heads, 128).cuda()
+            self.v = data.hostv.view(-1, self.kv_heads, 128).cuda()
+        self.stagek = torch.empty(self.batch, self.topk, self.kv_heads, 128, device="cuda", dtype=torch.bfloat16)
         self.stagev = torch.empty_like(self.stagek)
         self.stage_slots = torch.arange(self.batch * self.topk, device="cuda", dtype=torch.int32).reshape(self.batch, -1)
         self.cache = None
         if mode in {"l-cached", "no-io", "ahead", "query-ready", "echo", "topk-ready"}:
-            self.cache = DeviceLRU(self.batch, data.maxlen, capacity, self.topk)
+            self.cache = DeviceLRU(self.batch, data.maxlen, capacity, self.topk, heads=self.kv_heads)
             self.prime_cache()
         self.prefmap = torch.full((self.batch, data.maxlen), -1, device="cuda", dtype=torch.int32)
         self.prefk = torch.empty_like(self.stagek)
@@ -218,6 +221,8 @@ class ReplayLayer:
             self.hidden.copy_(self.data.hidden)
             if self.residual is not None:
                 self.residual.copy_(self.data.residual)
+        if hasattr(self.data, "reduced_o_source"):
+            self.data.reduced_o.copy_(self.data.reduced_o_source)
         if self.cache is not None:
             for name, value in self.initial_cache.items():
                 getattr(self.cache, name).copy_(value)
@@ -303,16 +308,20 @@ class ReplayLayer:
                 slots = self.stage_slots
                 if int(data.frame["seq_lens"].min()) < self.topk:
                     slots = slots.masked_fill(indices < 0, -1)
-                cachek = self.stagek.view(-1, 4, 128)
-                cachev = self.stagev.view(-1, 4, 128)
+                cachek = self.stagek.view(-1, self.kv_heads, 128)
+                cachev = self.stagev.view(-1, self.kv_heads, 128)
         with self.span("attention"):
-            output = keye_dsa_paged_attention(q.view(self.batch, 32, 128), cachek,
-                                              cachev, slots, num_q_heads=32, head_dim=128,
+            output = keye_dsa_paged_attention(q.view(self.batch, self.q_heads, 128), cachek,
+                                              cachev, slots, num_q_heads=self.q_heads, head_dim=128,
                                               sm_scale=attn.scaling, is_decode=True,
                                               workspace=self.workspace)
         self.last_attention_output = output
         with self.span("output_projection"):
             h, _ = attn.o_proj(output)
+        # Local TP-rank replay injects the true reduced O input; no communication
+        # is simulated or included in the measured local stage durations.
+        if hasattr(data, "reduced_o"):
+            h = data.reduced_o
         with self.span("post_attention_norm"):
             h, residual = layer.post_attention_layernorm(h, residual)
         with self.span("moe_ffn"):
