@@ -34,7 +34,7 @@ def main():
     env=dict(os.environ,CUDA_VISIBLE_DEVICES=GPU,OMP_NUM_THREADS='4',PYTHONUNBUFFERED='1')
     try:
         for rank in [0,1]:
-            cmd=[sys.executable,'scripts/keye_trace/run_horizonkv_fixed_budget.py','--run-dir',str(root),'--rank',str(rank),
+            cmd=[str(REPO/'.venv/bin/python'),'scripts/keye_trace/run_horizonkv_fixed_budget.py','--run-dir',str(root),'--rank',str(rank),
                  '--groups','RULER32K','RULER64K','RULER128K','--concurrencies','1','4','8','16',
                  '--layers','1','12','24','36','47','--steps','32','39']
             execute(root,f'pilot_rank{rank}',cmd,env)
