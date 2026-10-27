@@ -108,6 +108,9 @@ def main():
     for d in ['results','timelines']:(root/d).mkdir(exist_ok=True)
     source_info=dict(commit=subprocess.check_output(['git','rev-parse','HEAD'],cwd=REPO,text=True).strip(),
         dirty=subprocess.check_output(['git','status','--porcelain'],cwd=REPO,text=True).strip(),
+        gpu_inventory=subprocess.check_output(['nvidia-smi','-i',GPU,
+            '--query-gpu=uuid,pci.bus_id,pcie.link.gen.current,pcie.link.width.current,pcie.link.width.max,gpu_recovery_action',
+            '--format=csv'],text=True,timeout=20),
         sha256={n:hashlib.sha256((Path(__file__).parent/n).read_bytes()).hexdigest() for n in ['run_horizonkv_fixed_budget.py','horizonkv_layer_replay.py','horizonkv_tp2_local.py','horizonkv_fixed_budget_ledger.py','horizonkv_host_kernels.py']})
     save(root/f'rank{args.rank}-process-source.json',source_info)
     config=initialize();torch.manual_seed(20261014)
@@ -154,10 +157,20 @@ def main():
                     ref_input,ref_res=layer.post_attention_layernorm(data.reduced_o_source.clone(),native['residual'].clone())
                     reference_local=layer.mlp(ref_input.clone()).clone()
                     reference_full=reference_local+peer_layer.mlp(ref_input.clone())
-                    del peer_data,peer_frames
                     source_full_error=float((reference_full-frame['output_hidden'].cuda()).abs().max())
+                    source_anchor_error=None
                     if c==1:
-                        assert torch.allclose(reference_full,frame['output_hidden'].cuda(),rtol=.02,atol=.01),source_full_error
+                        # Fixtures were captured on A6000+L40S. Anchor weight loading
+                        # and TP reduction with their actual Attention outputs;
+                        # an A6000 recomputation of the L40S prefix is not bitwise
+                        # equivalent. Timed paths still match same-GPU native below.
+                        captured_o,_=layer.self_attn.o_proj(data.source_attention_output)
+                        captured_peer_o,_=peer_layer.self_attn.o_proj(peer_data.source_attention_output)
+                        anchor_input,_=layer.post_attention_layernorm(captured_o+captured_peer_o,native['residual'].clone())
+                        anchor_output=layer.mlp(anchor_input.clone())+peer_layer.mlp(anchor_input.clone())
+                        source_anchor_error=float((anchor_output-frame['output_hidden'].cuda()).abs().max())
+                        assert torch.allclose(anchor_output,frame['output_hidden'].cuda(),rtol=.02,atol=.01),(case,'captured Attention anchor',source_anchor_error)
+                    del peer_data,peer_frames
                     # Calibrated deployment ledger is created before the timed matrix.
                     ledger=json.loads((root/'budget.json').read_text()) if (root/'budget.json').exists() else None
                     choices=[('h-native',None)] if args.validate_only else []
@@ -178,7 +191,8 @@ def main():
                         errors=dict(normalization=float((runner.last_attention_input-data.source_attention_input).abs().max()),
                                     query=float((runner.last_query-data.source_query).abs().max()),
                                     attention=float((runner.last_attention_output-data.source_attention_output).abs().max()),
-                                    output=float((complete_output-reference_local).abs().max()),source_full_output=source_full_error)
+                                    output=float((complete_output-reference_local).abs().max()),source_full_output=source_full_error,
+                                    source_captured_attention_anchor=source_anchor_error)
                         selected_same=torch.equal(runner.last_topk,native['selected'])
                         source_set_same=torch.equal(runner.last_topk.cpu().sort(-1).values,frame['topk'].sort(-1).values)
                         assert selected_same,(case,errors)
@@ -206,6 +220,7 @@ def main():
                     save(target,dict(case=case,group=group,concurrency=c,layer=lid,rank=args.rank,step=step,lengths=frame['seq_lens'].tolist(),
                          shape=record[str(lid)],results=results,timed=True,input_ids=frame['request_ids'],
                          source_commit=source_info['commit'],implementation_sha256=source_info['sha256'],source_dirty_at_start=source_info['dirty'],
+                         gpu_inventory_at_start=source_info['gpu_inventory'],
                          scope='one A6000, actual TP2 rank-local kernels; true reduced O injected; NCCL omitted; not full-model latency'))
                     done+=1;del data,frames,frame;gc.collect();torch.cuda.empty_cache()
         del layer,peer_layer;gc.collect();torch.cuda.empty_cache()
