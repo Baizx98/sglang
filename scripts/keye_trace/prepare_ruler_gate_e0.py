@@ -34,15 +34,16 @@ def validate(path: Path, expected_rows: int) -> dict[str, Any]:
     rows = [json.loads(line) for line in path.read_text().splitlines() if line]
     if len(rows) != expected_rows:
         raise RuntimeError(f"{path}: expected {expected_rows} rows, found {len(rows)}")
-    indexes = []
+    input_hashes = []
     for ordinal, row in enumerate(rows):
         if not isinstance(row.get("input"), str) or not row["input"]:
             raise RuntimeError(f"{path}:{ordinal + 1}: missing nonempty input")
         if not isinstance(row.get("outputs"), list) or not row["outputs"]:
             raise RuntimeError(f"{path}:{ordinal + 1}: missing nonempty outputs")
-        indexes.append(row.get("index"))
-    if len(set(map(str, indexes))) != len(indexes):
-        raise RuntimeError(f"{path}: duplicate source indexes")
+        # NIAH's index is the answer's character offset, not a sample ID.
+        input_hashes.append(hashlib.sha256(row["input"].encode()).hexdigest())
+    if len(set(input_hashes)) != len(input_hashes):
+        raise RuntimeError(f"{path}: duplicate input prompts")
     return {
         "path": str(path.resolve()),
         "rows": len(rows),
