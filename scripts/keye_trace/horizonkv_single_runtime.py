@@ -67,7 +67,10 @@ def monitor(root):
             record["child_alive"] = bool(pid and Path(f"/proc/{pid}").exists())
             # File counts and timestamps supplement process liveness.
             record["fixture_files"] = len(list((root / "fixtures").glob("*.pt")))
-            record["result_files"] = len(list(root.glob("**/results/*.json")))
+            active_results = root / "results"
+            record["result_files"] = (len(list(active_results.glob("*.json")))
+                                      if active_results.exists()
+                                      else len(list(root.glob("**/results/*.json"))))
             age = int(time.time() - state["updated_unix_s"])
             phase = state.get("phase", "")
             if "input" in phase or "collect" in phase:
