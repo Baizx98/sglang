@@ -1,5 +1,5 @@
 """Fixed deployment-budget TP2-shaped local layer measurements; no plotting."""
-import argparse,json,csv,gc,statistics,subprocess,time,hashlib
+import argparse,json,csv,gc,statistics,subprocess,time,hashlib,os
 from functools import lru_cache
 from pathlib import Path
 from types import MethodType
@@ -7,10 +7,26 @@ import torch
 from safetensors import safe_open
 from horizonkv_layer_replay import initialize,load_layer,read_frames,ReplayData,ReplayLayer,graph_measure,MODEL
 from horizonkv_tp2_local import load_rank
-from horizonkv_single_runtime import GPU,REPO,save,update,notify
+from horizonkv_single_runtime import GPU,INPUT_GPUS,REPO,save,update,notify
 from horizonkv_trace_work import kernel_work_from_trace
 
 OLD=REPO/'data/horizonkv-motivation/2026-10-21_bs16-v01'
+
+def check_gpu_isolation(root,case,boundary):
+    """Keep external GPU jobs out of accepted timings; never terminate them."""
+    output=subprocess.check_output(['nvidia-smi',
+        '--query-compute-apps=gpu_uuid,pid','--format=csv,noheader,nounits'],
+        text=True,timeout=20)
+    processes=[dict(uuid=row[0].strip(),pid=int(row[1]))
+               for row in csv.reader(output.splitlines()) if len(row)==2]
+    foreign=[p for p in processes if p['uuid'] in INPUT_GPUS and p['pid']!=os.getpid()]
+    record=dict(case=case,boundary=boundary,checked_unix_s=time.time(),
+                worker_pid=os.getpid(),processes=processes,foreign=foreign)
+    if foreign:
+        with (root/'contention-events.jsonl').open('a') as stream:
+            stream.write(json.dumps(record)+'\n')
+        raise RuntimeError(f'External GPU job at {boundary}: {foreign}; case {case} not accepted')
+    return record
 
 def no_reduce(self,h,*args,**kwargs):
     return self.forward_normal(h,should_allreduce_fusion=True)
@@ -127,6 +143,7 @@ def main():
                 for step in args.steps:
                     case=f'{group}-c{c}-l{lid}-r{args.rank}-s{step}';target=root/'results'/f'{case}.json'
                     if target.exists():done+=1;continue
+                    isolation_before=check_gpu_isolation(root,case,'before_case')
                     update(root,status='running',phase='tp2_local_validation' if args.validate_only else 'fixed_budget_pilot',child_pid=__import__('os').getpid(),total_cases=total,completed_cases=done,detail=case)
                     group_meta=next(g for g in json.loads((args.source/'long-input-manifest.json').read_text())['groups'] if g['label']==group)
                     if len(group_meta['waves'])<c and (root/'budget.json').exists():
@@ -217,10 +234,12 @@ def main():
                            timing=timing,gpu_profile=kernel_work_from_trace(root/'timelines'/f'{case}.json'),
                            base_allocated_bytes=base_allocated,incremental_peak_bytes=torch.cuda.max_memory_allocated()-base_allocated,peak_allocated_bytes=torch.cuda.max_memory_allocated(),peak_reserved_bytes=torch.cuda.max_memory_reserved()))
                         del runner
+                    isolation_after=check_gpu_isolation(root,case,'after_measurement')
                     save(target,dict(case=case,group=group,concurrency=c,layer=lid,rank=args.rank,step=step,lengths=frame['seq_lens'].tolist(),
                          shape=record[str(lid)],results=results,timed=True,input_ids=frame['request_ids'],
                          source_commit=source_info['commit'],implementation_sha256=source_info['sha256'],source_dirty_at_start=source_info['dirty'],
                          gpu_inventory_at_start=source_info['gpu_inventory'],
+                         gpu_isolation_before=isolation_before,gpu_isolation_after=isolation_after,
                          scope='one A6000, actual TP2 rank-local kernels; true reduced O injected; NCCL omitted; not full-model latency'))
                     done+=1;del data,frames,frame;gc.collect();torch.cuda.empty_cache()
         del layer,peer_layer;gc.collect();torch.cuda.empty_cache()
