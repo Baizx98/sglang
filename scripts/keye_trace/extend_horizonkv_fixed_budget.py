@@ -19,13 +19,14 @@ def require_successful_capture(result):
             raise RuntimeError(f"Input capture rejected for {row['case_id']}: {reason.get('message',reason)}")
 
 
-def freeze(root):
+def freeze(root,pools=None):
     source=root/'expanded-inputs';source.mkdir(exist_ok=True)
     manifest=source/'long-input-manifest.json'
     if manifest.exists():return source,json.loads(manifest.read_text())
     tokenizer=AutoTokenizer.from_pretrained('/Tan/model/Keye-VL-2.0-30B-A3B',trust_remote_code=True)
     groups=[];waves=[]
-    for length,maxc in [(8192,64),(16384,64),(32768,32),(65536,32),(131072,16),(261632,8)]:
+    if pools is None:pools=[(8192,64),(16384,64),(32768,32),(65536,32),(131072,16),(261632,8)]
+    for length,maxc in pools:
         generated=source/'ruler-source'/str(length)
         if not (generated/'generation_manifest.json').exists():
             cmd=[PYTHON,'scripts/keye_trace/prepare_ruler_gate_e0.py','--ruler-repo',str(REPO/'data/external/RULER'),
@@ -56,12 +57,14 @@ def freeze(root):
     save(manifest,data);return source,data
 
 
-def capture(root,source,manifest,long=False):
+def capture(root,source,manifest,long=False,capture_name=None):
     selected=[w for w in manifest['waves'] if (w['length_bucket']>131072)==long]
     for w in selected:
         existing=source/f"input-wave{w['wave']:03d}.json"
         if existing.exists():require_successful_capture(json.loads(existing.read_text()))
     if all((source/f"input-wave{w['wave']:03d}.json").exists() for w in selected):return
+    label=capture_name or ('256k' if long else 'main')
+    stem=f'capture-{label}' if label!='main' else 'capture'
     port=31126
     cmd=[PYTHON,'-m','sglang.launch_server','--model-path','/Tan/model/Keye-VL-2.0-30B-A3B','--trust-remote-code',
          '--host','127.0.0.1','--port',str(port),'--tp-size','2','--attention-backend','keye_sa',
@@ -72,10 +75,10 @@ def capture(root,source,manifest,long=False):
     env=dict(os.environ,CUDA_VISIBLE_DEVICES=','.join(INPUT_GPUS),KEYE_SM80_DSA='1',KEYE_SM80_EXACT_TOPK='1',
              KEYE_LAYER_REPLAY_DIR=str(source/'fixtures'),KEYE_LAYER_REPLAY_LAYERS='1,12,24,36,47',KEYE_LAYER_REPLAY_STEPS='128',
              OMP_NUM_THREADS='4',OPENBLAS_NUM_THREADS='4',PYTHONUNBUFFERED='1')
-    save(source/('capture-256k-command.json' if long else 'capture-command.json'),dict(command=cmd,gpus=INPUT_GPUS,timing_evidence=False))
+    save(source/(stem+'-command.json'),dict(command=cmd,gpus=INPUT_GPUS,timing_evidence=False))
     server=None
     try:
-        with (source/('capture-256k.log' if long else 'capture.log')).open('a') as log:
+        with (source/(stem+'.log')).open('a') as log:
             server=subprocess.Popen(cmd,cwd=REPO,env=env,stdin=subprocess.DEVNULL,stdout=log,stderr=subprocess.STDOUT,start_new_session=True)
         update(root,phase='input_capture_model_loading',child_pid=server.pid,detail='A6000+L40S inputs only, never timing')
         url=f'http://127.0.0.1:{port}';deadline=time.time()+1200
@@ -97,7 +100,7 @@ def capture(root,source,manifest,long=False):
             result=run_wave(url,[row],f"replay__wave{w['wave']:03d}",160,3600)
             require_successful_capture(result)
             save(target,result)
-        notify(f'HorizonKV固定预算：{"256K" if long else "8–128K"}真实输入采集完成；接下来仅健康A6000计时。')
+        notify(f'HorizonKV固定预算：{label}真实输入采集完成；接下来仅健康A6000计时。')
     finally:
         if server is not None and server.poll() is None:
             os.killpg(server.pid,signal.SIGTERM)
