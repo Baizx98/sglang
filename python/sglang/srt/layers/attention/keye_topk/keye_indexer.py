@@ -1462,7 +1462,11 @@ class KeyeIndexer(MultiPlatformOp):
             (x.shape[0], self.topk), -1, dtype=torch.int32, device=x.device
         )
         q_offset = 0
-        chunk_size = 64
+        # Input collection may need smaller exact-score temporaries near the
+        # KV capacity limit. This only changes prefill query tiling, not decode.
+        chunk_size = int(os.getenv("KEYE_SM80_PREFILL_SCORE_CHUNK", "64"))
+        if chunk_size <= 0:
+            raise ValueError("KEYE_SM80_PREFILL_SCORE_CHUNK must be positive")
         for i in range(forward_batch.batch_size):
             seq_len = int(forward_batch.seq_lens_cpu[i].item())
             extend_len = int(forward_batch.extend_seq_lens_cpu[i])

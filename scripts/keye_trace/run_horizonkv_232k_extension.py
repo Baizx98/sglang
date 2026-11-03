@@ -15,7 +15,7 @@ def main():
         check_gpu_isolation(root,'232K startup','before_capture')
         source,manifest=freeze(root,pools=[(232*1024,8)])
         pilot=dict(manifest,waves=manifest['waves'][:1])
-        capture(root,source,pilot,long=True,capture_name='232k-pilot')
+        capture(root,source,pilot,long=True,capture_name='232k-pilot',prefill_chunk=128,score_chunk=8)
         # Release the mixed-device model before any A6000 layer replay.
         for rank in [0,1]:
             gate=root/f'gate-r{rank}';gate.mkdir(exist_ok=True)
@@ -30,7 +30,7 @@ def main():
              ranks=[0,1],layer=12,step=0,scope='Real non-aborted capture and same-A6000 replay gates; not E2E quality'))
         notify('HorizonKV 232K：首条真实请求及两个rank的层12回放校验通过；继续采集其余23条。')
         check_gpu_isolation(root,'232K full capture','before_capture')
-        capture(root,source,manifest,long=True,capture_name='232k')
+        capture(root,source,manifest,long=True,capture_name='232k',prefill_chunk=128,score_chunk=8)
         groups=[g['label'] for g in manifest['groups']]
         for rank in [0,1]:
             cmd=[PYTHON,'scripts/keye_trace/run_horizonkv_fixed_budget.py','--run-dir',str(root),
