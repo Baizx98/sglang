@@ -57,7 +57,7 @@ def freeze(root,pools=None):
     save(manifest,data);return source,data
 
 
-def capture(root,source,manifest,long=False,capture_name=None,prefill_chunk=None,score_chunk=None):
+def capture(root,source,manifest,long=False,capture_name=None,prefill_chunk=None,score_chunk=None,token_pool=None):
     selected=[w for w in manifest['waves'] if (w['length_bucket']>131072)==long]
     for w in selected:
         existing=source/f"input-wave{w['wave']:03d}.json"
@@ -68,7 +68,7 @@ def capture(root,source,manifest,long=False,capture_name=None,prefill_chunk=None
     port=31126
     cmd=[PYTHON,'-m','sglang.launch_server','--model-path','/Tan/model/Keye-VL-2.0-30B-A3B','--trust-remote-code',
          '--host','127.0.0.1','--port',str(port),'--tp-size','2','--attention-backend','keye_sa',
-         '--context-length','262144' if long else '131328','--max-total-tokens','263000' if long else '140000',
+         '--context-length','262144' if long else '131328','--max-total-tokens',str(token_pool or (263000 if long else 140000)),
          '--max-running-requests','1','--chunked-prefill-size',str(prefill_chunk or (512 if long else 1024)),
          '--mem-fraction-static','0.98' if long else '0.85','--disable-cuda-graph','--disable-custom-all-reduce',
          '--disable-radix-cache','--disable-overlap-schedule','--dtype','bfloat16','--random-seed','20261014']
