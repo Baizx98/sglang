@@ -12,6 +12,12 @@ from run_horizonkv_motivation import run_wave
 
 PYTHON=str(REPO/'.venv/bin/python')
 
+def require_successful_capture(result):
+    for row in result:
+        reason=row['response'].get('meta_info',{}).get('finish_reason',{})
+        if isinstance(reason,dict) and reason.get('type')=='abort':
+            raise RuntimeError(f"Input capture rejected for {row['case_id']}: {reason.get('message',reason)}")
+
 
 def freeze(root):
     source=root/'expanded-inputs';source.mkdir(exist_ok=True)
@@ -52,6 +58,9 @@ def freeze(root):
 
 def capture(root,source,manifest,long=False):
     selected=[w for w in manifest['waves'] if (w['length_bucket']>131072)==long]
+    for w in selected:
+        existing=source/f"input-wave{w['wave']:03d}.json"
+        if existing.exists():require_successful_capture(json.loads(existing.read_text()))
     if all((source/f"input-wave{w['wave']:03d}.json").exists() for w in selected):return
     port=31126
     cmd=[PYTHON,'-m','sglang.launch_server','--model-path','/Tan/model/Keye-VL-2.0-30B-A3B','--trust-remote-code',
@@ -86,6 +95,7 @@ def capture(root,source,manifest,long=False):
                    detail=f"{w['group']}, distinct request wave {w['wave']}; input timings excluded")
             row=json.loads(Path(w['request_file']).read_text())
             result=run_wave(url,[row],f"replay__wave{w['wave']:03d}",160,3600)
+            require_successful_capture(result)
             save(target,result)
         notify(f'HorizonKV固定预算：{"256K" if long else "8–128K"}真实输入采集完成；接下来仅健康A6000计时。')
     finally:
