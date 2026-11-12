@@ -21,6 +21,9 @@ def analyze(root, partial=False):
     requests = {r['rid']: r for r in [json.loads(s) for s in (root/'requests.jsonl').read_text().splitlines()]}
     manifest = [json.loads(s) for s in (root/'events/manifest.jsonl').read_text().splitlines()]
     identities = [(r['request_id'],r['target_layer_id']) for r in manifest]
+    chunk_lookup={(r['request_id'],r['target_layer_id']):root/'events'/r['file'] for r in manifest}
+    capture_stages={}
+    pp_boundaries_verified=0
     assert len(identities) == len(set(identities))
     if not partial:
         assert set(identities) == {(rid,layer) for rid in requests for layer in range(1,48)}
@@ -31,6 +34,17 @@ def analyze(root, partial=False):
         assert data['schema_version']==2 and data['exact_main'] and not data['prediction_uses_current_key']
         assert [r['step'] for r in data['rows']] == list(range(32))
         meta = requests[data['request_id']]
+        if 'pipeline_start_layer' in data:
+            start=int(data['pipeline_start_layer'])
+            device=data['capture_device']
+            if start in capture_stages:
+                assert capture_stages[start]==device
+            capture_stages[start]=device
+            if start>0 and data['target_layer_id']==start:
+                preceding=torch.load(chunk_lookup[(data['request_id'],start-1)],map_location='cpu',weights_only=False)
+                for here,there in zip(data['rows'],preceding['rows'],strict=True):
+                    assert torch.equal(here['previous_layer_indices'],there['exact_indices']), (path,here['step'])
+                pp_boundaries_verified+=1
         previous = None
         for r in data['rows']:
             length = r['context_len']
@@ -107,6 +121,7 @@ def analyze(root, partial=False):
     expansion.groupby(['group','layer','candidate_k'],as_index=False).agg(recall=('recall_at_M','mean'),
         rerank_recall=('rerank_recall','mean'),minimum=('recall_at_M','min')).to_csv(out/'candidate-by-layer.csv',index=False)
     audit=dict(partial=partial,request_count=base.request_id.nunique(),chunks=len(manifest),
+        capture_stages=capture_stages,pp_boundary_request_pairs_verified=pp_boundaries_verified,
         layer_step_observations=int(len(expansion)/len(WIDTHS)),method_rows=len(base),candidate_rows=len(expansion),
         all_candidate_scores_exact=True,all_first_step_selfchecks_exact=True,strict_rerank_losses=0,
         tied_loss_observations=int((expansion.tied_native_tokens_lost>0).sum()),

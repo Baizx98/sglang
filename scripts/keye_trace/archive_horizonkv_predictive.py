@@ -17,6 +17,7 @@ def main(root,destination,prefix,partial=False):
     audit=json.loads((source/'audit.json').read_text())
     gpu_path=source/'gpu-rerank-audit.json'
     gpu=json.loads(gpu_path.read_text()) if gpu_path.exists() else None
+    collection=json.loads((root/'server-command.json').read_text())
     if partial:
         assert audit['partial'] and audit['request_count']>0
         assert audit['chunks']==audit['request_count']*47
@@ -46,11 +47,11 @@ def main(root,destination,prefix,partial=False):
             fields={k:str(v) for k,v in frame.dtypes.items()}))
     provenance=dict(run_dir=str(root),completion='partial' if partial else 'complete',source_audit=audit,gpu_rerank_audit=gpu,
         environment=json.loads((root/'environment.json').read_text()),
-        collection=json.loads((root/'server-command.json').read_text()),
+        collection=collection,
         selection=json.loads((root/'selection.json').read_text()),outputs=outputs,
         archive_script_sha256=digest(Path(__file__)),
         units='Recall/Jaccard/coverage fractions 0..1; candidate_ratio unitless; lengths/n/counts tokens; layer/step zero-based. No latency/throughput measurements.',
-        evidence='Fresh TP2 exact-main shadow trace; all 47 adjacent layers included. Live candidate-kernel scores verified; CPU stable reranking audited. Native GPU Top-K replay '+('verified.' if gpu else 'not run due to driver failure.'),
+        evidence=f"Fresh PP{collection.get('pp_size',1)}/TP{collection.get('tp_size',2)} exact-main shadow trace; all 47 adjacent layers included. Live candidate-kernel scores verified; CPU stable reranking audited. Native GPU Top-K replay "+('verified.' if gpu else 'not run due to driver failure.'),
         exclusions='First Decode step intentionally absent from previous-step method; matched method comparisons use steps1..31. No request or layer excluded by outcome.')
     path=destination/f'{prefix}provenance_v01_reviewed.json'
     if path.exists():raise FileExistsError(path)
