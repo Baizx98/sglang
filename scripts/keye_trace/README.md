@@ -1,5 +1,31 @@
 # Keye DSA Trace Pilot
 
+## HorizonKV 4.2 same-state predictive study (2026-11-12)
+
+`horizonkv_predictive_runtime.py --run-dir <new-directory>` freezes 24 real
+requests (five RULER lengths, QA/summary/code), runs full-model BF16 TP2 on the
+two UUID-pinned A6000s, and captures all 47 adjacent layer pairs for 32 Decode
+steps. An independent `--monitor` process sends authorized ntfy notices every
+20 minutes, checking state and completed raw chunks. Never reuse a nonempty
+run directory for a new collection attempt.
+
+`KEYE_PREDICTIVE_STUDY=1` adds shadow capture to the existing lookahead hook;
+native exact selection continues to drive Attention. Prediction scans only
+historical target-layer keys using the prior layer's normalized attention
+input, reserves the new token, and records a sorted historical prefix through
+8192 candidates. Candidate scores are recomputed with the actual candidate
+kernel and compared bitwise to full-scan scores. No current-key prediction or
+canonical key-cache mutation is allowed. First-step full-score self-checks
+audit the hidden state and position semantics.
+
+`analyze_horizonkv_predictive.py --run-dir <directory>` validates completeness,
+scores and tie-aware rerank containment, then exports per-request/layer/step
+metrics. Method comparisons use matched steps 1--31; step 0 has no previous
+Decode step and is not imputed. Expansion uses steps 0--31 and sizes
+2048/2304/2560/3072/4096/6144/8192. Offline stable reranking can differ from GPU
+Top-K at boundary ties; strict-score losses must remain zero. These are shadow
+selection measurements, not task-quality or performance results.
+
 ## HorizonKV single-A6000 motivation replay (2026-10-20)
 
 `collect_horizonkv_layer_inputs.py` collects real Decode inputs on the healthy

@@ -1869,6 +1869,17 @@ class KeyeIndexer(MultiPlatformOp):
         if not selected_rows and not use_for_attention:
             return None
 
+        if record_enabled and os.getenv("KEYE_PREDICTIVE_STUDY", "0") == "1":
+            if use_for_attention:
+                raise ValueError("The same-state predictive study must retain exact attention")
+            from sglang.srt.layers.attention.keye_topk.predictive_study import record
+
+            record(self, previous_x, current_x, previous_indices, exact_indices,
+                   exact_scores, positions, forward_batch, layer_id, trace_dir,
+                   selected_rows, decode_steps, selected_request_ids, step_limit,
+                   _lookahead_max_k())
+            return None
+
         metadata = forward_batch.attn_backend.get_indexer_metadata(
             layer_id, forward_batch
         )
