@@ -15,19 +15,46 @@ from horizonkv_a6000 import GPU_IDS, inventory, notify
 from horizonkv_single_runtime import REPO, save, update
 
 
+def bounded_inventory(root):
+    # A stuck GSP can block NVML in uninterruptible driver sleep. Do not let
+    # progress notifications wait indefinitely for a subprocess to reap.
+    with (root/'monitor-gpu-probe.txt').open('w') as log:
+        proc = subprocess.Popen(['nvidia-smi', '--query-gpu=name,uuid,memory.used,gpu_recovery_action',
+            '--format=csv'], stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            os.killpg(proc.pid, signal.SIGKILL)
+            return dict(timed_out=True, pid=proc.pid)
+    return dict(exit_code=proc.returncode, output=(root/'monitor-gpu-probe.txt').read_text())
+
+
 def monitor(root):
     next_notice = time.time() + 1200
     while True:
         state = json.loads((root / 'state.json').read_text())
         terminal = state.get('status') in {'completed', 'failed', 'interrupted'}
+        server_log = root/'server.log'
+        if not terminal and server_log.exists():
+            with server_log.open('rb') as handle:
+                handle.seek(max(0, server_log.stat().st_size-32768))
+                recent = handle.read().lower()
+            if b'scatter gather kernel index out of bounds' in recent or b'device-side assert triggered' in recent:
+                pid=state.get('child_pid')
+                proc=Path(f'/proc/{pid}/cmdline')
+                if pid and proc.exists() and b'sglang.launch_server' in proc.read_bytes():
+                    # The CUDA context is already invalid. Stop only this run's
+                    # process group promptly instead of waiting for HTTP timeout.
+                    notify('HorizonKV 4.2：检测到CUDA断言，立即终止本轮服务并保留日志；不再等待请求超时，不重置设备。')
+                    os.killpg(pid,signal.SIGKILL)
+                    update(root,status='failed',phase='cuda_assert_watchdog',child_pid=None,
+                        detail='CUDA assertion found in owned server log; process group terminated. Inspect driver before resuming.')
+                    return
         if terminal or time.time() >= next_notice:
             metrics = root / 'events' / 'manifest.jsonl'
             chunks = sum(1 for _ in metrics.open()) if metrics.exists() else 0
             record = dict(checked_unix_s=time.time(), state=state, chunks=chunks)
-            try:
-                record['gpus'] = inventory()
-            except Exception as exc:
-                record['gpu_error'] = type(exc).__name__
+            record['gpus'] = bounded_inventory(root)
             pid = state.get('child_pid')
             record['server_alive'] = bool(pid and Path(f'/proc/{pid}').exists())
             record['ntfy_sent'] = notify(
