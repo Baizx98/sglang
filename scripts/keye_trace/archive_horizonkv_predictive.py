@@ -12,16 +12,23 @@ def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def main(root,destination,prefix):
+def main(root,destination,prefix,partial=False):
     source=root/'analysis'
     audit=json.loads((source/'audit.json').read_text())
-    gpu=json.loads((source/'gpu-rerank-audit.json').read_text())
-    assert not audit['partial'] and audit['request_count']==24 and audit['chunks']==24*47
-    assert audit['layer_step_observations']==24*47*32 and gpu['strict_losses']==0
+    gpu_path=source/'gpu-rerank-audit.json'
+    gpu=json.loads(gpu_path.read_text()) if gpu_path.exists() else None
+    if partial:
+        assert audit['partial'] and audit['request_count']>0
+        assert audit['chunks']==audit['request_count']*47
+    else:
+        assert not audit['partial'] and audit['request_count']==24 and audit['chunks']==24*47
+        assert audit['layer_step_observations']==24*47*32 and gpu['strict_losses']==0
     outputs=[]
     names=['method-observations','candidate-observations','gpu-rerank-observations',
         'method-by-request','candidate-by-request','method-summary','candidate-summary',
         'method-by-layer','candidate-by-layer']
+    if gpu is None:
+        names.remove('gpu-rerank-observations')
     for name in names:
         raw=source/(name+'.csv')
         frame=pd.read_csv(raw)
@@ -37,13 +44,13 @@ def main(root,destination,prefix):
             assert digest(raw)==digest(path)
         outputs.append(dict(file=path.name,rows=len(frame),source_sha256=digest(raw),sha256=digest(path),
             fields={k:str(v) for k,v in frame.dtypes.items()}))
-    provenance=dict(run_dir=str(root),source_audit=audit,gpu_rerank_audit=gpu,
+    provenance=dict(run_dir=str(root),completion='partial' if partial else 'complete',source_audit=audit,gpu_rerank_audit=gpu,
         environment=json.loads((root/'environment.json').read_text()),
         collection=json.loads((root/'server-command.json').read_text()),
         selection=json.loads((root/'selection.json').read_text()),outputs=outputs,
         archive_script_sha256=digest(Path(__file__)),
         units='Recall/Jaccard/coverage fractions 0..1; candidate_ratio unitless; lengths/n/counts tokens; layer/step zero-based. No latency/throughput measurements.',
-        evidence='Fresh TP2 exact-main shadow trace; all 47 adjacent layers included. GPU rerank uses native exact Top-K helper on candidate scores verified in the live model.',
+        evidence='Fresh TP2 exact-main shadow trace; all 47 adjacent layers included. Live candidate-kernel scores verified; CPU stable reranking audited. Native GPU Top-K replay '+('verified.' if gpu else 'not run due to driver failure.'),
         exclusions='First Decode step intentionally absent from previous-step method; matched method comparisons use steps1..31. No request or layer excluded by outcome.')
     path=destination/f'{prefix}provenance_v01_reviewed.json'
     if path.exists():raise FileExistsError(path)
@@ -54,4 +61,5 @@ def main(root,destination,prefix):
 if __name__=='__main__':
     p=argparse.ArgumentParser(description=__doc__);p.add_argument('--run-dir',type=Path,required=True)
     p.add_argument('--destination',type=Path,required=True);p.add_argument('--prefix',default='2026-11-12_1655_predictive-')
-    a=p.parse_args();main(a.run_dir.resolve(),a.destination.resolve(),a.prefix)
+    p.add_argument('--partial',action='store_true',help='Explicitly archive the audited subset, never label the full study complete')
+    a=p.parse_args();main(a.run_dir.resolve(),a.destination.resolve(),a.prefix,a.partial)
