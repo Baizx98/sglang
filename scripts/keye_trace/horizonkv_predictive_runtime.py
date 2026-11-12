@@ -78,7 +78,12 @@ def freeze(root):
 def post(url, payload, timeout=7200):
     req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers={'Content-Type': 'application/json'})
     with urllib.request.urlopen(req, timeout=timeout) as response:
-        return json.load(response)
+        raw = response.read()
+        try:
+            return json.loads(raw) if raw else None
+        except json.JSONDecodeError:
+            # Administrative endpoints such as flush_cache return plain text.
+            return raw.decode()
 
 
 def run(root):
@@ -138,6 +143,14 @@ def run(root):
             req_chunks = [r for r in chunks if r['request_id'] == row['rid']]
             if len(req_chunks) != 47 or {r['target_layer_id'] for r in req_chunks} != set(range(1,48)):
                 raise RuntimeError(f"Incomplete 47-layer trace for {row['rid']}: {len(req_chunks)}")
+            import torch
+            for chunk in req_chunks:
+                data = torch.load(root/'events'/chunk['file'], map_location='cpu', weights_only=False)
+                if any(r['score_max_abs'] != 0 for r in data['rows']):
+                    raise RuntimeError(f"Candidate/full score mismatch: {chunk['file']}")
+                first = data['rows'][0]
+                if first['selfcheck_max_abs'] != 0 or not first['selfcheck_equal']:
+                    raise RuntimeError(f"Full-score self-check failed: {chunk['file']}")
             update(root, completed_requests=i+1)
         update(root, phase='trace_collected', detail='24 fresh requests captured; shutting down owned server before analysis.')
     finally:
