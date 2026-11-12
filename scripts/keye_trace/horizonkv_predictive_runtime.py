@@ -171,6 +171,11 @@ def run(root, gpu_ids=GPU_IDS, tp_size=2, pp_size=1):
         '--max-running-requests', '1', '--chunked-prefill-size', '1024', '--mem-fraction-static', '0.90',
         '--disable-cuda-graph', '--disable-custom-all-reduce', '--disable-radix-cache',
         '--disable-overlap-schedule', '--dtype', 'bfloat16', '--random-seed', '20261112']
+    if pp_size > 1:
+        # Keye is advertised as a VLM, so the framework's default warm-up sends
+        # an image. This adapter is text-only; run the explicit Decode health
+        # request below instead of expanding the experiment to vision inputs.
+        cmd.append('--skip-server-warmup')
     save(root/'server-command.json', dict(command=cmd, env={k:v for k,v in env.items() if k.startswith(('KEYE_', 'CUDA_VISIBLE', 'OMP_', 'OPENBLAS_'))},
         commit=subprocess.check_output(['git','rev-parse','HEAD'],cwd=REPO,text=True).strip(),
         gpu_inventory=devices, tp_size=tp_size, pp_size=pp_size,
