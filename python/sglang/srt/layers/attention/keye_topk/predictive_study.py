@@ -69,6 +69,8 @@ def record(indexer, previous_x, current_x, previous_indices, exact_indices,
         path = directory / file
         data = dict(schema_version=2, request_id=rid, target_layer_id=layer,
             source_layer_id=layer-1, topk=indexer.topk, max_candidates=max_k,
+            pipeline_start_layer=batch.token_to_kv_pool.start_layer,
+            capture_device=torch.cuda.get_device_name(),
             prediction_uses_current_key=False, current_token_reserved=True,
             exact_main=True, rows=rows)
         tmp = path.with_suffix('.tmp')

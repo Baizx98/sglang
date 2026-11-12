@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
+from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.layers.attention.keye_topk.horizonkv_probe import profiled, span
 from sglang.srt.layers.attention.nsa.nsa_indexer import BaseIndexerMetadata
 from sglang.srt.layers.linear import ReplicatedLinear
@@ -1836,7 +1837,7 @@ class KeyeIndexer(MultiPlatformOp):
         """Record shadow scores and optionally return top-k for selected layers."""
         trace_dir = _lookahead_trace_dir()
         use_for_attention = layer_id in _lookahead_use_layers()
-        record_enabled = trace_dir is not None and torch.cuda.current_device() == 0
+        record_enabled = trace_dir is not None and get_tensor_model_parallel_rank() == 0
         if (not record_enabled and not use_for_attention) or not _use_sm80_dsa:
             return None
         if layer_id <= 0 or not forward_batch.forward_mode.is_decode():

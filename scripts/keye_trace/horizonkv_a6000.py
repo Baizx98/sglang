@@ -60,13 +60,13 @@ def inventory(require_idle=False):
     return selected
 
 
-def notify(message):
+def notify(message, title="HorizonKV dual A6000"):
     for attempt in range(3):
         try:
             config = json.loads(Path("/home10T/bzx/.codex/ntfy.json").read_text())
             request = urllib.request.Request(config["url"], data=message.encode(), method="POST",
                 headers={"Authorization": "Bearer " + config["token"],
-                         "Content-Type": "text/plain; charset=utf-8", "Title": "HorizonKV dual A6000"})
+                         "Content-Type": "text/plain; charset=utf-8", "Title": title})
             with urllib.request.urlopen(request, timeout=20) as response:
                 return response.status == 200
         except (OSError, ValueError, KeyError):

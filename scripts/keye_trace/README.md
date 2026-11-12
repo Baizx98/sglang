@@ -2,6 +2,19 @@
 
 ## HorizonKV 4.2 same-state predictive study (2026-11-12)
 
+For the authorized healthy-A6000 + L40S fallback, use `--tp-size 1 --pp-size 2`
+and explicit `--gpu-ids <healthy-A6000-UUID> <L40S-UUID>`. The text-only Keye
+wrapper now passes PP proxies and exposes stage layer ranges. Exact previous
+attention input and Top-K travel in the proxy so the layer 23-to-24 boundary
+remains in the study. Each stage's TP rank zero records its owned layers;
+raw chunks include the stage start and GPU model. All 47 pairs must still be
+present. Monitoring reads selected UUIDs and PCI tags from `run-config.json`,
+so the excluded faulty GPU's recovery state does not block this run.
+This changes execution placement, not the definition of same-state fidelity;
+cross-layout generated trajectories need not be bitwise identical. No mixed
+GPU timing is a performance result. `test_predictive_pp.py` checks the proxy
+contract without loading the full model.
+
 `horizonkv_predictive_runtime.py --run-dir <new-directory>` freezes 24 real
 requests (five RULER lengths, QA/summary/code), runs full-model BF16 TP2 on the
 two UUID-pinned A6000s, and captures all 47 adjacent layer pairs for 32 Decode

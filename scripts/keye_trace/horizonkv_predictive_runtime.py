@@ -1,6 +1,7 @@
 """Run the same-state 4.2 study; monitor verified files and notify every 20 min."""
 import argparse
 import csv
+from functools import partial
 import hashlib
 import json
 import os
@@ -12,15 +13,32 @@ import time
 import traceback
 import urllib.request
 
-from horizonkv_a6000 import GPU_IDS, inventory, notify
+from horizonkv_a6000 import GPU_IDS, notify as _notify
 from horizonkv_single_runtime import REPO, save, update
 
+notify=partial(_notify,title="HorizonKV 4.2")
 
-def bounded_inventory(root):
+
+def inventory(gpu_ids, require_idle=False):
+    result=subprocess.check_output(['nvidia-smi','-i',','.join(gpu_ids),
+        '--query-gpu=name,uuid,memory.total,memory.free,pci.bus_id,driver_version,gpu_recovery_action',
+        '--format=csv,noheader,nounits'],text=True,timeout=15)
+    fields=['name','uuid','memory_mib','free_mib','pci_bus','driver','recovery_action']
+    rows=[dict(zip(fields,[v.strip() for v in row])) for row in csv.reader(result.splitlines())]
+    if {r['uuid'] for r in rows}!=set(gpu_ids) or any(r['recovery_action']!='None' for r in rows):
+        raise RuntimeError('Selected GPUs are missing or require recovery')
+    if require_idle:
+        apps=subprocess.check_output(['nvidia-smi','-i',','.join(gpu_ids),
+            '--query-compute-apps=gpu_uuid,pid','--format=csv,noheader,nounits'],text=True,timeout=15)
+        if apps.strip():raise RuntimeError('A selected GPU has another compute process')
+    return rows
+
+
+def bounded_inventory(root, gpu_ids):
     # A stuck GSP can block NVML in uninterruptible driver sleep. Do not let
     # progress notifications wait indefinitely for a subprocess to reap.
     with (root/'monitor-gpu-probe.txt').open('w') as log:
-        proc = subprocess.Popen(['nvidia-smi', '--query-gpu=name,uuid,memory.used,temperature.gpu,power.draw,utilization.gpu,gpu_recovery_action',
+        proc = subprocess.Popen(['nvidia-smi', '-i', ','.join(gpu_ids), '--query-gpu=name,uuid,memory.used,temperature.gpu,power.draw,utilization.gpu,gpu_recovery_action',
             '--format=csv'], stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
         try:
             proc.wait(timeout=5)
@@ -31,6 +49,10 @@ def bounded_inventory(root):
 
 
 def monitor(root):
+    config=json.loads((root/'run-config.json').read_text()) if (root/'run-config.json').exists() else dict(gpu_ids=GPU_IDS)
+    gpu_ids=config['gpu_ids']
+    # Exclude the faulty, unselected card's later driver events.
+    selected_bus_tags=config.get('pci_bus_tags',[])
     next_notice = time.time() + 1200
     known_xids = set(subprocess.check_output(['dmesg'], text=True).splitlines())
     while True:
@@ -45,7 +67,7 @@ def monitor(root):
             if any(value in recent for value in [b'scatter gather kernel index out of bounds',
                     b'device-side assert triggered', b'cuda error:', b'cuda out of memory']):
                 failure = 'CUDA failure in owned server log'
-        gpu_probe = bounded_inventory(root)
+        gpu_probe = bounded_inventory(root, gpu_ids)
         with (root/'gpu-monitor.jsonl').open('a') as stream:
             stream.write(json.dumps(dict(checked_unix_s=time.time(), **gpu_probe))+'\n')
         if not terminal:
@@ -53,10 +75,11 @@ def monitor(root):
                 failure = 'GPU status query failed or timed out'
             else:
                 for gpu in csv.DictReader(gpu_probe['output'].splitlines(), skipinitialspace=True):
-                    if gpu['uuid'] in GPU_IDS and gpu['gpu_recovery_action'] != 'None':
+                    if gpu['uuid'] in gpu_ids and gpu['gpu_recovery_action'] != 'None':
                         failure = f"{gpu['uuid']} Recovery={gpu['gpu_recovery_action']}"
             lines = subprocess.check_output(['dmesg'], text=True).splitlines()
-            new_xids = [line for line in lines if 'NVRM: Xid' in line and line not in known_xids]
+            new_xids = [line for line in lines if 'NVRM: Xid' in line and line not in known_xids
+                and (not selected_bus_tags or any(tag in line for tag in selected_bus_tags))]
             if new_xids:
                 failure = 'New NVIDIA Xid: '+new_xids[-1]
             known_xids.update(lines)
@@ -133,29 +156,30 @@ def post(url, payload, timeout=7200):
             return raw.decode()
 
 
-def run(root):
-    inventory(require_idle=True)
+def run(root, gpu_ids=GPU_IDS, tp_size=2, pp_size=1):
+    devices=inventory(gpu_ids, require_idle=True)
     rows = freeze(root)
-    env = dict(os.environ, CUDA_VISIBLE_DEVICES=','.join(GPU_IDS), KEYE_SM80_DSA='1',
+    env = dict(os.environ, CUDA_VISIBLE_DEVICES=','.join(gpu_ids), KEYE_SM80_DSA='1',
         KEYE_SM80_EXACT_TOPK='1', KEYE_LOOKAHEAD_TRACE_DIR=str(root/'events'),
         KEYE_PREDICTIVE_STUDY='1', KEYE_LOOKAHEAD_RID_PREFIX='predictive__',
         KEYE_LOOKAHEAD_DECODE_STEPS='32', KEYE_LOOKAHEAD_MAX_K='8192',
         KEYE_SM80_PREFILL_SCORE_CHUNK='64', OMP_NUM_THREADS='4', OPENBLAS_NUM_THREADS='4',
         PYTHONUNBUFFERED='1')
     cmd = [sys.executable, '-m', 'sglang.launch_server', '--model-path', '/Tan/model/Keye-VL-2.0-30B-A3B',
-        '--trust-remote-code', '--host', '127.0.0.1', '--port', '31242', '--tp-size', '2',
+        '--trust-remote-code', '--host', '127.0.0.1', '--port', '31242', '--tp-size', str(tp_size), '--pp-size', str(pp_size),
         '--attention-backend', 'keye_sa', '--context-length', '131328', '--max-total-tokens', '140000',
-        '--max-running-requests', '1', '--chunked-prefill-size', '1024', '--mem-fraction-static', '0.85',
+        '--max-running-requests', '1', '--chunked-prefill-size', '1024', '--mem-fraction-static', '0.90',
         '--disable-cuda-graph', '--disable-custom-all-reduce', '--disable-radix-cache',
         '--disable-overlap-schedule', '--dtype', 'bfloat16', '--random-seed', '20261112']
     save(root/'server-command.json', dict(command=cmd, env={k:v for k,v in env.items() if k.startswith(('KEYE_', 'CUDA_VISIBLE', 'OMP_', 'OPENBLAS_'))},
         commit=subprocess.check_output(['git','rev-parse','HEAD'],cwd=REPO,text=True).strip(),
-        gpu_inventory=inventory(), scope='Fresh full-model TP2 exact trajectory with same-state shadow prediction; instrumentation excluded from performance claims'))
+        gpu_inventory=devices, tp_size=tp_size, pp_size=pp_size,
+        scope='Fresh full-model PP/TP exact trajectory with same-state shadow prediction; instrumentation excluded from performance claims'))
     server = None
     try:
         with (root/'server.log').open('w') as log:
             server = subprocess.Popen(cmd, cwd=REPO, env=env, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
-        update(root, status='running', phase='loading_tp2_model', child_pid=server.pid, total_requests=len(rows), completed_requests=0)
+        update(root, status='running', phase='loading_model', child_pid=server.pid, total_requests=len(rows), completed_requests=0)
         url = 'http://127.0.0.1:31242'
         deadline = time.time() + 1200
         while time.time() < deadline:
@@ -176,7 +200,7 @@ def run(root):
         save(root/'health.json', response)
         if not response.get('output_ids') or response['meta_info'].get('finish_reason',{}).get('type') == 'abort':
             raise RuntimeError('Nonempty real-model health generation required')
-        notify('HorizonKV 4.2：双 A6000 TP2 模型加载及真实 Decode 健康检查通过；开始24请求、全47相邻层对、32步同状态影子实验。')
+        notify(f'HorizonKV 4.2：两卡PP={pp_size}/TP={tp_size}模型加载及真实Decode健康检查通过；开始24请求、47相邻层对、32步同状态影子实验。')
         for i, row in enumerate(rows):
             update(root, phase='collecting_same_state_trace', completed_requests=i,
                 detail=f"{row['group']}，{row['prompt_tokens']} tokens，{row['rid']}")
@@ -219,6 +243,9 @@ if __name__ == '__main__':
     parser.add_argument('--run-dir', type=Path, required=True)
     parser.add_argument('--monitor', action='store_true')
     parser.add_argument('--freeze-only', action='store_true')
+    parser.add_argument('--gpu-ids',nargs='+',default=GPU_IDS)
+    parser.add_argument('--tp-size',type=int,default=2)
+    parser.add_argument('--pp-size',type=int,default=1)
     args = parser.parse_args()
     root = args.run_dir.resolve()
     root.mkdir(parents=True, exist_ok=True)
@@ -231,7 +258,7 @@ if __name__ == '__main__':
             raise KeyboardInterrupt('Owned study interrupted')
         signal.signal(signal.SIGTERM, stop)
         try:
-            run(root)
+            run(root,args.gpu_ids,args.tp_size,args.pp_size)
         except BaseException as exc:
             save(root/'failure.json', dict(error=str(exc), traceback=traceback.format_exc()))
             update(root, status='interrupted' if isinstance(exc,KeyboardInterrupt) else 'failed', phase='controller_stopped', detail=str(exc))

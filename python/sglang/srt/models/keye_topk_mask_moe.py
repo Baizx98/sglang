@@ -13,9 +13,11 @@ KeyeTopKMaskMoe 模型实现 - sglang 版本
 
 import logging
 import os
+import re
 from typing import Iterable, Optional, Tuple
 
 import torch
+from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.layers.attention.keye_topk.horizonkv_probe import profiled
 from transformers import PretrainedConfig
 
@@ -119,6 +121,24 @@ class KeyeTopKMaskMoeModel(Qwen3MoeModel):
     def get_input_embeddings(self) -> torch.nn.Embedding:
         return self.embed_tokens
 
+    def forward(self, input_ids, positions, forward_batch, input_embeds=None,
+                pp_proxy_tensors=None):
+        tracing = bool(os.getenv("KEYE_LOOKAHEAD_TRACE_DIR"))
+        decode = forward_batch.forward_mode.is_decode()
+        if tracing and decode and not self.pp_group.is_first_rank:
+            # Preserve the actual preceding layer's attention input and exact
+            # selection across the PP boundary, rather than dropping layer 24.
+            if pp_proxy_tensors is None:
+                raise ValueError("PP lookahead requires preceding-stage tensors")
+            forward_batch._keye_lookahead_previous_x = pp_proxy_tensors["lookahead_previous_x"]
+            forward_batch._keye_lookahead_previous_indices = pp_proxy_tensors["lookahead_previous_indices"]
+        output = super().forward(input_ids, positions, forward_batch, input_embeds,
+                                 pp_proxy_tensors=pp_proxy_tensors)
+        if tracing and decode and isinstance(output, PPProxyTensors):
+            output["lookahead_previous_x"] = forward_batch._keye_lookahead_previous_x
+            output["lookahead_previous_indices"] = forward_batch._keye_lookahead_previous_indices
+        return output
+
 
 class KeyeVL2MoeForConditionalGeneration(KeyeVL1_5ForConditionalGeneration):
     """
@@ -150,8 +170,29 @@ class KeyeVL2MoeForConditionalGeneration(KeyeVL1_5ForConditionalGeneration):
         )
 
     @profiled("model_total")
-    def forward(self, input_ids, positions, forward_batch, get_embedding=False):
-        return super().forward(input_ids, positions, forward_batch, get_embedding)
+    def forward(self, input_ids, positions, forward_batch, get_embedding=False,
+                pp_proxy_tensors=None):
+        if self.model.pp_group.world_size == 1:
+            return super().forward(input_ids, positions, forward_batch, get_embedding)
+        if forward_batch.contains_mm_inputs():
+            raise ValueError("Keye PP adapter currently supports text requests only")
+        if self.is_mrope_enabled:
+            positions = forward_batch.mrope_positions
+        output = self.model(input_ids, positions, forward_batch,
+                            pp_proxy_tensors=pp_proxy_tensors)
+        if not self.model.pp_group.is_last_rank:
+            return output
+        if get_embedding:
+            return self.pooler(output, forward_batch)
+        return self.logits_processor(input_ids, output, self.lm_head, forward_batch)
+
+    @property
+    def start_layer(self):
+        return self.model.start_layer
+
+    @property
+    def end_layer(self):
+        return self.model.end_layer
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
@@ -210,6 +251,10 @@ class KeyeVL2MoeForConditionalGeneration(KeyeVL1_5ForConditionalGeneration):
 
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
+                continue
+
+            layer_match = re.match(r"model\.layers\.(\d+)\.", name)
+            if layer_match and not self.start_layer <= int(layer_match[1]) < self.end_layer:
                 continue
 
             # sa_indexer 权重：直接加载，跳过所有融合映射
