@@ -1,5 +1,6 @@
 """Run the same-state 4.2 study; monitor verified files and notify every 20 min."""
 import argparse
+import csv
 import hashlib
 import json
 import os
@@ -19,7 +20,7 @@ def bounded_inventory(root):
     # A stuck GSP can block NVML in uninterruptible driver sleep. Do not let
     # progress notifications wait indefinitely for a subprocess to reap.
     with (root/'monitor-gpu-probe.txt').open('w') as log:
-        proc = subprocess.Popen(['nvidia-smi', '--query-gpu=name,uuid,memory.used,gpu_recovery_action',
+        proc = subprocess.Popen(['nvidia-smi', '--query-gpu=name,uuid,memory.used,temperature.gpu,power.draw,utilization.gpu,gpu_recovery_action',
             '--format=csv'], stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
         try:
             proc.wait(timeout=5)
@@ -31,30 +32,49 @@ def bounded_inventory(root):
 
 def monitor(root):
     next_notice = time.time() + 1200
+    known_xids = set(subprocess.check_output(['dmesg'], text=True).splitlines())
     while True:
         state = json.loads((root / 'state.json').read_text())
         terminal = state.get('status') in {'completed', 'failed', 'interrupted'}
+        failure = None
         server_log = root/'server.log'
         if not terminal and server_log.exists():
             with server_log.open('rb') as handle:
                 handle.seek(max(0, server_log.stat().st_size-32768))
                 recent = handle.read().lower()
-            if b'scatter gather kernel index out of bounds' in recent or b'device-side assert triggered' in recent:
-                pid=state.get('child_pid')
-                proc=Path(f'/proc/{pid}/cmdline')
-                if pid and proc.exists() and b'sglang.launch_server' in proc.read_bytes():
-                    # The CUDA context is already invalid. Stop only this run's
-                    # process group promptly instead of waiting for HTTP timeout.
-                    notify('HorizonKV 4.2：检测到CUDA断言，立即终止本轮服务并保留日志；不再等待请求超时，不重置设备。')
-                    os.killpg(pid,signal.SIGKILL)
-                    update(root,status='failed',phase='cuda_assert_watchdog',child_pid=None,
-                        detail='CUDA assertion found in owned server log; process group terminated. Inspect driver before resuming.')
-                    return
+            if any(value in recent for value in [b'scatter gather kernel index out of bounds',
+                    b'device-side assert triggered', b'cuda error:', b'cuda out of memory']):
+                failure = 'CUDA failure in owned server log'
+        gpu_probe = bounded_inventory(root)
+        with (root/'gpu-monitor.jsonl').open('a') as stream:
+            stream.write(json.dumps(dict(checked_unix_s=time.time(), **gpu_probe))+'\n')
+        if not terminal:
+            if gpu_probe.get('timed_out') or gpu_probe.get('exit_code') != 0:
+                failure = 'GPU status query failed or timed out'
+            else:
+                for gpu in csv.DictReader(gpu_probe['output'].splitlines(), skipinitialspace=True):
+                    if gpu['uuid'] in GPU_IDS and gpu['gpu_recovery_action'] != 'None':
+                        failure = f"{gpu['uuid']} Recovery={gpu['gpu_recovery_action']}"
+            lines = subprocess.check_output(['dmesg'], text=True).splitlines()
+            new_xids = [line for line in lines if 'NVRM: Xid' in line and line not in known_xids]
+            if new_xids:
+                failure = 'New NVIDIA Xid: '+new_xids[-1]
+            known_xids.update(lines)
+        if failure:
+            pid=state.get('child_pid')
+            proc=Path(f'/proc/{pid}/cmdline')
+            if pid and proc.exists() and b'sglang.launch_server' in proc.read_bytes():
+                # Stop only the recorded service group; no GPU reset or retry.
+                os.killpg(pid,signal.SIGKILL)
+            update(root,status='failed',phase='error_watchdog',child_pid=None,detail=failure)
+            save(root/'watchdog-error.json', dict(checked_unix_s=time.time(),failure=failure,gpu_probe=gpu_probe))
+            notify('HorizonKV 4.2：检测到错误，已停止本轮服务，不重试、不复位。'+failure)
+            return
         if terminal or time.time() >= next_notice:
             metrics = root / 'events' / 'manifest.jsonl'
             chunks = sum(1 for _ in metrics.open()) if metrics.exists() else 0
             record = dict(checked_unix_s=time.time(), state=state, chunks=chunks)
-            record['gpus'] = bounded_inventory(root)
+            record['gpus'] = gpu_probe
             pid = state.get('child_pid')
             record['server_alive'] = bool(pid and Path(f'/proc/{pid}').exists())
             record['ntfy_sent'] = notify(
