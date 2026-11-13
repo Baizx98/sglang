@@ -60,6 +60,7 @@ def main() -> None:
     parser.add_argument("--tasks", nargs="+", required=True)
     parser.add_argument("--num-samples", type=int, default=8)
     parser.add_argument("--seed", type=int, default=20260810)
+    parser.add_argument('--reuse-generated',action='store_true',help='Validate existing cells rather than regenerate them')
     parser.add_argument(
         "--nltk-data", type=Path, default=Path("/Tan/dataset/nltk_data")
     )
@@ -105,6 +106,12 @@ def main() -> None:
                 "--random_seed",
                 str(args.seed),
             ]
+            if args.reuse_generated and (save_dir/task/'validation.jsonl').is_file():
+                record=validate(save_dir/task/'validation.jsonl',args.num_samples)
+                record.update(length=length,task=task)
+                generated.append(record)
+                print(json.dumps(record),flush=True)
+                continue
             completed = subprocess.run(
                 command,
                 cwd=prepare.parent,
@@ -142,12 +149,9 @@ def main() -> None:
         "num_samples": args.num_samples,
         "random_seed": args.seed,
         "nltk_data": str(args.nltk_data.resolve()),
-        "punkt_tab_zip_sha256": sha256_file(
-            args.nltk_data / "tokenizers" / "punkt_tab.zip"
-        ),
-        "punkt_zip_sha256": sha256_file(
-            args.nltk_data / "tokenizers" / "punkt.zip"
-        ),
+        "nltk_resources": {str(p.relative_to(args.nltk_data)):sha256_file(p)
+            for resource in ['punkt','punkt_tab']
+            for p in sorted((args.nltk_data/'tokenizers'/resource).rglob('*')) if p.is_file()},
         "generated": generated,
     }
     manifest_path = args.output_root / "generation_manifest.json"
