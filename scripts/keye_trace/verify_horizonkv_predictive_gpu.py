@@ -13,6 +13,7 @@ import numpy as np
 import torch
 
 from sglang.srt.layers.attention.keye_topk.keye_indexer import KeyeIndexer
+from analyze_horizonkv_predictive import load_chunk
 
 WIDTHS=[2048,2304,2560,3072,4096,6144,8192]
 
@@ -30,7 +31,7 @@ def main(root):
             'gpu_rerank_recall','boundary_tied_tokens_lost','strict_tokens_lost'])
         writer.writeheader()
         for c in manifest:
-            data=torch.load(root/'events'/c['file'],map_location='cpu',weights_only=False)
+            data=load_chunk(root/'events'/c['file'])
             ids=torch.stack([r['candidates'] for r in data['rows']]).cuda()
             scores=torch.stack([r['candidate_scores'] for r in data['rows']]).cuda()
             lengths=torch.tensor([r['context_len'] for r in data['rows']],device='cuda',dtype=torch.int32)

@@ -5,6 +5,7 @@ token reserves one candidate slot because its target-layer key is unavailable
 at the proposed early production point. The full exact trajectory is retained.
 """
 import json
+import gzip
 import os
 from pathlib import Path
 
@@ -87,7 +88,8 @@ def record(indexer, previous_x, current_x, previous_indices, exact_indices,
         rows.append(row)
         if len(rows) != step_limit:
             continue
-        file = f'{rid}__layer{layer:02d}.pt'
+        compressed=os.getenv('KEYE_PREDICTIVE_COMPRESS_TRACE','0') == '1'
+        file = f'{rid}__layer{layer:02d}.pt' + ('.gz' if compressed else '')
         path = directory / file
         data = dict(schema_version=2, request_id=rid, target_layer_id=layer,
             source_layer_id=layer-1, topk=indexer.topk, max_candidates=max_k,
@@ -96,7 +98,10 @@ def record(indexer, previous_x, current_x, previous_indices, exact_indices,
             prediction_uses_current_key=False, current_token_reserved=True,
             exact_main=True, rows=rows)
         tmp = path.with_suffix('.tmp')
-        torch.save(data, tmp)
+        if compressed:
+            with gzip.open(tmp,'wb',compresslevel=1) as handle:torch.save(data,handle)
+        else:
+            torch.save(data, tmp)
         os.replace(tmp,path)
         with (directory/'manifest.jsonl').open('a') as stream:
             stream.write(json.dumps(dict(file=file, request_id=rid, target_layer_id=layer,

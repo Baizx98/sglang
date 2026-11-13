@@ -156,7 +156,7 @@ def post(url, payload, timeout=7200):
             return raw.decode()
 
 
-def run(root, gpu_ids=GPU_IDS, tp_size=2, pp_size=1, requests_file=None, steps=32, seed=20261112, extra_metrics=False):
+def run(root, gpu_ids=GPU_IDS, tp_size=2, pp_size=1, requests_file=None, steps=32, seed=20261112, extra_metrics=False, compress_trace=False):
     devices=inventory(gpu_ids, require_idle=True)
     if requests_file is None:
         rows = freeze(root)
@@ -184,6 +184,7 @@ def run(root, gpu_ids=GPU_IDS, tp_size=2, pp_size=1, requests_file=None, steps=3
     if extra_metrics:
         assert tp_size == 1, 'Attention diagnostic currently supports TP1 only'
         env['KEYE_PREDICTIVE_EXTRA_METRICS']='1'
+    if compress_trace:env['KEYE_PREDICTIVE_COMPRESS_TRACE']='1'
     cmd = [sys.executable, '-m', 'sglang.launch_server', '--model-path', '/Tan/model/Keye-VL-2.0-30B-A3B',
         '--trust-remote-code', '--host', '127.0.0.1', '--port', '31242', '--tp-size', str(tp_size), '--pp-size', str(pp_size),
         '--attention-backend', 'keye_sa', '--context-length', '131328', '--max-total-tokens', '140000',
@@ -240,7 +241,8 @@ def run(root, gpu_ids=GPU_IDS, tp_size=2, pp_size=1, requests_file=None, steps=3
                 raise RuntimeError(f"Incomplete 47-layer trace for {row['rid']}: {len(req_chunks)}")
             import torch
             for chunk in req_chunks:
-                data = torch.load(root/'events'/chunk['file'], map_location='cpu', weights_only=False)
+                from analyze_horizonkv_predictive import load_chunk
+                data = load_chunk(root/'events'/chunk['file'])
                 if [r['step'] for r in data['rows']] != list(range(steps)):
                     raise RuntimeError(f"Noncontiguous trace: {chunk['file']}")
                 if any(r['score_max_abs'] != 0 for r in data['rows']):
@@ -276,6 +278,7 @@ if __name__ == '__main__':
     parser.add_argument('--steps',type=int,default=32)
     parser.add_argument('--seed',type=int,default=20261112)
     parser.add_argument('--extra-metrics',action='store_true')
+    parser.add_argument('--compress-trace',action='store_true')
     args = parser.parse_args()
     root = args.run_dir.resolve()
     root.mkdir(parents=True, exist_ok=True)
@@ -288,7 +291,7 @@ if __name__ == '__main__':
             raise KeyboardInterrupt('Owned study interrupted')
         signal.signal(signal.SIGTERM, stop)
         try:
-            run(root,args.gpu_ids,args.tp_size,args.pp_size,args.requests_file,args.steps,args.seed,args.extra_metrics)
+            run(root,args.gpu_ids,args.tp_size,args.pp_size,args.requests_file,args.steps,args.seed,args.extra_metrics,args.compress_trace)
         except BaseException as exc:
             save(root/'failure.json', dict(error=str(exc), traceback=traceback.format_exc()))
             update(root, status='interrupted' if isinstance(exc,KeyboardInterrupt) else 'failed', phase='controller_stopped', detail=str(exc))

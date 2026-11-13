@@ -2,6 +2,7 @@
 import argparse
 import hashlib
 import json
+import gzip
 from pathlib import Path
 
 import numpy as np
@@ -14,6 +15,12 @@ WIDTHS = [2048, 2304, 2560, 3072, 4096, 6144, 8192]
 
 def sha(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def load_chunk(path):
+    opener=gzip.open if path.suffix=='.gz' else open
+    with opener(path,'rb') as handle:
+        return torch.load(handle,map_location='cpu',weights_only=False)
 
 
 def analyze(root, partial=False):
@@ -33,7 +40,7 @@ def analyze(root, partial=False):
     base_rows, expansion_rows, raw_sources, extra_rows = [], [], [], []
     for chunk in manifest:
         path = root/'events'/chunk['file']
-        data = torch.load(path, map_location='cpu', weights_only=False)
+        data = load_chunk(path)
         assert data['schema_version']==2 and data['exact_main'] and not data['prediction_uses_current_key']
         assert [r['step'] for r in data['rows']] == list(range(steps))
         meta = requests[data['request_id']]
@@ -44,7 +51,7 @@ def analyze(root, partial=False):
                 assert capture_stages[start]==device
             capture_stages[start]=device
             if start>0 and data['target_layer_id']==start:
-                preceding=torch.load(chunk_lookup[(data['request_id'],start-1)],map_location='cpu',weights_only=False)
+                preceding=load_chunk(chunk_lookup[(data['request_id'],start-1)])
                 for here,there in zip(data['rows'],preceding['rows'],strict=True):
                     assert torch.equal(here['previous_layer_indices'],there['exact_indices']), (path,here['step'])
                 pp_boundaries_verified+=1
