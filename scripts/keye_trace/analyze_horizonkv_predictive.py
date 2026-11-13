@@ -116,6 +116,12 @@ def analyze(root, partial=False):
             request_max=('recall','max'),request_p10=('recall',lambda x:x.quantile(.1)),requests=('request_id','nunique'))
     summary(request_base,['group','length_bucket','method']).to_csv(out/'method-summary.csv',index=False)
     summary(request_exp,['group','length_bucket','candidate_k','candidate_ratio']).to_csv(out/'candidate-summary.csv',index=False)
+    expansion.groupby(['group','length_bucket','candidate_k'],as_index=False).agg(
+        observation_p10=('recall_at_M',lambda x:x.quantile(.10)),
+        observation_p01=('recall_at_M',lambda x:x.quantile(.01)),
+        observation_min=('recall_at_M','min'),
+        fully_covered_fraction=('recall_at_M',lambda x:(x==1).mean()),
+        observations=('recall_at_M','size')).to_csv(out/'candidate-tail.csv',index=False)
     base[base.matched_three_methods].groupby(['group','layer','method'],as_index=False).agg(
         recall=('recall','mean'),jaccard=('jaccard','mean'),minimum=('recall','min')).to_csv(out/'method-by-layer.csv',index=False)
     expansion.groupby(['group','layer','candidate_k'],as_index=False).agg(recall=('recall_at_M','mean'),

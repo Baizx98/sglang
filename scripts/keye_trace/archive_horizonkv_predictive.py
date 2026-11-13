@@ -27,7 +27,7 @@ def main(root,destination,prefix,partial=False):
     outputs=[]
     names=['method-observations','candidate-observations','gpu-rerank-observations',
         'method-by-request','candidate-by-request','method-summary','candidate-summary',
-        'method-by-layer','candidate-by-layer']
+        'method-by-layer','candidate-by-layer','candidate-tail']
     if gpu is None:
         names.remove('gpu-rerank-observations')
     for name in names:
