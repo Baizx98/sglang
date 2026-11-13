@@ -31,7 +31,8 @@ def main(out):
                 answer=list(r['answer_nodes']);extra=dict(problem_type=r['problem_type'])
             identity=digest(r['prompt'])
             if identity in seen:continue
-            ids=tok.apply_chat_template(messages,tokenize=True,add_generation_prompt=True)
+            rendered=tok.apply_chat_template(messages,tokenize=False,add_generation_prompt=True)
+            ids=tok.encode(rendered,add_special_tokens=False)
             if not 2048<len(ids)<=120000:continue
             split='calibration' if count<cal_count else 'test'
             if doc in documents and documents[doc]!=split:continue

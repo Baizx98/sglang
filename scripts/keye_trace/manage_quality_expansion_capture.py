@@ -27,6 +27,7 @@ def main(base):
             notice=time.time()+1200
         time.sleep(20)
     text=read(base/'text-inputs-docsplit/requests.jsonl');bfcl=read(base/'new-bfcl-inputs/requests.jsonl');external=read(base/'external-inputs/requests.jsonl')
+    assert len(text)==1223 and len(bfcl)==80 and len(external)==120, (len(text),len(bfcl),len(external))
     generated=json.loads((base/'ruler-generated/generation_manifest.json').read_text())
     assert len(generated['generated'])==78
     tok=AutoTokenizer.from_pretrained('/Tan/model/Keye-VL-2.0-30B-A3B',trust_remote_code=True)
