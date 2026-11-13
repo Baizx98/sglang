@@ -156,13 +156,29 @@ def post(url, payload, timeout=7200):
             return raw.decode()
 
 
-def run(root, gpu_ids=GPU_IDS, tp_size=2, pp_size=1):
+def run(root, gpu_ids=GPU_IDS, tp_size=2, pp_size=1, requests_file=None, steps=32, seed=20261112):
     devices=inventory(gpu_ids, require_idle=True)
-    rows = freeze(root)
+    if requests_file is None:
+        rows = freeze(root)
+    else:
+        rows = [json.loads(s) for s in requests_file.read_text().splitlines() if s]
+        assert rows and len({r['rid'] for r in rows}) == len(rows)
+        for row in rows:
+            assert len(row['input_ids']) == row['prompt_tokens'] > 2048
+        save(root/'selection.json', dict(seed=seed, source=str(requests_file),
+            source_sha256=hashlib.sha256(requests_file.read_bytes()).hexdigest(),
+            policy='Externally frozen requests; outcome-independent selection',
+            requests=[{k:v for k,v in r.items() if k != 'input_ids'} for r in rows]))
+        (root/'requests.jsonl').write_text(requests_file.read_text())
+    config_path=root/'run-config.json'
+    config=json.loads(config_path.read_text()) if config_path.exists() else {}
+    config.update(gpu_ids=gpu_ids,tp_size=tp_size,pp_size=pp_size,steps=steps,seed=seed,
+        candidate_widths=[2048,2304,2560,3000,3072,4096,6144,8192] if requests_file else [2048,2304,2560,3072,4096,6144,8192])
+    save(config_path,config)
     env = dict(os.environ, CUDA_VISIBLE_DEVICES=','.join(gpu_ids), KEYE_SM80_DSA='1',
         KEYE_SM80_EXACT_TOPK='1', KEYE_LOOKAHEAD_TRACE_DIR=str(root/'events'),
         KEYE_PREDICTIVE_STUDY='1', KEYE_LOOKAHEAD_RID_PREFIX='predictive__',
-        KEYE_LOOKAHEAD_DECODE_STEPS='32', KEYE_LOOKAHEAD_MAX_K='8192',
+        KEYE_LOOKAHEAD_DECODE_STEPS=str(steps), KEYE_LOOKAHEAD_MAX_K='8192',
         KEYE_SM80_PREFILL_SCORE_CHUNK='64', OMP_NUM_THREADS='4', OPENBLAS_NUM_THREADS='4',
         PYTHONUNBUFFERED='1')
     cmd = [sys.executable, '-m', 'sglang.launch_server', '--model-path', '/Tan/model/Keye-VL-2.0-30B-A3B',
@@ -170,7 +186,7 @@ def run(root, gpu_ids=GPU_IDS, tp_size=2, pp_size=1):
         '--attention-backend', 'keye_sa', '--context-length', '131328', '--max-total-tokens', '140000',
         '--max-running-requests', '1', '--chunked-prefill-size', '1024', '--mem-fraction-static', '0.90',
         '--disable-cuda-graph', '--disable-custom-all-reduce', '--disable-radix-cache',
-        '--disable-overlap-schedule', '--dtype', 'bfloat16', '--random-seed', '20261112']
+        '--disable-overlap-schedule', '--dtype', 'bfloat16', '--random-seed', str(seed)]
     if pp_size > 1:
         # Keye is advertised as a VLM, so the framework's default warm-up sends
         # an image. This adapter is text-only; run the explicit Decode health
@@ -205,15 +221,15 @@ def run(root, gpu_ids=GPU_IDS, tp_size=2, pp_size=1):
         save(root/'health.json', response)
         if not response.get('output_ids') or response['meta_info'].get('finish_reason',{}).get('type') == 'abort':
             raise RuntimeError('Nonempty real-model health generation required')
-        notify(f'HorizonKV 4.2：两卡PP={pp_size}/TP={tp_size}模型加载及真实Decode健康检查通过；开始24请求、47相邻层对、32步同状态影子实验。')
+        notify(f'HorizonKV 4.2：PP={pp_size}/TP={tp_size}真实Decode健康检查通过；开始{len(rows)}请求、47相邻层对、{steps}步影子实验。')
         for i, row in enumerate(rows):
             update(root, phase='collecting_same_state_trace', completed_requests=i,
                 detail=f"{row['group']}，{row['prompt_tokens']} tokens，{row['rid']}")
             post(url+'/flush_cache', {})
             response = post(url+'/generate', dict(input_ids=row['input_ids'], rid=row['rid'],
-                sampling_params=dict(temperature=0, max_new_tokens=33, ignore_eos=True), stream=False))
+                sampling_params=dict(temperature=0, max_new_tokens=steps+1, ignore_eos=True), stream=False))
             save(root/f'response-{i:02d}.json', response)
-            if len(response.get('output_ids', [])) != 33 or response['meta_info'].get('finish_reason',{}).get('type') == 'abort':
+            if len(response.get('output_ids', [])) != steps+1 or response['meta_info'].get('finish_reason',{}).get('type') == 'abort':
                 raise RuntimeError(f"Incomplete generation: {row['rid']}")
             chunks = [json.loads(s) for s in (root/'events/manifest.jsonl').read_text().splitlines()]
             req_chunks = [r for r in chunks if r['request_id'] == row['rid']]
@@ -222,13 +238,15 @@ def run(root, gpu_ids=GPU_IDS, tp_size=2, pp_size=1):
             import torch
             for chunk in req_chunks:
                 data = torch.load(root/'events'/chunk['file'], map_location='cpu', weights_only=False)
+                if [r['step'] for r in data['rows']] != list(range(steps)):
+                    raise RuntimeError(f"Noncontiguous trace: {chunk['file']}")
                 if any(r['score_max_abs'] != 0 for r in data['rows']):
                     raise RuntimeError(f"Candidate/full score mismatch: {chunk['file']}")
                 first = data['rows'][0]
                 if first['selfcheck_max_abs'] != 0 or not first['selfcheck_equal']:
                     raise RuntimeError(f"Full-score self-check failed: {chunk['file']}")
             update(root, completed_requests=i+1)
-        update(root, phase='trace_collected', detail='24 fresh requests captured; shutting down owned server before analysis.')
+        update(root, phase='trace_collected', detail=f'{len(rows)} requests captured; shutting down owned server before analysis.')
     finally:
         if server is not None and server.poll() is None:
             os.killpg(server.pid, signal.SIGTERM)
@@ -251,6 +269,9 @@ if __name__ == '__main__':
     parser.add_argument('--gpu-ids',nargs='+',default=GPU_IDS)
     parser.add_argument('--tp-size',type=int,default=2)
     parser.add_argument('--pp-size',type=int,default=1)
+    parser.add_argument('--requests-file',type=Path)
+    parser.add_argument('--steps',type=int,default=32)
+    parser.add_argument('--seed',type=int,default=20261112)
     args = parser.parse_args()
     root = args.run_dir.resolve()
     root.mkdir(parents=True, exist_ok=True)
@@ -263,7 +284,7 @@ if __name__ == '__main__':
             raise KeyboardInterrupt('Owned study interrupted')
         signal.signal(signal.SIGTERM, stop)
         try:
-            run(root,args.gpu_ids,args.tp_size,args.pp_size)
+            run(root,args.gpu_ids,args.tp_size,args.pp_size,args.requests_file,args.steps,args.seed)
         except BaseException as exc:
             save(root/'failure.json', dict(error=str(exc), traceback=traceback.format_exc()))
             update(root, status='interrupted' if isinstance(exc,KeyboardInterrupt) else 'failed', phase='controller_stopped', detail=str(exc))

@@ -18,6 +18,9 @@ def sha(path):
 
 def analyze(root, partial=False):
     torch.set_num_threads(4)
+    config=json.loads((root/'run-config.json').read_text()) if (root/'run-config.json').exists() else {}
+    steps=int(config.get('steps',32))
+    widths=config.get('candidate_widths',WIDTHS)
     requests = {r['rid']: r for r in [json.loads(s) for s in (root/'requests.jsonl').read_text().splitlines()]}
     manifest = [json.loads(s) for s in (root/'events/manifest.jsonl').read_text().splitlines()]
     identities = [(r['request_id'],r['target_layer_id']) for r in manifest]
@@ -32,7 +35,7 @@ def analyze(root, partial=False):
         path = root/'events'/chunk['file']
         data = torch.load(path, map_location='cpu', weights_only=False)
         assert data['schema_version']==2 and data['exact_main'] and not data['prediction_uses_current_key']
-        assert [r['step'] for r in data['rows']] == list(range(32))
+        assert [r['step'] for r in data['rows']] == list(range(steps))
         meta = requests[data['request_id']]
         if 'pipeline_start_layer' in data:
             start=int(data['pipeline_start_layer'])
@@ -75,7 +78,7 @@ def analyze(root, partial=False):
                 intersection=int(member[ids].sum())
                 base_rows.append(dict(common,method=method,recall=intersection/K,
                     jaccard=intersection/(K+len(ids)-intersection),selected=len(ids)))
-            for width in WIDTHS:
+            for width in widths:
                 take=min(width,length)
                 ids=candidates[:width]
                 sc=scores[:width]
@@ -128,11 +131,11 @@ def analyze(root, partial=False):
         rerank_recall=('rerank_recall','mean'),minimum=('recall_at_M','min')).to_csv(out/'candidate-by-layer.csv',index=False)
     audit=dict(partial=partial,request_count=base.request_id.nunique(),chunks=len(manifest),
         capture_stages=capture_stages,pp_boundary_request_pairs_verified=pp_boundaries_verified,
-        layer_step_observations=int(len(expansion)/len(WIDTHS)),method_rows=len(base),candidate_rows=len(expansion),
+        layer_step_observations=int(len(expansion)/len(widths)),steps=steps,candidate_widths=widths,method_rows=len(base),candidate_rows=len(expansion),
         all_candidate_scores_exact=True,all_first_step_selfchecks_exact=True,strict_rerank_losses=0,
         tied_loss_observations=int((expansion.tied_native_tokens_lost>0).sum()),
         raw_sources=raw_sources,selection_sha256=sha(root/'selection.json'),
-        statistics='Equal request weighting after averaging all 47 layers and matched steps 1..31 for method comparison; steps0..31 for expansion. Request min/max are ranges, not confidence intervals.',
+        statistics=f'Equal request weighting over all 47 layers; matched steps 1..{steps-1} for methods, steps0..{steps-1} for expansion. Request ranges are not CI.',
         first_decode_step='No previous-step baseline; missing intentionally, never replaced by current-step ground truth.',
         scope='Exact trajectory shadow fidelity; not free-running task quality, asynchronous overlap or performance')
     (out/'audit.json').write_text(json.dumps(audit,indent=2)+'\n')
