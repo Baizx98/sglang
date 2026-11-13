@@ -20,6 +20,8 @@ WIDTHS=[2048,2304,2560,3072,4096,6144,8192]
 @torch.inference_mode()
 def main(root):
     torch.set_num_threads(4)
+    config=json.loads((root/'run-config.json').read_text()) if (root/'run-config.json').exists() else {}
+    widths=config.get('candidate_widths',WIDTHS)
     output=root/'analysis/gpu-rerank-observations.csv'
     manifest=[json.loads(s) for s in (root/'events/manifest.jsonl').read_text().splitlines()]
     count=ties=0
@@ -32,7 +34,7 @@ def main(root):
             ids=torch.stack([r['candidates'] for r in data['rows']]).cuda()
             scores=torch.stack([r['candidate_scores'] for r in data['rows']]).cuda()
             lengths=torch.tensor([r['context_len'] for r in data['rows']],device='cuda',dtype=torch.int32)
-            for width in WIDTHS:
+            for width in widths:
                 offsets=KeyeIndexer._topk_with_lengths(None,scores[:,:width],lengths.clamp(max=width),2048)
                 final=ids[:,:width].gather(1,offsets.long()).cpu().numpy()
                 for i,r in enumerate(data['rows']):
