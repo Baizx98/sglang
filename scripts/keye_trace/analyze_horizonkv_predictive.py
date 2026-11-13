@@ -30,7 +30,7 @@ def analyze(root, partial=False):
     assert len(identities) == len(set(identities))
     if not partial:
         assert set(identities) == {(rid,layer) for rid in requests for layer in range(1,48)}
-    base_rows, expansion_rows, raw_sources = [], [], []
+    base_rows, expansion_rows, raw_sources, extra_rows = [], [], [], []
     for chunk in manifest:
         path = root/'events'/chunk['file']
         data = torch.load(path, map_location='cpu', weights_only=False)
@@ -68,6 +68,9 @@ def analyze(root, partial=False):
                 task=meta['task'],length_bucket=meta['length_bucket_upper'],prompt_tokens=meta['prompt_tokens'],
                 layer=data['target_layer_id'],source_layer=data['source_layer_id'],step=r['step'],
                 context_len=length,matched_three_methods=r['step']>0)
+            if 'hidden_cosine' in r:
+                extra_rows.append(dict(common,**{k:r[k] for k in ['hidden_cosine','hidden_relative_l2',
+                    'score_mae','score_nmae','score_cosine','score_spearman'] if k in r}))
             methods = dict(native=native, previous_layer=r['previous_layer_indices'].numpy(),
                 horizonkv=candidates[:K])
             if previous is not None:
@@ -105,6 +108,13 @@ def analyze(root, partial=False):
         raw_sources.append(dict(file=str(path),sha256=sha(path),bytes=path.stat().st_size))
     out=root/'analysis';out.mkdir(exist_ok=True)
     base=pd.DataFrame(base_rows);expansion=pd.DataFrame(expansion_rows)
+    if extra_rows:
+        pd.DataFrame(extra_rows).to_csv(out/'representation-observations.csv',index=False)
+        attention=[]
+        for path in sorted((root/'events').glob('attention-stage-layer*.jsonl')):
+            attention.extend(json.loads(s) for s in path.read_text().splitlines())
+        assert len(attention)==len(extra_rows)*3,(len(attention),len(extra_rows))
+        pd.DataFrame(attention).to_csv(out/'attention-observations.csv',index=False)
     base.to_csv(out/'method-observations.csv',index=False)
     expansion.to_csv(out/'candidate-observations.csv',index=False)
     request_base=base[base.matched_three_methods].groupby(['request_id','group','length_bucket','method'],as_index=False).agg(

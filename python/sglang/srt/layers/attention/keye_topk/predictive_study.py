@@ -37,6 +37,16 @@ def record(indexer, previous_x, current_x, previous_indices, exact_indices,
     true_q, _, true_w = indexer._get_q_k_w_bf16(current_x, positions, enable_dual_stream=False)
     rescored = keye_indexer_score_candidates(true_q, keys, pages, candidates, true_w,
         lengths, indexer.softmax_scale)
+    extra = os.getenv('KEYE_PREDICTIVE_EXTRA_METRICS','0') == '1'
+    if extra:
+        # Same-state candidate attention is evaluated by the model after Q/K/V
+        # production. Carry only the selected indices, not another copy of KV.
+        indexer._study_attention_sets = {}
+        for width in [3072,4096]:
+            local=indexer._topk_with_lengths(rescored[:,:width],lengths.clamp(max=width),indexer.topk)
+            indexer._study_attention_sets[f'horizonkv_M{width}']=candidates[:,:width].gather(1,local.long())
+        indexer._study_attention_sets['previous_layer']=previous_indices
+        indexer._study_attention_rows=[(selected_rows[i],rids[i],steps[i]) for i in range(len(selected_rows))]
     reference_scores = exact_scores.gather(1, candidates.clamp_min(0).long())
     score_delta = torch.where(candidates >= 0, (rescored-reference_scores).abs(), 0).max(dim=1).values
     # The first-step full-score self-check detects hidden-state/key/position errors.
@@ -57,12 +67,24 @@ def record(indexer, previous_x, current_x, previous_indices, exact_indices,
             raise RuntimeError(f'Noncontiguous study trace {key}: {step} != {len(rows)}')
         def cpu(t):
             return t[row_index].detach().cpu().clone()
-        rows.append(dict(step=step, context_len=int(lengths[row_index]), exact_indices=cpu(exact_indices),
+        row=dict(step=step, context_len=int(lengths[row_index]), exact_indices=cpu(exact_indices),
             previous_layer_indices=cpu(previous_indices), candidates=cpu(candidates),
             candidate_scores=cpu(rescored), score_max_abs=float(score_delta[row_index]),
             native_cutoff=float(exact_scores[row_index].gather(0, exact_indices[row_index].long()).min()),
             selfcheck_max_abs=float(selfcheck_delta[row_index]) if step == 0 else None,
-            selfcheck_equal=bool(selfcheck_equal[row_index]) if step == 0 else None))
+            selfcheck_equal=bool(selfcheck_equal[row_index]) if step == 0 else None)
+        if extra:
+            a=previous_x[row_index].float().flatten();b=current_x[row_index].float().flatten()
+            n=int(history_lengths[row_index]);pred=predicted_scores[row_index,:n].float();truth=exact_scores[row_index,:n].float()
+            row.update(hidden_cosine=float(torch.nn.functional.cosine_similarity(a,b,dim=0)),
+                hidden_relative_l2=float((a-b).norm()/b.norm().clamp_min(1e-30)),
+                score_mae=float((pred-truth).abs().mean()),
+                score_nmae=float((pred-truth).abs().mean()/truth.abs().mean().clamp_min(1e-30)),
+                score_cosine=float(torch.nn.functional.cosine_similarity(pred,truth,dim=0)))
+            if step in [0,15,31,63]:
+                from scipy.stats import spearmanr
+                row['score_spearman']=float(spearmanr(pred.cpu().numpy(),truth.cpu().numpy()).statistic)
+        rows.append(row)
         if len(rows) != step_limit:
             continue
         file = f'{rid}__layer{layer:02d}.pt'

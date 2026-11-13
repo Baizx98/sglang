@@ -156,7 +156,7 @@ def post(url, payload, timeout=7200):
             return raw.decode()
 
 
-def run(root, gpu_ids=GPU_IDS, tp_size=2, pp_size=1, requests_file=None, steps=32, seed=20261112):
+def run(root, gpu_ids=GPU_IDS, tp_size=2, pp_size=1, requests_file=None, steps=32, seed=20261112, extra_metrics=False):
     devices=inventory(gpu_ids, require_idle=True)
     if requests_file is None:
         rows = freeze(root)
@@ -181,6 +181,9 @@ def run(root, gpu_ids=GPU_IDS, tp_size=2, pp_size=1, requests_file=None, steps=3
         KEYE_LOOKAHEAD_DECODE_STEPS=str(steps), KEYE_LOOKAHEAD_MAX_K='8192',
         KEYE_SM80_PREFILL_SCORE_CHUNK='64', OMP_NUM_THREADS='4', OPENBLAS_NUM_THREADS='4',
         PYTHONUNBUFFERED='1')
+    if extra_metrics:
+        assert tp_size == 1, 'Attention diagnostic currently supports TP1 only'
+        env['KEYE_PREDICTIVE_EXTRA_METRICS']='1'
     cmd = [sys.executable, '-m', 'sglang.launch_server', '--model-path', '/Tan/model/Keye-VL-2.0-30B-A3B',
         '--trust-remote-code', '--host', '127.0.0.1', '--port', '31242', '--tp-size', str(tp_size), '--pp-size', str(pp_size),
         '--attention-backend', 'keye_sa', '--context-length', '131328', '--max-total-tokens', '140000',
@@ -272,6 +275,7 @@ if __name__ == '__main__':
     parser.add_argument('--requests-file',type=Path)
     parser.add_argument('--steps',type=int,default=32)
     parser.add_argument('--seed',type=int,default=20261112)
+    parser.add_argument('--extra-metrics',action='store_true')
     args = parser.parse_args()
     root = args.run_dir.resolve()
     root.mkdir(parents=True, exist_ok=True)
@@ -284,7 +288,7 @@ if __name__ == '__main__':
             raise KeyboardInterrupt('Owned study interrupted')
         signal.signal(signal.SIGTERM, stop)
         try:
-            run(root,args.gpu_ids,args.tp_size,args.pp_size,args.requests_file,args.steps,args.seed)
+            run(root,args.gpu_ids,args.tp_size,args.pp_size,args.requests_file,args.steps,args.seed,args.extra_metrics)
         except BaseException as exc:
             save(root/'failure.json', dict(error=str(exc), traceback=traceback.format_exc()))
             update(root, status='interrupted' if isinstance(exc,KeyboardInterrupt) else 'failed', phase='controller_stopped', detail=str(exc))

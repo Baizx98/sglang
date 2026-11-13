@@ -393,6 +393,27 @@ class KeyeTopKMaskAttention(nn.Module):
                 q, k, v, forward_batch, topk_indices=topk_indices
             )
 
+        study_sets=getattr(self.sa_indexer,'_study_attention_sets',None)
+        if study_sets:
+            study_rows=self.sa_indexer._study_attention_rows
+            self.sa_indexer._study_attention_sets=None
+            records=[]
+            for method,indices in study_sets.items():
+                other=self.attn(q,k,v,forward_batch,topk_indices=indices)
+                for row_index,rid,step in study_rows:
+                    baseline=attn_output[row_index].float().flatten()
+                    approximate=other[row_index].float().flatten()
+                    delta=approximate-baseline
+                    records.append(dict(request_id=rid,layer=self.layer_id,step=step,method=method,
+                        attention_cosine=float(torch.nn.functional.cosine_similarity(approximate,baseline,dim=0)),
+                        attention_relative_l2=float(delta.norm()/baseline.norm().clamp_min(1e-30)),
+                        attention_max_abs=float(delta.abs().max()),exact_norm=float(baseline.norm()),
+                        exact_main=True,tp_size=1))
+            directory=Path(os.environ['KEYE_LOOKAHEAD_TRACE_DIR'])
+            directory.mkdir(parents=True,exist_ok=True)
+            with (directory/f'attention-stage-layer{self.layer_id:02d}.jsonl').open('a') as handle:
+                for record in records:handle.write(json.dumps(record)+'\n')
+
         # ---- 5. Output Projection ----
         with span(forward_batch, self.layer_id, "output_projection"):
             output, _ = self.o_proj(attn_output)
