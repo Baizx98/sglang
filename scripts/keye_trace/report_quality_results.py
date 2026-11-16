@@ -37,6 +37,11 @@ def main(tables,gpu,report,archive_link):
     # means have a different meaning and are exported separately.
     att=pd.read_parquet(tables/'attention-observations.parquet');att=att[att.split=='test']
     at=att.groupby(['dataset','method']).agg(mean_cos=('attention_cosine','mean'),min_cos=('attention_cosine','min'),l2_mean=('attention_relative_l2','mean'),l2_p90=('attention_relative_l2',lambda x:x.quantile(.9)),l2_p99=('attention_relative_l2',lambda x:x.quantile(.99)),l2_max=('attention_relative_l2','max')).reset_index()
+    diagnostic=[]
+    for scope,part in [('all47',att),('historical42',att[att.layer.isin([3]+list(range(5,46)))])]:
+        for dataset,group in part[part.method=='horizonkv_M3072'].groupby('dataset'):
+            diagnostic.append(dict(dataset=dataset,scope=scope,mean_cosine=group.attention_cosine.mean(),min_cosine=group.attention_cosine.min(),l2_p99=group.attention_relative_l2.quantile(.99),l2_max=group.attention_relative_l2.max()))
+    diagnostic=pd.DataFrame(diagnostic)
     tail=pd.read_parquet(tables/'candidate-observations.parquet',columns=['request_id','dataset','split','layer','step','candidate_k','recall_at_M'])
     tail=tail[(tail.split=='test')&tail.candidate_k.isin([3072,8192])]
     tt=tail.groupby(['dataset','candidate_k']).agg(mean=('recall_at_M','mean'),median=('recall_at_M','median'),p01=('recall_at_M',lambda x:x.quantile(.01)),p10=('recall_at_M',lambda x:x.quantile(.1)),minimum=('recall_at_M','min'),fully_covered=('recall_at_M',lambda x:(x==1).mean())).reset_index()
@@ -80,7 +85,7 @@ Keye-VL-2.0-30B-A3B，BF16，健康A6000 `GPU-19717dbe-cbf8-b0b8-744d-1cb9a93658
 
 - 15510个唯一请求层文件，992640个层步；方法记录{facts['method_rows']}行，候选{facts['candidate_rows']}行，Attention{facts['attention_rows']}行，表示/评分{facts['representation_rows']}行。
 - 330条PP23→24边界逐步核对；所有候选评分与同状态原生评分差为0，15510个首步自检通过。
-- CPU稳定精排严格高分遗漏0；GPU原生Top-K helper核查{native['observations']}组，严格高分遗漏{native['strict_losses']}，边界同分差异{native['boundary_tie_cases']}组、最大{native['max_boundary_tied_tokens_lost']}token。CPU与GPU同分选择可能不同，不据此虚构kernel失配。
+- CPU稳定精排严格高分遗漏0；GPU原生Top-K helper核查{native['observations']}组，严格高分遗漏{native['strict_losses']}，边界同分差异{native['boundary_tie_cases']}组、最大{native['max_boundary_tied_tokens_lost']}token。与CPU逐行连接后，7941120组覆盖率和精排Recall全部相同（最大差0）；同分差异指与原生真值集合的边界差异，不是CPU/GPU分歧。
 - 新旧token输入、manifest、chunk、处理脚本和输出的来源/哈希在[数据包]({archive_link})，不把中断记录混入完成集。采集实现459f448bc/a0398779b，模型/预测代码两批相同；处理3189d4892及后续报告脚本提交见provenance。
 
 详细子集的校准/测试组成：
@@ -128,6 +133,12 @@ Required-M@90/95/99/99.9及各自右删失比例在required-budget-by-task.csv�
 下表汇总测试层步，cosine和相对L2均无量纲；L2=0.01为1%相对误差。P99是误差上尾，min cosine/max L2保留所有层：
 
 {table(at)}
+
+预先指定的历史42层诊断（仅M3072、测试层步；不作为自动部署mask）：
+
+{table(diagnostic)}
+
+全层与42层必须并列；下面的极大误差集中在零基层1，不能因均值好或事后删层而隐藏。其他层/任务的尾部也保存在逐层表中，仍需独立质量验证。
 
 M3072的最坏测试样本入口：
 
