@@ -57,7 +57,7 @@ def monitor(root):
     known_xids = set(subprocess.check_output(['dmesg'], text=True).splitlines())
     while True:
         state = json.loads((root / 'state.json').read_text())
-        terminal = state.get('status') in {'completed', 'failed', 'interrupted'}
+        terminal = state.get('status') in {'completed', 'failed', 'interrupted', 'paused'}
         failure = None
         server_log = root/'server.log'
         if not terminal and server_log.exists():
@@ -102,6 +102,7 @@ def monitor(root):
             record['server_alive'] = bool(pid and Path(f'/proc/{pid}').exists())
             record['ntfy_sent'] = notify(
                 f"HorizonKV 4.2：{state.get('status')}；{state.get('phase')}；"
+                f"总进度 {config.get('prior_completed_requests',0)+state.get('completed_requests',0)}/{config.get('overall_total_requests',state.get('total_requests','?'))}；"
                 f"请求 {state.get('completed_requests', 0)}/{state.get('total_requests', '?')}；"
                 f"已落盘层Trace {chunks}；{state.get('detail', '')}")
             save(root / 'monitor-status.json', record)
