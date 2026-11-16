@@ -12,7 +12,7 @@ QUANTILES=[.01,.05,.10,.25,.50,.75,.90,.95,.99]
 def describe(frame,keys,metrics):
     result=None
     for metric in metrics:
-        groups=frame.groupby(keys,dropna=False)[metric]
+        groups=frame.groupby(keys,dropna=False,observed=True)[metric]
         block=groups.agg(count='count',size='size',mean='mean',median='median',variance='var',std='std',minimum='min',maximum='max')
         block['missing_count']=block.pop('size')-block['count']
         q=groups.quantile(QUANTILES,interpolation='linear').unstack(-1)

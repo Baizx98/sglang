@@ -3,6 +3,7 @@ import argparse
 import hashlib
 import json
 import gzip
+import io
 from pathlib import Path
 
 import numpy as np
@@ -18,9 +19,11 @@ def sha(path):
 
 
 def load_chunk(path):
-    opener=gzip.open if path.suffix=='.gz' else open
-    with opener(path,'rb') as handle:
-        return torch.load(handle,map_location='cpu',weights_only=False)
+    # torch's ZIP reader seeks among tensor records. Seeking directly through
+    # gzip repeatedly decompresses the prefix; decode once before random access.
+    if path.suffix=='.gz':
+        return torch.load(io.BytesIO(gzip.decompress(path.read_bytes())),map_location='cpu',weights_only=False)
+    return torch.load(path,map_location='cpu',weights_only=False)
 
 
 def analyze(root, partial=False):
