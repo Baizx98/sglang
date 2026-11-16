@@ -29,6 +29,9 @@ def main(tables,gpu,report,archive_link):
     summary=means.groupby('dataset').mean()[['previous_layer','previous_step','horizonkv']]
     summary['n']=means.groupby('dataset').size();summary=summary[['n','previous_layer','previous_step','horizonkv']].reset_index()
     summary.columns=['数据集','测试请求','前层直接复用','前步直接复用','前层h预测']
+    per=method.pivot_table(index=['request_id','dataset','task_name','split'],columns='method',values='recall').reset_index()
+    exceptions=per[per.horizonkv<=per.previous_step].merge(meta[['request_id','prompt_tokens']],on='request_id')
+    exceptions.to_csv(tables/'h-vs-step-counterexamples.csv',index=False)
     cs=candidate[candidate.split=='test'];coverage=cs.pivot_table(index=['dataset','request_id'],columns='candidate_k',values='recall_at_M').groupby('dataset').mean()
     coverage=coverage[[2048,3000,3072,4096,8192]].reset_index();coverage.columns=['数据集','M2048','M3000','M3072','M4096','M8192']
     ruler=cs[cs.dataset=='RULER'].pivot_table(index=['length_bucket','request_id'],columns='candidate_k',values='recall_at_M').groupby('length_bucket').mean()
@@ -98,7 +101,7 @@ LongBench涵盖12子任务、RULER13任务×6长度、BFCL4类别，LBv2按领�
 
 以下主结果使用独立测试子集，校准集另表保存。方法比较使用共同step1–63，候选/Attention使用step0–63。数据集表先在每条请求内平均47层和相关步，再等权平均请求；RULER每个任务×长度一条测试请求，长度表每点13条。表中n是请求数，不是独立层步数。
 
-每项指标导出count/missing、均值、中位数、样本方差(ddof1)、标准差、min/max、P1/P5/P10/P25/P50/P75/P90/P95/P99；分位数为linear定义。不足两点方差NA，未测Spearman不填0。逐层/逐请求层、任务×长度×split、请求均值分布、池化层步分布全部保存；池化层步相关，不能当独立样本置信区间。
+每项指标导出count/missing、均值、中位数、样本方差(ddof1)、标准差、min/max、P1/P5/P10/P25/P50/P75/P90/P95/P99；分位数为linear定义。不足两点方差NA，未测Spearman不填0。同一文档的不同问题也可能相关，本轮没有据此计算独立样本置信区间。逐层/逐请求层、任务×长度×split、请求均值分布、池化层步分布全部保存；池化层步相关，不能当独立样本置信区间。
 
 全47层是主口径，历史42层（3、5–45，零基）仅作预先指定消融，不因本轮结果删层。候选Precision的分母是实际有效候选数；Required-M只在8个实测M上取最小值，超过8192右删失，不能当8192截顶平均。Attention相对L2以原生精确Top-k DSA输出为分母，不是dense Attention。
 
@@ -109,6 +112,10 @@ LongBench涵盖12子任务、RULER13任务×6长度、BFCL4类别，LBv2按领�
 {table(summary,{c:pct for c in summary.columns[2:]})}
 
 全330条的请求平均中，h预测高于直接前层复用{facts['h_beats_previous_layer_requests']}条，高于前步复用{facts['h_beats_previous_step_requests']}条；这是描述性胜负计数，包含校准集，不能与上表测试均值混为同一口径。
+
+未优于前步复用的请求保留如下（包含校准/测试标记，Recall单位0–1）：
+
+{table(exceptions)}
 
 ### 4.2 扩候选后的覆盖率
 
@@ -160,7 +167,7 @@ M3072的最坏测试样本入口：
 
 本次没有新增模型输入采集，使用已有完整trace进行后处理及原生GPU helper核查。所有原始日志/trace留在实验仓库；[数据包索引]({archive_link})提供字段、单位、源路径、配置、代码/脚本hash、处理方法与验证状态。数据包包含逐观测Parquet、逐请求/逐层和分布统计CSV/Parquet；正文draft.md未改写。
 
-本报告不报告混卡性能、自由生成任务得分、logits KL或异步重叠收益。设备温度/显存采样只作健康诊断，不作峰值或成本效率结论。先前读取/批量处理的受控优化临时产物未纳入归档，最终完整审计是本次结果依据。
+本报告不报告混卡性能、自由生成任务得分、logits KL或异步重叠收益。两批均固定同一模型路径与架构，未逐批重新计算完整checkpoint内容哈希，不宣称跨重启逐位复现。设备温度/显存采样只作健康诊断，不作峰值或成本效率结论。先前读取/批量处理的受控优化临时产物未纳入归档，最终完整审计是本次结果依据。
 ''')
     savepath=tables/'report-derived-facts.json';savepath.write_text(json.dumps(association,indent=2)+'\n')
 
