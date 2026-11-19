@@ -1,0 +1,33 @@
+{
+  "acceptance": {
+    "source": "real merged-batch Keye layer replay",
+    "length_buckets": [32768, 65536, 131072],
+    "batch_sizes": [4, 16],
+    "source_slot_layouts": ["contiguous", "shuffle_128_token_blocks", "shuffle_1_token_blocks"],
+    "layer": 36,
+    "decode_step": 2,
+    "request_offset": 8,
+    "seed": 20261014,
+    "trials": 11,
+    "graph_iterations": 12,
+    "warmups": 8
+  },
+  "complete_indexer": "attention_input to logical Top-2048 inclusive of projected current-key write",
+  "selector": {
+    "B4": "vllm_persistent",
+    "B16": "vllm_ampere_cute"
+  },
+  "primary_independent_index_storage": "slab_lossless_fused_norm",
+  "primary_fixed_index_storage": {
+    "32K_or_per_token_random_slots": "fixed_layout_fused_norm",
+    "other": "fixed_layout_lossless_fused_norm"
+  },
+  "primary_exploratory_approximate": "int4_scan_bf16_refine_4096",
+  "approximate_sensitivity": "int4_scan_bf16_refine_8192",
+  "notes": [
+    "Independent Index Key placement is chosen at admission and holds one resident exact representation; Main KV placement is unchanged.",
+    "Overflow or non-optimal selection counts as a failed condition. No retrospective fallback or shape-specific variant is part of a preregistered method.",
+    "The approximate method includes the fused norm projection epilogue validated in the layer-24 development replay.",
+    "The per-condition fastest exact new result is a separate post hoc upper bound. INT4 is approximate independent of observed exact overlap in this sample."
+  ]
+}

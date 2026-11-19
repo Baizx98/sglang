@@ -1,0 +1,17 @@
+{
+  "acceptance": {
+    "length_buckets": [32768, 65536, 131072],
+    "batch_sizes": [4, 16],
+    "source_slot_layouts": ["contiguous", "shuffle_128_token_blocks", "shuffle_1_token_blocks"],
+    "layer": 36,
+    "request_offset": 8,
+    "decode_steps": [0, 1, 2, 3, 4]
+  },
+  "primary": "period4",
+  "sensitivity": "period3",
+  "refresh": "independent lossless Index Key slab with native BF16 projection. The fused-norm pilot is retained separately.",
+  "reuse": "native K-only projection and appended key, preceding refresh's logical Top-2048 IDs",
+  "comparison": "fastest correct native or round-one lossless over all five consecutive inputs",
+  "quality": "frozen warm trace overlap is diagnostic; serving-generated task quality is measured separately",
+  "scope": "both refreshes always included; terminal fragment reported separately"
+}
