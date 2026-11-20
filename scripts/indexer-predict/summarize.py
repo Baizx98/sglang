@@ -101,6 +101,7 @@ def run(args):
             req_writer.writerows(requests)
             if requests:
                 methods[row["panel"], row["split"], row["M"], row["method"]].append(row)
+    paired_ablations = []
     with (args.output / "stages.csv").open("x") as stream:
         stage_fields = ("panel", "length_bucket", "batch", "layer", "step", "split", "M",
                         "stage", "median_us", "mad_us", "source_file", "source_line")
@@ -109,15 +110,30 @@ def run(args):
         for source in args.inputs:
             for line, text in enumerate(source.read_text().splitlines(), 1):
                 record = json.loads(text)
+                case = dict(
+                    panel=source.parent.name, length_bucket=record["bucket"], batch=record["batch"],
+                    layer=record["layer"], step=record["step"], split=record["split"], M=record["width"],
+                    source_file=str(source), source_line=line,
+                )
                 for stage, timing in record["timings"].items():
                     if stage in record["methods"]:
                         continue
                     writer.writerow(dict(
-                        panel=source.parent.name, length_bucket=record["bucket"], batch=record["batch"], layer=record["layer"],
-                        step=record["step"], split=record["split"], M=record["width"],
-                        stage=stage, median_us=timing["median_us"], mad_us=timing["mad_us"],
-                        source_file=str(source), source_line=line,
+                        case, stage=stage, median_us=timing["median_us"], mad_us=timing["mad_us"],
                     ))
+                for effect, pair in record.get("full_path_ablations", {}).items():
+                    control = record["timings"][pair["control"]]["median_us"]
+                    fused = record["timings"][pair["fused"]]["median_us"]
+                    paired_ablations.append(dict(
+                        case, effect=effect, control=pair["control"], fused=pair["fused"],
+                        control_median_us=control, fused_median_us=fused,
+                        saved_us=control - fused, speedup=control / fused,
+                    ))
+    if paired_ablations:
+        with (args.output / "fusion-ablations.csv").open("x") as stream:
+            writer = csv.DictWriter(stream, list(paired_ablations[0]), lineterminator="\n")
+            writer.writeheader()
+            writer.writerows(paired_ablations)
     with (args.output / "segments.csv").open("x") as stream:
         segment_fields = (
             "panel", "length_bucket", "batch", "layer", "step", "split", "M",
