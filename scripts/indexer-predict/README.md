@@ -46,3 +46,13 @@ INDEXER_FULL_TARGET="$PWD/scripts/indexer-predict/benchmark.py" \
 - `logical_key_bytes` 是每次扫描触及的逻辑 Key 表示、其量化/例外元数据和已触及例外行的最小唯一字节数。它与缓存分配、FP32/FP16 分数输出及选择器工作区分列。GPU 实际 DRAM 事务由硬件计数器另行测量。
 - 初始化使用同步墙钟，Append 使用真实目标层 Key 单测。稳态完整预测用 CUDA Graph 与 CUDA Event 测量。按格先取重复中位数，再比较逐格最快正确基线。
 - 段级审计以已知的精确第 M−1 名做阈值上限分析，或给保留段内的键精确评分后观察候选覆盖。其结果是离线可行性证据。
+
+## 后层质量和新路线
+
+`--fit-int4 2` 比较在编码时拟合两轮最小平方尺度的 INT4 单组和双组，评分同普通 INT4。开启 `--progressive 1.25 1.5 2` 后，从 INT6 的高 4 位生成初选，再只读取入围位置的额外两位重评分。两次选择均计入。需要在 `--quant-formats` 中包含 `6x1`。加 `--exact-tuning` 可以对比掩码解码和 L2 缓存修饰符。无损停用任何造成预测集合差异的路径。
+
+`temporal_oracle.py --rolling` 使用真实相邻步，给出上一轮阈值及段筛查的离线诊断，并检验只更新被评分段时的滚动误差。性能回放的 `--temporal 0.25 0.5 --temporal-segments 32` 使用已准备的真实上一轮段分数作为状态，在保留段上用**当前** Q 重扫。部分刷新与全扫刷新各自计时，完整周期的性能需按实际刷新次数核算。时间路由和全历史量化路由分别报告。
+
+`policy.py freeze` 只读取校准结果，按长度、层和 M 固定方法。用 `policy.py test` 检查预先指定的 held-out batch/step 矩阵和请求不重叠，再报告加速及额外漏项。试验门槛默认是额外漏项均值 ≤1 pp 与 P95 ≤3 pp。两个门槛都属于同状态候选覆盖，服务任务结果另计。
+
+`capture.py --quality-policy` 可用 PP2 服务运行真实长上下文 RULER 生成。请求需要实际参考答案，非空；每条以原生、精确 BF16 预测及低位预测三种模式在同一脚本上生成。策略 JSON 有 `candidate_width`、`append_reserve`、`default`、可选逐层 `layers` 和 `audit_layers`。逐层可配置 `method=native/bf16/quantized`，低位模式可给 `bits`、`groups`、`fit_steps`、`oversample`、`tile`、`half_scores`。服务实际执行候选内目标层选择并生成文本。它保留原生 BF16 Key 作实际精排，额外维持低位预测缓冲，服务时延不用于性能结论。
