@@ -72,3 +72,9 @@ bash scripts/indexer-predict/run_frozen.sh test data/indexer-predict/frozen-run
 `capture.py --quality-policy` 可用 PP2 服务运行真实长上下文 RULER 生成。请求需要实际参考答案，非空；每条以原生、精确 BF16 预测及低位预测三种模式在同一脚本上生成。策略 JSON 有 `candidate_width`、`append_reserve`、`default`、可选逐层 `layers` 和 `audit_layers`。逐层可配置 `method=native/bf16/quantized`，低位模式可给 `bits`、`groups`、`fit_steps`、`oversample`、`tile`、`half_scores`。服务实际执行候选内目标层选择并生成文本。它保留原生 BF16 Key 作实际精排，额外维持低位预测缓冲，服务时延不用于性能结论。
 
 `quality_cases.py` 用冻结路由为每个长度桶导出 RULER 生成策略及持出请求。默认每桶按 token 哈希选择一条独立请求，M3072，仅已校准的目标层启用预测。紧凑路径使用 FlashInfer 选择器，替代计时选择器在边界同分时可能产生不同候选。该配置适合实际输出的诊断，较大任务集需要单独报告。
+
+## FP32 逐 Key 筛选原型
+
+`--certified-bits 6 8 --certified-capacity 4 8 12` 在基准中另测固定容量的精确候选路径，需要包含 `--quant-formats 6x1 8x1`。粗扫用 INT6/INT8 及每 Key 两个向上舍入的 FP16 范数，同一 Triton kernel 输出近似分数和带符号 gate 的 FP32 上界。种子和压实后的剩余候选使用原有 BF16 候选 scorer。遇到缓冲溢出或原始截止分数同分时，设备上按行回退到原始密集评分及 Torch 有序选择。实际 BF16 读取预算包含种子、复查及回退，驻留包含原始 Key、低位 Key 与范数副缓冲。分数缓冲字节数为持久分数和上界缓冲的大小，另有临时索引、scatter 和选择器开销。CUDA Graph 计时包含路由和回退准备。
+
+`certified_device_audit.py --check-graph` 运行真实输入对拍、范数追加及 CUDA Graph 功能检查，无性能计时。当前原型的运行入口与冻结低位路由独立。

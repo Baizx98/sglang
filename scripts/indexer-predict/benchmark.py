@@ -26,6 +26,7 @@ for directory in ("scripts/indexer-optimization", "scripts/indexer-round2",
 
 from ampere_topk.topk import decode_topk, workspace_bytes as cute_workspace_bytes
 from bench import TRACE, Trace, load_indexer, measure_graph, page_layout
+from certified_device import CertifiedRows
 from flashinfer import top_k_ragged_transform
 from horizonkv_layer_replay import initialize
 from lossless import StaticExponentKeys
@@ -384,6 +385,20 @@ def benchmark(replay, indexer, args, identity, previous_replay=None, codebook=No
     for name, state in formats.items():
         staged[f"append_{name}"] = lambda state=state: state.append(replay.current_keys, append_slots)
 
+    certified_states = {}
+    for bits in args.certified_bits or ():
+        state = formats.get(f"int{bits}_g1")
+        if state is None:
+            raise ValueError(f"--certified-bits {bits} requires --quant-formats {bits}x1")
+        certified, extra_init_us = build_stage(
+            lambda: CertifiedRows(state, slots, pages, lengths, scale), measure,
+        )
+        key_init_us = score_methods[f"int{bits}_g1_b{args.quant_tiles[0]}"][4]
+        certified_states[bits] = certified, key_init_us + extra_init_us if measure else None
+        staged[f"append_certified_int{bits}"] = (
+            lambda certified=certified: certified.append(replay.current_keys, append_slots)
+        )
+
     for m in args.candidates:
         if m > min(replay.lengths) + 1:
             raise ValueError("candidate width exceeds the shortest request")
@@ -511,6 +526,30 @@ def benchmark(replay, indexer, args, identity, previous_replay=None, codebook=No
                         true_top2048_intersection=intersections(selected, target_ids).tolist(),
                         kept_tokens_by_request=kept, shortlist_width=impl.shortlist_tokens,
                     )
+        for bits, (certified, initialize_us) in certified_states.items():
+            for factor in args.certified_capacity:
+                name = f"certified_int{bits}_cap{factor:g}:torch_sorted"
+                call = certified.prepare(q_only, m, factor, reference_width=reference_width)
+                selected = call()
+                if not torch.equal(selected.sort(1).values, gold.sort(1).values):
+                    rows[name] = {"failed": "certified route differs from the original BF16 Top-M set"}
+                    continue
+                counts, overflow, fallback = call.compaction
+                exact_reads = int((counts.masked_fill(overflow, 0) + call.seed_size + fallback * lengths).sum())
+                norm = certified.k_norms.nbytes
+                score_buffers = certified.approx.nbytes + certified.upper.nbytes + certified.final_scores.nbytes
+                calls[name] = call
+                rows[name] = dict(
+                    exact=True, baseline=False, score_equal=None, score_dtype="torch.float32",
+                    index_key_bytes=slots.nbytes + certified.state.storage_bytes + norm,
+                    logical_key_bytes=tokens * (8 * bits + 2 + 4) + 128 * exact_reads,
+                    logical_score_write_bytes=score_buffers, workspace_bytes_before_selector=None,
+                    known_cute_workspace_bytes=None, initialize_wall_us=initialize_us,
+                    predicted_set_intersection=[m] * len(replay.lengths),
+                    true_top2048_intersection=gold_recall,
+                    certified_seed_size=call.seed_size, certified_remainder_counts=counts.tolist(),
+                    certified_overflow=overflow.tolist(), certified_dense_fallback=fallback.tolist(),
+                )
         # Ensure an identical strongest denominator is available when comparing
         # methods based on a request-local contiguous slab and direct addressing.
         exact_names = [name for name, rec in rows.items() if rec.get("baseline")]
@@ -675,6 +714,8 @@ if __name__ == "__main__":
     parser.add_argument("--temporal", type=float, nargs="+")
     parser.add_argument("--temporal-segments", type=int, choices=(32,64,128), nargs="+", default=[32,64])
     parser.add_argument("--progressive", type=float, nargs="+")
+    parser.add_argument("--certified-bits", type=int, choices=(6, 8), nargs="+")
+    parser.add_argument("--certified-capacity", type=float, nargs="+", default=[4, 8])
     parser.add_argument("--segment-audit", type=int, nargs="+")
     parser.add_argument("--trials", type=int, default=11)
     parser.add_argument("--iterations", type=int, default=12)
