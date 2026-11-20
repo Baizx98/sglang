@@ -188,11 +188,20 @@ def intersections(query, reference):
 
 
 def timed_build(factory):
+    # Exclude first-use compilation and collect a warm allocation/build time.
+    warmed = factory()
     torch.cuda.synchronize()
-    begin = time.perf_counter()
-    storage = factory()
-    torch.cuda.synchronize()
-    return storage, (time.perf_counter() - begin) * 1e6
+    del warmed
+    samples = []
+    for i in range(3):
+        torch.cuda.synchronize()
+        begin = time.perf_counter()
+        storage = factory()
+        torch.cuda.synchronize()
+        samples.append((time.perf_counter() - begin) * 1e6)
+        if i != 2:
+            del storage
+    return storage, statistics.median(samples)
 
 
 def benchmark(replay, indexer, args, identity, previous_replay=None):
@@ -470,6 +479,7 @@ def metadata(args):
         git=subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
         source_sha256={p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in sources},
         scope="real previous-layer hidden state to M logical candidates; historical keys only; no prediction K or append",
+        initialization="synchronized wall time, one untimed build and three timed repeats",
     )
 
 
