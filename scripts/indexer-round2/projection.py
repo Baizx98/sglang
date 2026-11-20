@@ -11,7 +11,7 @@ def _normalize_heads(
     q_stride: tl.constexpr, k_stride: tl.constexpr,
     q_eps: tl.constexpr, k_eps: tl.constexpr,
     position_stride: tl.constexpr, section_t: tl.constexpr, section_h: tl.constexpr,
-    epilogue: tl.constexpr,
+    epilogue: tl.constexpr, exact_rope: tl.constexpr = False,
 ):
     row = tl.program_id(0)
     head = tl.program_id(1)
@@ -36,9 +36,24 @@ def _normalize_heads(
         cos = tl.load(trig + position * 64 + column)
         sin = tl.load(trig + position * 64 + column + 32)
         swap = tl.gather(values, dim ^ 32, 0)
-        primary = values.to(cos.dtype) * cos
-        cross = swap.to(sin.dtype) * sin
-        rotated = tl.where(dim < 32, primary - cross, primary + cross)
+        if exact_rope:
+            # Native Triton MRoPE fuses the cosine product in the lower
+            # half and the sine product in the upper half.
+            lower = dim < 32
+            a = tl.where(lower, values, swap)
+            b = tl.where(lower, cos, sin)
+            other_a = tl.where(lower, swap, values).to(tl.float32)
+            other_b = tl.where(lower, sin, cos).to(tl.float32)
+            rounded = (other_a * other_b).to(tl.bfloat16)
+            addend = tl.where(lower, -rounded, rounded)
+            rotated = tl.inline_asm_elementwise(
+                "fma.rn.bf16 $0, $1, $2, $3;", "=h,h,h,h",
+                [a, b, addend], dtype=tl.bfloat16, is_pure=True, pack=1,
+            )
+        else:
+            primary = values.to(cos.dtype) * cos
+            cross = swap.to(sin.dtype) * sin
+            rotated = tl.where(dim < 32, primary - cross, primary + cross)
         butterfly = rotated.to(tl.bfloat16).to(tl.float32)
         for stage in tl.static_range(6):
             bit = 1 << stage

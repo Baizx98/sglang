@@ -227,14 +227,31 @@ def benchmark(replay, indexer, args, identity, previous_replay=None, codebook=No
         return q, gate
 
     default_q, default_gate = legacy_projection()
+
+    def exact_projection(q, gate):
+        return (torch.equal(default_q.view(torch.int16), q.view(torch.int16))
+                and torch.equal(default_gate.view(torch.int16), gate.view(torch.int16)))
+
     native_q, native_gate = q_only_native()
-    if not torch.equal(default_q, native_q) or not torch.equal(default_gate, native_gate):
+    if not exact_projection(native_q, native_gate):
         raise RuntimeError("the Q-only projection changed Q or gate")
     fused_q, fused_gate = q_only_fused()
-    fused_projection_exact = torch.equal(default_q, fused_q) and torch.equal(default_gate, fused_gate)
-    use_fused_projection = args.fused_query and fused_projection_exact
-    q_only = q_only_fused if use_fused_projection else q_only_native
-    fast_q, fast_gate = (fused_q, fused_gate) if use_fused_projection else (native_q, native_gate)
+    fused_projection_exact = exact_projection(fused_q, fused_gate)
+    full_projection_exact = None
+    projection_variant = "native"
+    q_only, fast_q, fast_gate = q_only_native, native_q, native_gate
+    if args.fused_query:
+        q_only_full = predictor_projection(
+            indexer, replay.hidden, replay.positions, full_epilogue=True,
+        )
+        full_q, full_gate = q_only_full()
+        full_projection_exact = exact_projection(full_q, full_gate)
+        if full_projection_exact:
+            q_only, fast_q, fast_gate = q_only_full, full_q, full_gate
+            projection_variant = "full_epilogue"
+        elif fused_projection_exact:
+            q_only, fast_q, fast_gate = q_only_fused, fused_q, fused_gate
+            projection_variant = "normalization"
 
     def native(q, gate):
         return keye_indexer_score_paged(q, slots, pages, gate, lengths, scale)
@@ -313,6 +330,8 @@ def benchmark(replay, indexer, args, identity, previous_replay=None, codebook=No
     staged = {"projection_legacy": legacy_projection, "projection_q_only_native": q_only_native}
     if fused_projection_exact:
         staged["projection_q_only_fused"] = q_only_fused
+    if full_projection_exact:
+        staged["projection_q_only_full_epilogue"] = q_only_full
     staged["score_exact_bf16"] = lambda: bf16(fast_q, fast_gate)
     staged["score_lossless12"] = lambda: packed_score(fast_q, fast_gate)
     for mode in ("int4_g1_b128_f16", "int5_g2_b128_f16", "int6_g1_b128_f16",
@@ -465,7 +484,9 @@ def benchmark(replay, indexer, args, identity, previous_replay=None, codebook=No
             exact_topm_ties=ties.tolist(), exact_candidate_intersection=gold_recall,
             fastest_bf16=best, fastest_equal_layout_bf16=matched,
             static12_active_exception_rows=static.exception_count,
-            fused_projection_exact=fused_projection_exact, fused_projection_selected=use_fused_projection,
+            fused_projection_exact=fused_projection_exact,
+            fused_projection_selected=projection_variant != "native",
+            full_epilogue_exact=full_projection_exact, projection_variant=projection_variant,
             methods=rows, timings=timings,
         )
         if args.segment_audit:
@@ -489,8 +510,10 @@ def enforce_exclusive_gpu():
 
 
 def metadata(args):
-    sources = [*HERE.glob("*.py"),
-               ROOT / "scripts/indexer-round2/slab_index.py", ROOT / "scripts/indexer-optimization/optimize.py"]
+    sources = [
+        *HERE.glob("*.py"), ROOT / "scripts/indexer-round2/slab_index.py",
+        ROOT / "scripts/indexer-round2/projection.py", ROOT / "scripts/indexer-optimization/optimize.py",
+    ]
     books = [args.pair_pq / f"l{layer:02}.pt" for layer in args.layers] if args.pair_pq else []
     return dict(
         arguments={k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
