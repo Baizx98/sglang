@@ -68,7 +68,10 @@ def freeze(args):
             methods = {
                 name for name, method in record["methods"].items()
                 if (method.get("exact") is not None and "failed" not in method
-                    and name in record["timings"] and "_temporal_" not in name)
+                    and name in record["timings"] and "_temporal_" not in name
+                    # A fixed exact route has to reproduce the native
+                    # cutoff tie order for inputs outside calibration.
+                    and (not method["exact"] or name.endswith(":torch_sorted")))
             }
             valid.append(methods)
         eligible = set.intersection(*valid)
@@ -90,6 +93,7 @@ def freeze(args):
         metric="equal-layout fastest BF16 per condition",
         cutoffs=dict(mean_extra_miss_pp=args.mean_limit, p95_extra_miss_pp=args.tail_limit),
         gate_scope="same-state prediction coverage only",
+        exact_route_selector="torch_sorted",
         lower_batch_bound=args.minimum_batch,
         source_sha256={str(path):hashlib.sha256(path.read_bytes()).hexdigest() for path in args.inputs},
         calibration_request_ids=sorted({
@@ -124,12 +128,17 @@ def test(args):
         if identity not in route:
             raise ValueError(f"missing pre-registered route for {identity}")
         selected = route[identity]
-        speed, miss = measure(record, selected)
-        results.append(dict(
+        result = dict(
             source=source, line=line, length_bucket=record["bucket"], layer=record["layer"],
             batch=record["batch"], step=record["step"], M=record["width"], method=selected,
-            speedup_same_layout=speed, extra_miss_pp=miss,
-        ))
+        )
+        method = record["methods"].get(selected, {})
+        if method.get("failed") or selected not in record["timings"]:
+            result.update(status="invalid", error=method.get("failed", "unavailable frozen route"))
+        else:
+            speed, miss = measure(record, selected)
+            result.update(status="valid", speedup_same_layout=speed, extra_miss_pp=miss)
+        results.append(result)
     expected = {
         (*identity, batch, step)
         for identity in route for batch in args.expect_batch for step in args.expect_step
@@ -137,17 +146,19 @@ def test(args):
     if expected != measured:
         raise ValueError(f"holdout matrix mismatch: {len(expected - measured)} missing, "
                          f"{len(measured - expected)} extra")
-    individual = [delta for row in results for delta in row["extra_miss_pp"]]
+    valid = [row for row in results if row["status"] == "valid"]
+    individual = [delta for row in valid for delta in row["extra_miss_pp"]]
     summary = dict(
-        cells=len(results), request_rows=len(individual),
-        geomean_speedup=statistics.geometric_mean(row["speedup_same_layout"] for row in results),
-        mean_extra_miss_pp=statistics.mean(individual),
-        p95_extra_miss_pp=percentile95(individual),
-        max_extra_miss_pp=max(individual),
+        cells=len(results), valid_cells=len(valid), invalid_cells=len(results) - len(valid),
+        request_rows=len(individual),
+        geomean_speedup=statistics.geometric_mean(row["speedup_same_layout"] for row in valid) if valid else None,
+        mean_extra_miss_pp=statistics.mean(individual) if individual else None,
+        p95_extra_miss_pp=percentile95(individual) if individual else None,
+        max_extra_miss_pp=max(individual) if individual else None,
         policy_not_reselected=True,
     )
     summary["target_reached"] = (
-        summary["geomean_speedup"] >= 1.5
+        bool(valid) and len(valid) == len(results) and summary["geomean_speedup"] >= 1.5
         and summary["mean_extra_miss_pp"] <= policy["cutoffs"]["mean_extra_miss_pp"]
         and summary["p95_extra_miss_pp"] <= policy["cutoffs"]["p95_extra_miss_pp"]
     )
