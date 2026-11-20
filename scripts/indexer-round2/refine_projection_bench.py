@@ -15,8 +15,8 @@ import torch
 
 from projection import prepare_projection
 from refine_bench import (
-    K, ROOT, TRACE, Trace, assess, load_indexer, logical_scores, measure_graph, prepared_refiners,
-    scopes, shuffle_pages, torch_candidate_scores, torch_select, write_csv,
+    ROOT, TRACE, Trace, assess, load_indexer, logical_scores, measure_graph, predicted_candidates,
+    prepared_refiners, scopes, shuffle_pages, torch_candidate_scores, torch_select, write_csv,
 )
 
 
@@ -62,7 +62,7 @@ def projected_write(inputs, project):
 def run(args):
     from horizonkv_layer_replay import initialize
 
-    initialize()
+    config = initialize()
     trace = Trace(args.trace)
     indexer = load_indexer(1)
     selector_args = SimpleNamespace(skip_flashinfer=False, flashinfer_deterministic=False, ampere_cute=True)
@@ -70,7 +70,7 @@ def run(args):
     pairs, all_methods = [], []
     meta = {
         "source_layer": 0, "target_layer": 1, "step": args.step, "request_offset": args.offset,
-        "candidate_snapshot": str(args.candidates),
+        "candidate_snapshot": "recomputed before timing" if args.recompute_candidates else str(args.candidates),
         "frozen_selector_calibration": "refine-l40s-freeze/methods.csv, fastest correct geometric mean within batch and candidate width",
         "frozen_routes": {f"{batch}-{width}": method for (batch, width), method in ROUTES.items()},
         "device": str(torch.cuda.get_device_properties()), "torch": torch.__version__,
@@ -91,8 +91,19 @@ def run(args):
             for batch in args.batch:
                 ids = trace.ids(length, batch, args.offset)
                 inputs = trace.load(ids, 1, args.step, indexer, "merged")
-                snapshot = torch.load(args.candidates / f"candidates-{length}-b{batch}.pt", weights_only=True)
-                assert snapshot["requests"] == ids and snapshot["lengths"].equal(inputs.lengths.cpu())
+                snapshot_name = f"candidates-{length}-b{batch}.pt"
+                if args.recompute_candidates:
+                    candidates, tokens = predicted_candidates(
+                        trace, inputs, indexer, ids, args.step, args.width, config,
+                    )
+                    torch.save({
+                        "requests": ids, "source_input_ids": tokens, "lengths": inputs.lengths.cpu(),
+                        "candidates": {width: rows.cpu() for width, rows in candidates.items()},
+                    }, args.output / snapshot_name)
+                else:
+                    snapshot = torch.load(args.candidates / snapshot_name, weights_only=True)
+                    assert snapshot["requests"] == ids and snapshot["lengths"].equal(inputs.lengths.cpu())
+                    candidates = {width: snapshot["candidates"][width].cuda() for width in args.width}
                 hidden, positions, _, _ = trace.append_frames(ids, 1, args.step)
                 fused_project = prepare_projection(indexer, hidden, positions)
                 projection_check = bitwise_projection(inputs.project(), fused_project())
@@ -102,7 +113,7 @@ def run(args):
                     physical = shuffle_pages(inputs, layout, args.seed) if layout else inputs
                     for width in args.width:
                         projected_write(physical, physical.project)()
-                        candidate = snapshot["candidates"][width].cuda()
+                        candidate = candidates[width]
                         methods, sgl_score = prepared_refiners(physical, candidate, selector_args)
                         old_full = scopes(physical, methods, True)["project_write_refine"]
                         route = ROUTES[batch, width]
@@ -188,6 +199,7 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=20261120)
     parser.add_argument("--trace", type=Path, default=TRACE)
     parser.add_argument("--candidates", type=Path, default=ROOT / "data/indexer-round2/results/refine-a6000-frozen")
+    parser.add_argument("--recompute-candidates", action="store_true", help="generate ordered candidates for this step and cohort")
     parser.add_argument("--output", type=Path, required=True)
     options = parser.parse_args()
     torch.set_num_threads(4)

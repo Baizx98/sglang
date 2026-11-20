@@ -36,6 +36,8 @@ A6000 全 36 格均更快，逐格比值的 geomean 为 1.3821×，范围 1.3028
 
 36 格都与原生投影的 Q、当前 K 和门权逐位一致，最终逻辑下标也都通过 Triton 和 PyTorch 的严格排名。额外在 L40S 独立检查层 1/12/36、step 0/2/4/8、三档长度和 B4/16，共 72 个组合。其中 3 个 B16 组合出现 13、25、16 个 Q BF16 元素变化，K 和门权逐位一致。层 1 的差异出现在 128K、step 8。既有 A6000 全量 Indexer 结果也在层 36、32K/B16、step 2 观测到当前 K 差异。融合投影的精确声明仅覆盖本次 A6000 排名实测点。额外逐位检查表为 `data/indexer-round2/results/refine-projection-crossstep-l40s.csv`。
 
+保持同一投影、冻结路由、全部精确旧对照和 36 格设置，在 A6000 用 step 4 和 offset 0 复验。B4 使用不同请求。B16 保留每档的全部 16 条请求并改变顺序和步。重新生成该步的相邻层候选。全 36 格的 Q、当前 K 和门权逐位一致，且均通过两套严格排名。相对每格最快旧法为 1.3862×，范围 1.3046–1.4597×，36/36 格更快。同路由只换投影为 1.3960×，两组精排结果等权 geomean 为 1.3841×。复验原始计时和冻结路由见 `data/indexer-round2/results/refine-projection-a6000-step4/raw.jsonl`，逐格表为同目录的 `paired.csv`。
+
 ## 近似候选处理
 
 输入序列已由同一预测器排序。直接前缀路径实际把前 2048 个逻辑 ID 拷贝到连续输出。保护前缀路径将前 1024 或 1536 个逻辑 ID 固定选入，再计算其余候选的真实目标分数，以 FlashInfer 选择补足。候选的排序耗时包含在独立预测计时，精排计时覆盖前缀连续化、需要时的真实分数与候选变换，以及逻辑 ID 输出。
@@ -87,4 +89,8 @@ INDEXER_FULL_TARGET="$PWD/scripts/indexer-round2/refine_projection_bench.py" \
 INDEXER_FULL_TARGET="$PWD/scripts/indexer-round2/refine_predictor.py" \
   scripts/indexer-round2/run_full.sh \
   --output data/indexer-round2/results/refine-predictor-a6000-rerun
+
+INDEXER_FULL_TARGET="$PWD/scripts/indexer-round2/refine_projection_bench.py" \
+  scripts/indexer-round2/run_full.sh --step 4 --offset 0 --recompute-candidates \
+  --output data/indexer-round2/results/refine-projection-a6000-step4-rerun
 ```
