@@ -5,6 +5,7 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
+from prefix_topm import _accumulate_histogram
 
 
 @triton.jit
@@ -140,9 +141,11 @@ def _e2m1(code):
 
 @triton.jit
 def _scan(q, q_scales, k, planes, k_scales, gates, bases, lengths, mapping, out, decode_table,
+          histogram,
           gate_stride: tl.constexpr, width: tl.constexpr, scale: tl.constexpr,
           block: tl.constexpr, bits: tl.constexpr, groups: tl.constexpr,
-          mapping_kind: tl.constexpr, coarse: tl.constexpr, fp4: tl.constexpr, pair_pq: tl.constexpr):
+          mapping_kind: tl.constexpr, coarse: tl.constexpr, fp4: tl.constexpr, pair_pq: tl.constexpr,
+          hist_bins: tl.constexpr, hist_trailing: tl.constexpr, hist_shards: tl.constexpr):
     row = tl.program_id(1)
     tile = tl.program_id(0)
     token = tile * block + tl.arange(0, block)
@@ -206,6 +209,9 @@ def _scan(q, q_scales, k, planes, k_scales, gates, bases, lengths, mapping, out,
         approx = total.to(tl.bfloat16).to(tl.float32)
         score = tl.sum(tl.maximum(approx * scale, 0.0) * w[:, None], 0)
         tl.store(out + row * width + token, tl.where(live, score, -float("inf")))
+        if hist_bins:
+            _accumulate_histogram(score.to(tl.float16), live, histogram, row, tile,
+                                  hist_bins, hist_trailing, hist_shards)
     else:
         tl.store(out + row * width + token, -float("inf"))
 
@@ -278,7 +284,7 @@ class QuantizedKeys:
         )
 
     def prepare_scan(self, lengths, scale, block=256, warps=4, score_dtype=torch.float32,
-                     shortlist_width=None, coarse=False, block_selection=False):
+                     shortlist_width=None, coarse=False, block_selection=False, prefix=None):
         if shortlist_width is not None and shortlist_width % block:
             raise ValueError("shortlist width must be divisible by the scan block size")
         if block_selection and shortlist_width is None:
@@ -288,20 +294,29 @@ class QuantizedKeys:
         width = shortlist_width or triton.cdiv(self.plan.width, block) * block
         scores = torch.empty((self.batch, width), dtype=score_dtype, device=lengths.device)
         mapping_kind = 2 if block_selection else int(shortlist_width is not None)
+        histogram = scores
+        hist_config = (0, 0, 0)
+        if prefix is not None:
+            if mapping_kind or coarse or score_dtype != torch.float16 or prefix.width != width:
+                raise ValueError("a prefix histogram needs a matching dense FP16 scan")
+            histogram = prefix.histogram
+            hist_config = (prefix.bins, prefix.trailing, prefix.shards)
 
         def scan(gates, candidates=None):
+            if prefix is not None:
+                histogram.zero_()
             _scan[(width // block, self.batch)](
                 self.query_codes, self.query_scales, self.codes, self.planes, self.scales,
                 gates, self.plan.bases, lengths, lengths if candidates is None else candidates,
-                scores, self.decode_table, gates.stride(0), width, scale, block, self.bits, self.groups,
-                mapping_kind, coarse, self.fp4, self.pair_pq, num_warps=warps, enable_fp_fusion=False,
+                scores, self.decode_table, histogram, gates.stride(0), width, scale, block, self.bits, self.groups,
+                mapping_kind, coarse, self.fp4, self.pair_pq, *hist_config, num_warps=warps, enable_fp_fusion=False,
             )
             return scores
 
         return scan, scores.nbytes
 
-    def prepare(self, lengths, scale, block=256, warps=4, score_dtype=torch.float32):
-        scan, score_bytes = self.prepare_scan(lengths, scale, block, warps, score_dtype)
+    def prepare(self, lengths, scale, block=256, warps=4, score_dtype=torch.float32, prefix=None):
+        scan, score_bytes = self.prepare_scan(lengths, scale, block, warps, score_dtype, prefix=prefix)
 
         def score(q, gates):
             self.encode_query(q)

@@ -78,3 +78,9 @@ bash scripts/indexer-predict/run_frozen.sh test data/indexer-predict/frozen-run
 `--certified-bits 6 8 --certified-capacity 4 8 12` 在基准中另测固定容量的精确候选路径，需要包含 `--quant-formats 6x1 8x1`。粗扫用 INT6/INT8 及每 Key 两个向上舍入的 FP16 范数，同一 Triton kernel 输出近似分数和带符号 gate 的 FP32 上界。种子和压实后的剩余候选使用原有 BF16 候选 scorer。遇到缓冲溢出或原始截止分数同分时，设备上按行回退到原始密集评分及 Torch 有序选择。实际 BF16 读取预算包含种子、复查及回退，驻留包含原始 Key、低位 Key 与范数副缓冲。分数缓冲字节数为持久分数和上界缓冲的大小，另有临时索引、scatter 和选择器开销。CUDA Graph 计时包含路由和回退准备。
 
 `certified_device_audit.py --check-graph` 运行真实输入对拍、范数追加及 CUDA Graph 功能检查，无性能计时。当前原型的运行入口与冻结低位路由独立。
+
+## FP16 评分内前缀直方图
+
+`--fp16-scores --prefix-histogram-bits 9` 为匹配 `--prefix-modes` 的低位格式增加完整路径对照。评分 CTA 直接从同一批 FP16 分数累积 radix 前缀直方图。合并得到第 M−1 名所属桶，再扫描分数并压实其所属桶及更高分位置。超容量的请求走原密集选择。选中分数与原低位分数的最高分多重集合相同，截止同分可能改变逻辑 ID，所以额外覆盖损失仍须实测。与原 FlashInfer 同格式路径的配对计时由摘要导出，另报定长直方图和压实缓冲空间。
+
+`prefix_topm_audit.py --prefix-bits 9 --score-histogram --check-graph` 在真实冻结的 FP16 格式上验证融合、压实、结果与 CUDA Graph。默认冻结矩阵继续使用已登记的原选择器。

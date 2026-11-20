@@ -20,7 +20,7 @@ FIELDS = (
     "mean_bf16_prediction_overlap", "index_key_bytes", "raw_logical_history_bytes",
     "workspace_bytes_before_selector", "known_cute_workspace_bytes", "initialize_wall_us",
     "total_valid_history_tokens", "logical_key_bytes", "logical_score_write_bytes", "any_bf16_cutoff_tie",
-    "fused_query_encoding", "source_file", "source_line",
+    "fused_query_encoding", "prefix_workspace_bytes", "source_file", "source_line",
 )
 REQUEST_FIELDS = (
     "panel", "length_bucket", "batch", "layer", "step", "split", "M", "method", "request",
@@ -74,6 +74,7 @@ def rows(paths):
                             "index_key_bytes", "workspace_bytes_before_selector",
                             "known_cute_workspace_bytes", "initialize_wall_us",
                             "logical_key_bytes", "logical_score_write_bytes", "fused_query_encoding",
+                            "prefix_workspace_bytes",
                         )},
                     )
                     requests = [

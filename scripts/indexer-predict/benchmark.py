@@ -30,6 +30,7 @@ from certified_device import CertifiedRows
 from flashinfer import top_k_ragged_transform
 from horizonkv_layer_replay import initialize
 from lossless import StaticExponentKeys
+from prefix_topm import PrefixTopM
 from progressive import prepare_progressive, validate as validate_progressive
 from quantized import QuantizedKeys
 from query import QueryProjection, predictor_projection
@@ -299,7 +300,17 @@ def benchmark(replay, indexer, args, identity, previous_replay=None, codebook=No
                 scorer, workspace, True, static.storage_bytes, static_init_us,
             )
 
-    formats, compact_history_scores = {}, {}
+    formats, compact_history_scores, prefix_states = {}, {}, {}
+
+    def score_from_hidden(scan, state, fused):
+        if fused:
+            gate = full_projection.encode_into(
+                replay.hidden, replay.positions, state.query_codes, state.query_scales, state.groups,
+            )
+        else:
+            q, gate = q_only()
+            state.encode_query(q)
+        return scan(gate)
     variants = [
         (int(bits), int(groups), 0, False, None)
         for bits, groups in (name.split("x") for name in args.quant_formats)
@@ -347,13 +358,11 @@ def benchmark(replay, indexer, args, identity, previous_replay=None, codebook=No
                     return scan(gate)
 
                 output_name = f"{name}_b{tile}" + ("_f16" if dtype == torch.float16 else "")
+                if args.prefix_histogram_bits and output_name in args.prefix_modes and dtype == torch.float16:
+                    prefix_states[output_name] = state, tile, use_compact_projection
                 if use_compact_projection:
                     def history_scores(scan=scan, state=state):
-                        gate = full_projection.encode_into(
-                            replay.hidden, replay.positions, state.query_codes, state.query_scales,
-                            state.groups,
-                        )
-                        return scan(gate)
+                        return score_from_hidden(scan, state, True)
 
                     compact_history_scores[output_name] = history_scores
                 workspace = score_bytes + state.query_codes.nbytes + state.query_scales.nbytes
@@ -424,14 +433,26 @@ def benchmark(replay, indexer, args, identity, previous_replay=None, codebook=No
                 else (torch.equal(actual_scores, native_scores[:, :actual_scores.size(1)])
                       if exact else None)
             )
-            for select_name, select in selector_map.items():
+            choices = {tag: (history_scores, select, None) for tag, select in selector_map.items()}
+            if name in prefix_states:
+                state, tile, fused = prefix_states[name]
+                prefix = PrefixTopM(lengths, actual_scores.size(1), m, args.prefix_histogram_bits)
+                scan, _ = state.prepare_scan(lengths, scale, tile, score_dtype=torch.float16, prefix=prefix)
+
+                def fused_history(scan=scan, state=state, fused=fused):
+                    return score_from_hidden(scan, state, fused)
+
+                if not torch.equal(fused_history(), actual_scores):
+                    raise RuntimeError(f"the fused prefix histogram changed scores for {name}")
+                choices[f"prefix{args.prefix_histogram_bits}"] = (fused_history, prefix.select_from_histogram, prefix)
+            for select_name, (score_run, select, prefix) in choices.items():
                 if select_name == "vllm_cute" and actual_scores.dtype != torch.float32:
                     continue
                 call_name = f"{name}:{select_name}"
                 if exact and not score_equal:
                     rows[call_name] = {"failed": "different BF16 scores"}
                     continue
-                call = prepare_call(history_scores, select, current)
+                call = prepare_call(score_run, select, current)
                 try:
                     selected = call().clone()
                     torch.cuda.synchronize()
@@ -472,6 +493,12 @@ def benchmark(replay, indexer, args, identity, previous_replay=None, codebook=No
                     predicted_set_intersection=intersections(selected, gold).tolist(),
                     true_top2048_intersection=intersections(selected, target_ids).tolist(),
                 )
+                if prefix is not None:
+                    rows[call_name].update(
+                        prefix_workspace_bytes=prefix.workspace_bytes,
+                        prefix_candidate_counts=prefix.observed.tolist(),
+                        prefix_dense_fallback=prefix.fallback_lengths.gt(0).tolist(),
+                    )
         if args.progressive:
             state = formats.get("int6_g1")
             if state is None:
@@ -567,6 +594,11 @@ def benchmark(replay, indexer, args, identity, previous_replay=None, codebook=No
         )
         if measure:
             ablations = {}
+            for name in prefix_states:
+                control = f"{name}:flashinfer"
+                fused = f"{name}:prefix{args.prefix_histogram_bits}"
+                if control in calls and fused in calls:
+                    ablations[f"prefix_histogram_{name}"] = dict(control=control, fused=fused)
             if full_projection_exact:
                 # The earlier fastest exact path used the same lossless slab
                 # and selection. Change only the projection in this pair.
@@ -714,6 +746,8 @@ if __name__ == "__main__":
     parser.add_argument("--temporal", type=float, nargs="+")
     parser.add_argument("--temporal-segments", type=int, choices=(32,64,128), nargs="+", default=[32,64])
     parser.add_argument("--progressive", type=float, nargs="+")
+    parser.add_argument("--prefix-histogram-bits", type=int, choices=(7, 8, 9))
+    parser.add_argument("--prefix-modes", nargs="+", default=["int8_g1_b128_f16", "pq4_g1_b128_f16"])
     parser.add_argument("--certified-bits", type=int, choices=(6, 8), nargs="+")
     parser.add_argument("--certified-capacity", type=float, nargs="+", default=[4, 8])
     parser.add_argument("--segment-audit", type=int, nargs="+")
@@ -722,6 +756,8 @@ if __name__ == "__main__":
     parser.add_argument("--warmups", type=int, default=8)
     parser.add_argument("--seed", type=int, default=20261120)
     args = parser.parse_args()
+    if args.prefix_histogram_bits and not args.fp16_scores:
+        parser.error("the prefix histogram is only available for --fp16-scores")
     torch.set_num_threads(4)
     with torch.inference_mode():
         run(args)
