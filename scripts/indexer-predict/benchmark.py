@@ -315,6 +315,11 @@ def benchmark(replay, indexer, args, identity, previous_replay=None, codebook=No
         staged["projection_q_only_fused"] = q_only_fused
     staged["score_exact_bf16"] = lambda: bf16(fast_q, fast_gate)
     staged["score_lossless12"] = lambda: packed_score(fast_q, fast_gate)
+    for mode in ("int4_g1_b128_f16", "int5_g2_b128_f16", "int6_g1_b128_f16",
+                 "int8_g1_b256_f16", "pq4_g1_b128_f16"):
+        if mode in score_methods:
+            scorer = score_methods[mode][0]
+            staged[f"score_{mode}"] = lambda scorer=scorer: scorer(fast_q, fast_gate)
     append_slots = plan.bases + lengths
     static.append(replay.current_keys, append_slots)
     if not torch.equal(static.restore(append_slots).view(torch.int16), replay.current_keys.view(torch.int16)):
