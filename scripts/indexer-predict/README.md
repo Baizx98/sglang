@@ -57,7 +57,7 @@ INDEXER_FULL_TARGET="$PWD/scripts/indexer-predict/benchmark.py" \
 
 `policy.py freeze` 只读取校准结果，按长度、层和 M 固定方法。用 `policy.py test` 检查预先指定的 held-out batch/step 矩阵和请求不重叠，再报告加速及额外漏项。试验门槛默认是额外漏项均值 ≤1 pp 与 P95 ≤3 pp。两个门槛都属于同状态候选覆盖，服务任务结果另计。
 
-采集结束且 A6000 空闲后，按以下顺序运行冻结矩阵。两次运行共用同一个输出根目录和实际码本。每格同时对拍 Q-only 全融合后处理、仅归一化融合和原生投影，分子分母共用通过逐位核验的最高融合程度。全融合保留原生 MRoPE 两半不同的 BF16 FMA 舍入，再做 Hadamard。`projection_audit.py` 可单独复核真实输入的逐位一致性。
+采集结束且 A6000 空闲后，按以下顺序运行冻结矩阵。两次运行共用同一个输出根目录和实际码本。每格同时对拍 Q-only 全融合后处理、仅归一化融合和原生投影，分子分母共用通过逐位核验的最高融合程度。全融合保留原生 MRoPE 两半不同的 BF16 FMA 舍入，再做 Hadamard。低位全扫把分组 INT8 Q 编码放入该 epilogue，每格对拍 Q codes、FP32 scale 和完整历史分数。`projection_audit.py` 可单独复核真实输入的编码一致性。
 
 ```sh
 .venv/bin/python scripts/indexer-predict/pq_fit.py \

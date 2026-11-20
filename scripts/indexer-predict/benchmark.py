@@ -31,7 +31,7 @@ from horizonkv_layer_replay import initialize
 from lossless import StaticExponentKeys
 from progressive import prepare_progressive, validate as validate_progressive
 from quantized import QuantizedKeys
-from query import predictor_projection
+from query import QueryProjection, predictor_projection
 from refine_bench import reconstruct_layer0_input
 from segment_oracle import audit as audit_segments
 from slab_index import IndexSlab, Plan, _score_slab
@@ -164,10 +164,9 @@ def selectors(lengths, width, reference_width):
     return result
 
 
-def prepare_call(project, score, select, current):
+def prepare_call(history_scores, select, current):
     def call():
-        values = score(*project())
-        return torch.cat((current, select(values)), dim=1)
+        return torch.cat((current, select(history_scores())), dim=1)
 
     return call
 
@@ -240,10 +239,14 @@ def benchmark(replay, indexer, args, identity, previous_replay=None, codebook=No
     full_projection_exact = None
     projection_variant = "native"
     q_only, fast_q, fast_gate = q_only_native, native_q, native_gate
+    full_projection = None
     if args.fused_query:
-        q_only_full = predictor_projection(
-            indexer, replay.hidden, replay.positions, full_epilogue=True,
-        )
+        full_projection = QueryProjection(indexer, replay.hidden.size(0), replay.hidden.device,
+                                          full_epilogue=True)
+
+        def q_only_full():
+            return full_projection(replay.hidden, replay.positions)
+
         full_q, full_gate = q_only_full()
         full_projection_exact = exact_projection(full_q, full_gate)
         if full_projection_exact:
@@ -291,7 +294,7 @@ def benchmark(replay, indexer, args, identity, previous_replay=None, codebook=No
                 scorer, workspace, True, static.storage_bytes, build_us + static_us,
             )
 
-    formats = {}
+    formats, compact_history_scores = {}, {}
     variants = [
         (int(bits), int(groups), 0, False, None)
         for bits, groups in (name.split("x") for name in args.quant_formats)
@@ -315,11 +318,39 @@ def benchmark(replay, indexer, args, identity, previous_replay=None, codebook=No
         codec = "pq" if table is not None else "fp" if fp4 else "int"
         name = f"{codec}{bits}{fit}_g{groups}"
         formats[name] = state
+        use_compact_projection = False
+        if full_projection_exact:
+            state.encode_query(fast_q)
+            reference_codes = state.query_codes.clone()
+            reference_scales = state.query_scales.clone()
+            projected_gate = full_projection.encode_into(
+                replay.hidden, replay.positions, state.query_codes, state.query_scales, groups,
+            )
+            use_compact_projection = (
+                torch.equal(reference_codes, state.query_codes)
+                and torch.equal(reference_scales.view(torch.int32), state.query_scales.view(torch.int32))
+                and torch.equal(default_gate.view(torch.int16), projected_gate.view(torch.int16))
+            )
         for tile in args.quant_tiles:
             dtypes = (torch.float32, torch.float16) if args.fp16_scores else (torch.float32,)
             for dtype in dtypes:
-                scorer, workspace = state.prepare(lengths, scale, tile, score_dtype=dtype)
+                scan, score_bytes = state.prepare_scan(lengths, scale, tile, score_dtype=dtype)
+
+                def scorer(q, gate, state=state, scan=scan):
+                    state.encode_query(q)
+                    return scan(gate)
+
                 output_name = f"{name}_b{tile}" + ("_f16" if dtype == torch.float16 else "")
+                if use_compact_projection:
+                    def history_scores(scan=scan, state=state):
+                        gate = full_projection.encode_into(
+                            replay.hidden, replay.positions, state.query_codes, state.query_scales,
+                            state.groups,
+                        )
+                        return scan(gate)
+
+                    compact_history_scores[output_name] = history_scores
+                workspace = score_bytes + state.query_codes.nbytes + state.query_scales.nbytes
                 logical_key_bytes[output_name] = (
                     tokens * (8 * bits + 2 * groups) + (table[1].nbytes if table is not None else 0)
                 )
@@ -357,10 +388,14 @@ def benchmark(replay, indexer, args, identity, previous_replay=None, codebook=No
         gold, ties = reference_topm(native_scores[:, :reference_width].contiguous(), lengths, m)
         target_ids = replay.target_ids.int()
         gold_recall = intersections(gold, target_ids).tolist()
-        legacy = prepare_call(legacy_projection, native, selector_map["torch_sorted"], current)
+        legacy = prepare_call(lambda: native(*legacy_projection()), selector_map["torch_sorted"], current)
         calls, rows = {"legacy_full_sorted": legacy}, {}
         for name, (score, workspace, exact, storage, init_us) in score_methods.items():
             actual_scores = score(fast_q, fast_gate).clone()
+            compact_scores = compact_history_scores.get(name)
+            if compact_scores is not None and not torch.equal(compact_scores(), actual_scores):
+                raise RuntimeError(f"fused Q encoding changed the score for {name}")
+            history_scores = compact_scores or (lambda score=score: score(*q_only()))
             baseline = exact
             # Ignore padding beyond the common score domain.
             score_equal = (
@@ -376,7 +411,7 @@ def benchmark(replay, indexer, args, identity, previous_replay=None, codebook=No
                 if exact and not score_equal:
                     rows[call_name] = {"failed": "different BF16 scores"}
                     continue
-                call = prepare_call(q_only, score, select, current)
+                call = prepare_call(history_scores, select, current)
                 try:
                     selected = call().clone()
                     torch.cuda.synchronize()
@@ -405,6 +440,7 @@ def benchmark(replay, indexer, args, identity, previous_replay=None, codebook=No
                 calls[call_name] = call
                 rows[call_name] = dict(
                     exact=exact, baseline=baseline, score_equal=score_equal, index_key_bytes=storage,
+                    fused_query_encoding=compact_scores is not None,
                     score_dtype=str(actual_scores.dtype),
                     logical_key_bytes=logical_key_bytes[name],
                     logical_score_write_bytes=actual_scores.nbytes,

@@ -19,7 +19,8 @@ FIELDS = (
     "speedup_all", "mean_true_recall", "mean_delta_pp", "worst_delta_pp",
     "mean_bf16_prediction_overlap", "index_key_bytes", "raw_logical_history_bytes",
     "workspace_bytes_before_selector", "known_cute_workspace_bytes", "initialize_wall_us",
-    "total_valid_history_tokens", "logical_key_bytes", "logical_score_write_bytes", "any_bf16_cutoff_tie", "source_file", "source_line",
+    "total_valid_history_tokens", "logical_key_bytes", "logical_score_write_bytes", "any_bf16_cutoff_tie",
+    "fused_query_encoding", "source_file", "source_line",
 )
 REQUEST_FIELDS = (
     "panel", "length_bucket", "batch", "layer", "step", "split", "M", "method", "request",
@@ -72,7 +73,7 @@ def rows(paths):
                         **{key: method.get(key) for key in (
                             "index_key_bytes", "workspace_bytes_before_selector",
                             "known_cute_workspace_bytes", "initialize_wall_us",
-                            "logical_key_bytes", "logical_score_write_bytes",
+                            "logical_key_bytes", "logical_score_write_bytes", "fused_query_encoding",
                         )},
                     )
                     requests = [

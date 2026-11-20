@@ -23,21 +23,34 @@ class QueryProjection:
                 raise ValueError("the full epilogue requires grouped 64-dimension NeoX MRoPE")
             rope._match_cos_sin_cache_dtype(self.normalized)
 
+    def _fused_postprocess(self, query_gate, positions, out, scales=None, groups=0):
+        indexer = self.indexer
+        positions = positions if positions.ndim == 2 else positions.unsqueeze(0).expand(3, -1)
+        rope = indexer.rotary_emb
+        # The grid contains only query heads. The shared K branch is never used.
+        _normalize_heads[(self.batch, indexer.num_heads)](
+            query_gate, query_gate, indexer.q_norm.weight, indexer.k_norm.weight,
+            indexer.k_norm.bias, out, self.no_keys, positions, rope.cos_sin_cache,
+            query_gate.stride(0), query_gate.stride(0), indexer.q_norm.variance_epsilon,
+            indexer.k_norm.variance_epsilon, positions.stride(0),
+            *rope.mrope_section[:2], self.full_epilogue, self.full_epilogue, scales, groups,
+            num_warps=2, enable_fp_fusion=False,
+        )
+
+    def encode_into(self, hidden, positions, codes, scales, groups):
+        if not self.full_epilogue or groups not in (1, 2):
+            raise ValueError("the INT8 Q output requires the full epilogue with one or two groups")
+        query_gate, _ = self.indexer.q_proj(hidden)
+        self._fused_postprocess(query_gate, positions, codes, scales, groups)
+        return query_gate[:, self.indexer.total_q_dim:]
+
     def __call__(self, hidden, positions):
         indexer = self.indexer
         positions = positions if positions.ndim == 2 else positions.unsqueeze(0).expand(3, -1)
         rope = indexer.rotary_emb
         query_gate, _ = indexer.q_proj(hidden)
         if self.fused:
-            # The launch contains only query heads. The shared K branch does not run.
-            _normalize_heads[(self.batch, indexer.num_heads)](
-                query_gate, query_gate, indexer.q_norm.weight, indexer.k_norm.weight,
-                indexer.k_norm.bias, self.normalized, self.no_keys, positions, rope.cos_sin_cache,
-                query_gate.stride(0), query_gate.stride(0), indexer.q_norm.variance_epsilon,
-                indexer.k_norm.variance_epsilon, positions.stride(0),
-                *rope.mrope_section[:2], self.full_epilogue, self.full_epilogue,
-                num_warps=2, enable_fp_fusion=False,
-            )
+            self._fused_postprocess(query_gate, positions, self.normalized)
             query = self.normalized
         else:
             query = query_gate[:, :indexer.total_q_dim].reshape(-1, indexer.head_dim)

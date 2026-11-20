@@ -12,6 +12,7 @@ def _normalize_heads(
     q_eps: tl.constexpr, k_eps: tl.constexpr,
     position_stride: tl.constexpr, section_t: tl.constexpr, section_h: tl.constexpr,
     epilogue: tl.constexpr, exact_rope: tl.constexpr = False,
+    scales_out=None, quant_groups: tl.constexpr = 0,
 ):
     row = tl.program_id(0)
     head = tl.program_id(1)
@@ -62,7 +63,16 @@ def _normalize_heads(
         values = (butterfly * 0.125).to(tl.bfloat16)
 
     if head < 16:
-        tl.store(q_out + (row * 16 + head) * 64 + dim, values)
+        out_head = row * 16 + head
+        if quant_groups:
+            grouped = tl.reshape(values.to(tl.float32), (quant_groups, 64 // quant_groups))
+            scale = tl.maximum(tl.max(tl.abs(grouped), 1), 1e-20) / 127.0
+            codes = tl.extra.cuda.libdevice.rint(tl.div_rn(grouped, scale[:, None]))
+            codes = tl.minimum(tl.maximum(codes, -127), 127).to(tl.int8)
+            tl.store(q_out + out_head * 64 + dim, tl.reshape(codes, (64,)))
+            tl.store(scales_out + out_head * quant_groups + tl.arange(0, quant_groups), scale)
+        else:
+            tl.store(q_out + out_head * 64 + dim, values)
     else:
         tl.store(k_out + row * 64 + dim, values)
 
