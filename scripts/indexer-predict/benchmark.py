@@ -527,11 +527,35 @@ def benchmark(replay, indexer, args, identity, previous_replay=None, codebook=No
             methods=rows,
         )
         if measure:
+            ablations = {}
+            if full_projection_exact:
+                # The earlier fastest exact path used the same lossless slab
+                # and selection. Change only the projection in this pair.
+                for selector in ("flashinfer", "torch_sorted"):
+                    fused_name = f"lossless12:{selector}"
+                    if fused_name not in same_layout:
+                        continue
+                    prior = q_only_fused if fused_projection_exact else q_only_native
+                    unfused_name = f"control_previous_projection:{selector}"
+                    calls[unfused_name] = prepare_call(
+                        lambda: packed_score(*prior()), selector_map[selector], current,
+                    )
+                    ablations["bf16_projection"] = dict(control=unfused_name, fused=fused_name)
+                    break
+                int8 = "int8_g1_b256_f16"
+                fused_name = f"{int8}:flashinfer"
+                if int8 in compact_history_scores and fused_name in calls:
+                    unfused_name = "control_separate_int8_query_encoding:flashinfer"
+                    separate = score_methods[int8][0]
+                    calls[unfused_name] = prepare_call(
+                        lambda: separate(*q_only()), selector_map["flashinfer"], current,
+                    )
+                    ablations["int8_query_encoding"] = dict(control=unfused_name, fused=fused_name)
             timings = measure_graph(calls | staged, args.trials, args.iterations, args.seed, args.warmups)
             result.update(
                 fastest_bf16=min(exact_names, key=lambda name: timings[name]["median_us"]),
                 fastest_equal_layout_bf16=min(same_layout, key=lambda name: timings[name]["median_us"]),
-                timings=timings,
+                timings=timings, full_path_ablations=ablations,
             )
         else:
             result.update(verification_only=True, validated_equal_layout_bf16=same_layout)
