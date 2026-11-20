@@ -186,7 +186,9 @@ def intersections(query, reference):
     return (ordered.gather(1, rank) == query).sum(dim=1)
 
 
-def timed_build(factory):
+def build_stage(factory, measure):
+    if not measure:
+        return factory(), None
     # Exclude first-use compilation and collect a warm allocation/build time.
     warmed = factory()
     torch.cuda.synchronize()
@@ -204,6 +206,7 @@ def timed_build(factory):
 
 
 def benchmark(replay, indexer, args, identity, previous_replay=None, codebook=None):
+    measure = not args.verify_only
     scale = indexer.softmax_scale
     reference_width = max(replay.lengths) + 1
     width = triton.cdiv(reference_width, 256) * 256
@@ -211,12 +214,12 @@ def benchmark(replay, indexer, args, identity, previous_replay=None, codebook=No
     current = lengths[:, None]
     slots = replay.keys
     plan = Plan.from_lengths(lengths, 64)
-    raw, build_us = timed_build(lambda: IndexSlab(
+    raw, build_us = build_stage(lambda: IndexSlab(
         plan, slots, pages, lengths, packed=False, exception_reserve=0,
-    ))
-    packed, packed_us = timed_build(lambda: IndexSlab(
+    ), measure)
+    packed, packed_us = build_stage(lambda: IndexSlab(
         plan, slots, pages, lengths, packed=True, exception_reserve=len(replay.lengths),
-    ))
+    ), measure)
     bf16, _ = prepare_slab_score(raw, scale, 128, 4)
     q_only_native = predictor_projection(indexer, replay.hidden, replay.positions)
     q_only_fused = predictor_projection(indexer, replay.hidden, replay.positions, fused=True)
@@ -276,7 +279,8 @@ def benchmark(replay, indexer, args, identity, previous_replay=None, codebook=No
     score_methods["lossless12"] = (packed_score, packed_workspace, True, packed.storage_bytes, packed_us)
     packed_exceptions = int((packed.arena.keys.headers < 0).sum())
     logical_key_bytes["lossless12"] = (100 * tokens) + 128 * packed_exceptions
-    static, static_us = timed_build(lambda: StaticExponentKeys(raw))
+    static, static_us = build_stage(lambda: StaticExponentKeys(raw), measure)
+    static_init_us = build_us + static_us if measure else None
     static_mask_groups = sum(triton.cdiv(length, 32) for length in replay.lengths)
     static_exception_groups = int(static.masks.view(torch.int32).count_nonzero())
     static_logical_bytes = 96 * tokens + 4 * (
@@ -291,7 +295,7 @@ def benchmark(replay, indexer, args, identity, previous_replay=None, codebook=No
             name = f"static12_b{tile}{suffix}"
             logical_key_bytes[name] = static_logical_bytes
             score_methods[name] = (
-                scorer, workspace, True, static.storage_bytes, build_us + static_us,
+                scorer, workspace, True, static.storage_bytes, static_init_us,
             )
 
     formats, compact_history_scores = {}, {}
@@ -307,13 +311,14 @@ def benchmark(replay, indexer, args, identity, previous_replay=None, codebook=No
         variants.append((4, 1, 0, False, codebook))
     for bits, groups, fit_steps, fp4, table in variants:
         if args.direct_paged_build:
-            state, code_us = timed_build(lambda: QuantizedKeys.from_paged(
+            state, initialization_us = build_stage(lambda: QuantizedKeys.from_paged(
                 plan, slots, pages, lengths, bits, groups, fit_steps, fp4, table,
-            ))
-            initialization_us = code_us
+            ), measure)
         else:
-            state, code_us = timed_build(lambda: QuantizedKeys(raw, bits, groups, fit_steps, fp4, table))
-            initialization_us = build_us + code_us
+            state, code_us = build_stage(
+                lambda: QuantizedKeys(raw, bits, groups, fit_steps, fp4, table), measure,
+            )
+            initialization_us = build_us + code_us if measure else None
         fit = f"fit{fit_steps}" if fit_steps else ""
         codec = "pq" if table is not None else "fp" if fp4 else "int"
         name = f"{codec}{bits}{fit}_g{groups}"
@@ -512,19 +517,24 @@ def benchmark(replay, indexer, args, identity, previous_replay=None, codebook=No
         same_layout = [name for name in exact_names if not name.startswith("paged:")]
         if not same_layout:
             raise RuntimeError("no validated BF16 implementation in the equal-layout denominator")
-        timings = measure_graph(calls | staged, args.trials, args.iterations, args.seed, args.warmups)
-        best = min(exact_names, key=lambda name: timings[name]["median_us"])
-        matched = min(same_layout, key=lambda name: timings[name]["median_us"])
         result = dict(
             **identity, width=m, request_ids=replay.request_ids, history_lengths=replay.lengths,
             exact_topm_ties=ties.tolist(), exact_candidate_intersection=gold_recall,
-            fastest_bf16=best, fastest_equal_layout_bf16=matched,
             static12_active_exception_rows=static.exception_count,
             fused_projection_exact=fused_projection_exact,
             fused_projection_selected=projection_variant != "native",
             full_epilogue_exact=full_projection_exact, projection_variant=projection_variant,
-            methods=rows, timings=timings,
+            methods=rows,
         )
+        if measure:
+            timings = measure_graph(calls | staged, args.trials, args.iterations, args.seed, args.warmups)
+            result.update(
+                fastest_bf16=min(exact_names, key=lambda name: timings[name]["median_us"]),
+                fastest_equal_layout_bf16=min(same_layout, key=lambda name: timings[name]["median_us"]),
+                timings=timings,
+            )
+        else:
+            result.update(verification_only=True, validated_equal_layout_bf16=same_layout)
         if args.segment_audit:
             result["segment_audit"] = audit_segments(
                 slots, fast_q, fast_gate, replay.lengths, native_scores, gold,
@@ -563,14 +573,15 @@ def metadata(args):
         source_sha256={p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in sources},
         codebook_sha256={str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in books},
         scope="real previous-layer hidden state to M logical candidates; historical keys only; no prediction K or append",
-        initialization="synchronized wall time, one untimed build and three timed repeats",
+        initialization=None if args.verify_only else "synchronized wall time, one untimed build and three timed repeats",
     )
 
 
 def run(args):
     if torch.cuda.device_count() != 1 or torch.cuda.get_device_capability() != (8, 6):
-        raise RuntimeError("measure on a single visible SM86 GPU")
-    enforce_exclusive_gpu()
+        raise RuntimeError("use a single visible SM86 GPU")
+    if not args.verify_only:
+        enforce_exclusive_gpu()
     config = initialize()
     old = Trace(TRACE) if args.existing else None
     captured = CapturedInputs(args.capture or [])
@@ -596,19 +607,27 @@ def run(args):
                     if old is not None or step == 0:
                         raise ValueError("temporal benchmark needs a capture and a positive step")
                     previous = captured.load(bucket, args.split, batch, layer, step - 1, args.offset)
-                enforce_exclusive_gpu()
-                for row in benchmark(replay, indexer, args, identity, previous, codebook):
+                if not args.verify_only:
                     enforce_exclusive_gpu()
+                for row in benchmark(replay, indexer, args, identity, previous, codebook):
+                    if not args.verify_only:
+                        enforce_exclusive_gpu()
                     stream.write(json.dumps(row) + "\n")
                     stream.flush()
-                    best = row["fastest_equal_layout_bf16"]
-                    exact_us = row["timings"][best]["median_us"]
-                    print(identity, "M", row["width"], "equal-layout", best, round(exact_us, 2), flush=True)
+                    if args.verify_only:
+                        count = sum("failed" not in entry for entry in row["methods"].values())
+                        print(identity, "M", row["width"], "verified methods", count, flush=True)
+                    else:
+                        best = row["fastest_equal_layout_bf16"]
+                        exact_us = row["timings"][best]["median_us"]
+                        print(identity, "M", row["width"], "equal-layout", best, round(exact_us, 2), flush=True)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--verify-only", action="store_true",
+                        help="check projection, scores and candidate sets without timing")
     traced = parser.add_mutually_exclusive_group(required=True)
     traced.add_argument("--existing", action="store_true")
     traced.add_argument("--capture", type=Path, nargs="+")

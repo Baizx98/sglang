@@ -40,6 +40,8 @@ INDEXER_FULL_TARGET="$PWD/scripts/indexer-predict/benchmark.py" \
 
 只有写入 `completed.jsonl` 并通过步骤与张量尺寸核验的真实请求会进入回放。测试用 `--split test`。回放 B16 使用 16 个不同请求。分子和分母均从预测 hidden state 开始，默认采用同一种跳过预测 K 的 Q/gate 实现。历史布局基线包括分页 BF16、同等连续 BF16、原有逐 token 指数压缩，以及可运行的 Torch、FlashInfer 和 vLLM CuTe 选择器。有边界同分时也要求匹配原预测路径的 PyTorch 有序 Top-M 集合。
 
+`benchmark.py --verify-only` 走相同的投影、评分和候选检查，跳过 CUDA 事件、图计时和初始化计时。产物只列通过对拍的方法、集合指标与失败原因，不能用于冻结性能路由。
+
 ## 指标
 
 - `true_top2048_intersection` 为预测候选与采集轨迹上目标层真实 Top-2048 的交集个数。额外候选损失为精确预测交集减去测试方法交集，再除以 2048。与精确预测的 Top-M 集合重合独立保存。
