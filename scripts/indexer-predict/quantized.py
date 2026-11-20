@@ -8,38 +8,38 @@ import triton.language as tl
 
 
 @triton.jit
-def _encode(keys, codes, planes, scales, slots,
-            rows: tl.constexpr, bits: tl.constexpr, groups: tl.constexpr,
-            block: tl.constexpr, append: tl.constexpr, fit_steps: tl.constexpr):
-    r = tl.program_id(0) * block + tl.arange(0, block)
-    g = tl.program_id(1)
-    d = tl.arange(0, 64 // groups)
+def _write_rows(key, dst, valid, codes, planes, scales, g,
+                bits: tl.constexpr, groups: tl.constexpr, block: tl.constexpr,
+                fit_steps: tl.constexpr, fp4: tl.constexpr):
     low_bits: tl.constexpr = 8 if bits == 8 else 4
     row_bytes: tl.constexpr = 64 * low_bits // 8
     width: tl.constexpr = row_bytes // groups
-    max_code: tl.constexpr = (1 << (bits - 1)) - 1
-    logical = r[:, None] * 64 + g * (64 // groups) + d[None, :]
-    if append:
-        # Append receives physical slots reserved by the owner. It has no role
-        # in prediction and is timed separately on actual target-layer K.
-        dst = tl.load(slots + r, mask=r < rows, other=0)
-        valid = (r < rows) & (dst >= 0)
+    if fp4:
+        # Scaled E2M1 values expressed in integer units. The sign lives in
+        # bit 3 and the seven thresholds round to the nearest FP4 level.
+        scale = (tl.maximum(tl.max(tl.abs(key), 1), 1e-20) / 96.0).to(tl.bfloat16)
+        magnitude = tl.div_rn(tl.abs(key), scale.to(tl.float32)[:, None])
+        code = (
+            (magnitude > 4.0).to(tl.int32) + (magnitude > 12.0).to(tl.int32)
+            + (magnitude > 20.0).to(tl.int32) + (magnitude > 28.0).to(tl.int32)
+            + (magnitude > 40.0).to(tl.int32) + (magnitude > 56.0).to(tl.int32)
+            + (magnitude > 80.0).to(tl.int32)
+        )
+        biased = code | tl.where(key < 0.0, 8, 0)
     else:
-        dst = r
-        valid = r < rows
-    key = tl.load(keys + logical, mask=valid[:, None], other=0).to(tl.float32)
-    scale = (tl.maximum(tl.max(tl.abs(key), 1), 1e-20) / max_code).to(tl.bfloat16)
-    for _ in tl.static_range(fit_steps):
+        max_code: tl.constexpr = (1 << (bits - 1)) - 1
+        scale = (tl.maximum(tl.max(tl.abs(key), 1), 1e-20) / max_code).to(tl.bfloat16)
+        for _ in tl.static_range(fit_steps):
+            quantized = tl.extra.cuda.libdevice.rint(tl.div_rn(key, scale.to(tl.float32)[:, None]))
+            code = tl.minimum(tl.maximum(quantized, -max_code), max_code)
+            correlation = tl.sum(key * code, 1)
+            power = tl.sum(code * code, 1)
+            optimum = tl.maximum(tl.div_rn(correlation, tl.maximum(power, 1.0)), 1.0e-20)
+            scale = tl.where(power > 0.0, optimum.to(tl.bfloat16), scale)
         quantized = tl.extra.cuda.libdevice.rint(tl.div_rn(key, scale.to(tl.float32)[:, None]))
-        code = tl.minimum(tl.maximum(quantized, -max_code), max_code)
-        correlation = tl.sum(key * code, 1)
-        power = tl.sum(code * code, 1)
-        optimum = tl.maximum(tl.div_rn(correlation, tl.maximum(power, 1.0)), 1.0e-20)
-        scale = tl.where(power > 0.0, optimum.to(tl.bfloat16), scale)
-    quantized = tl.extra.cuda.libdevice.rint(tl.div_rn(key, scale.to(tl.float32)[:, None]))
-    bounded = tl.minimum(tl.maximum(quantized, -max_code), max_code)
-    if bits < 8:
+        bounded = tl.minimum(tl.maximum(quantized, -max_code), max_code)
         biased = bounded.to(tl.int32) + (1 << (bits - 1))
+    if bits < 8:
         # The dense nibble stream stores the four most significant bits.
         # The extra stream can then be omitted by a cheaper first-pass scan.
         lo, hi = tl.split(tl.reshape(biased >> (bits - 4), (block, width, 2)))
@@ -65,6 +65,45 @@ def _encode(keys, codes, planes, scales, slots,
 
 
 @triton.jit
+def _encode(keys, codes, planes, scales, slots,
+            rows: tl.constexpr, bits: tl.constexpr, groups: tl.constexpr,
+            block: tl.constexpr, append: tl.constexpr, fit_steps: tl.constexpr, fp4: tl.constexpr):
+    r = tl.program_id(0) * block + tl.arange(0, block)
+    g = tl.program_id(1)
+    d = tl.arange(0, 64 // groups)
+    logical = r[:, None] * 64 + g * (64 // groups) + d[None, :]
+    if append:
+        # Append receives physical slots reserved by the owner. It has no role
+        # in prediction and is timed separately on actual target-layer K.
+        dst = tl.load(slots + r, mask=r < rows, other=0)
+        valid = (r < rows) & (dst >= 0)
+    else:
+        dst = r
+        valid = r < rows
+    key = tl.load(keys + logical, mask=valid[:, None], other=0).to(tl.float32)
+    _write_rows(key, dst, valid, codes, planes, scales, g, bits, groups, block, fit_steps, fp4)
+
+
+@triton.jit
+def _encode_paged(raw, table, lengths, bases, codes, planes, scales,
+                  page_stride: tl.constexpr, page_token_stride: tl.constexpr,
+                  key_stride: tl.constexpr, bits: tl.constexpr,
+                  groups: tl.constexpr, fit_steps: tl.constexpr, block: tl.constexpr,
+                  fp4: tl.constexpr):
+    row = tl.program_id(1)
+    group = tl.program_id(2)
+    token = tl.program_id(0) * block + tl.arange(0, block)
+    live = token < tl.load(lengths + row)
+    physical = tl.load(table + row * page_stride + token * page_token_stride, mask=live, other=-1)
+    live &= physical >= 0
+    d = group * (64 // groups) + tl.arange(0, 64 // groups)
+    key = tl.load(raw + physical[:, None] * key_stride + d[None, :],
+                  mask=live[:, None], other=0).to(tl.float32)
+    dst = tl.load(bases + row) + token
+    _write_rows(key, dst, live, codes, planes, scales, group, bits, groups, block, fit_steps, fp4)
+
+
+@triton.jit
 def _encode_query(q, q_codes, q_scales, stride: tl.constexpr, head_stride: tl.constexpr,
                   groups: tl.constexpr):
     row = tl.program_id(0)
@@ -80,10 +119,19 @@ def _encode_query(q, q_codes, q_scales, stride: tl.constexpr, head_stride: tl.co
 
 
 @triton.jit
+def _e2m1(code):
+    exp = (code & 7) >> 1
+    mantissa = code & 1
+    significand = tl.where(exp == 0, mantissa, mantissa + 2)
+    magnitude = (significand * 8) << tl.maximum(exp - 1, 0)
+    return tl.where((code & 8) == 0, magnitude, -magnitude).to(tl.int8)
+
+
+@triton.jit
 def _scan(q, q_scales, k, planes, k_scales, gates, bases, lengths, mapping, out,
           gate_stride: tl.constexpr, width: tl.constexpr, scale: tl.constexpr,
           block: tl.constexpr, bits: tl.constexpr, groups: tl.constexpr,
-          mapping_kind: tl.constexpr, coarse: tl.constexpr):
+          mapping_kind: tl.constexpr, coarse: tl.constexpr, fp4: tl.constexpr):
     row = tl.program_id(1)
     tile = tl.program_id(0)
     token = tile * block + tl.arange(0, block)
@@ -114,7 +162,9 @@ def _scan(q, q_scales, k, planes, k_scales, gates, bases, lengths, mapping, out,
                              mask=live[:, None], other=0)
             if bits < 8:
                 encoded = packed.to(tl.int32)
-                if bits == 4 or coarse:
+                if fp4:
+                    key = tl.interleave(_e2m1(encoded & 15), _e2m1(encoded >> 4))
+                elif bits == 4 or coarse:
                     key = tl.interleave((((encoded & 15) - 8) * factor).to(tl.int8),
                                         (((encoded >> 4) - 8) * factor).to(tl.int8))
                 else:
@@ -147,15 +197,32 @@ def _scan(q, q_scales, k, planes, k_scales, gates, bases, lengths, mapping, out,
 
 
 class QuantizedKeys:
-    def __init__(self, raw_slab, bits, groups, fit_steps=0):
+    def __init__(self, raw_slab, bits, groups, fit_steps=0, fp4=False):
+        self._allocate(raw_slab.plan, raw_slab.lengths, bits, groups, fit_steps, fp4)
+        self.build(raw_slab.resident)
+
+    @classmethod
+    def from_paged(cls, plan, raw, table, lengths, bits, groups, fit_steps=0, fp4=False):
+        state = cls.__new__(cls)
+        state._allocate(plan, lengths, bits, groups, fit_steps, fp4)
+        _encode_paged[(triton.cdiv(table.size(1), 32), lengths.numel(), groups)](
+            raw, table, lengths, plan.bases, state.codes, state.planes, state.scales,
+            *table.stride(), raw.stride(0), bits, groups, fit_steps, 32, fp4, num_warps=4,
+        )
+        return state
+
+    def _allocate(self, plan, lengths, bits, groups, fit_steps, fp4):
         if bits not in (4, 5, 6, 8) or groups not in (1, 2):
             raise ValueError("Index Key supports 4, 5, 6 or 8 bits and 1 or 2 groups")
-        self.plan = raw_slab.plan
+        if fp4 and (bits != 4 or fit_steps):
+            raise ValueError("E2M1 uses four bits and peak scaling")
+        self.fp4 = fp4
+        self.plan = plan
         self.bits = bits
         self.groups = groups
         self.fit_steps = fit_steps
-        self.batch = raw_slab.lengths.numel()
-        device = raw_slab.lengths.device
+        self.batch = lengths.numel()
+        device = lengths.device
         low_bytes = 64 if bits == 8 else 32
         self.codes = torch.empty((self.plan.capacity, low_bytes),
                                  dtype=torch.int8 if bits == 8 else torch.uint8, device=device)
@@ -164,7 +231,6 @@ class QuantizedKeys:
         self.scales = torch.empty((self.plan.capacity, groups), dtype=torch.bfloat16, device=device)
         self.query_codes = torch.empty((self.batch, 16, 64), dtype=torch.int8, device=device)
         self.query_scales = torch.empty((self.batch, 16, groups), dtype=torch.float32, device=device)
-        self.build(raw_slab.resident)
 
     @property
     def storage_bytes(self):
@@ -174,14 +240,14 @@ class QuantizedKeys:
         rows = keys.size(0)
         _encode[(triton.cdiv(rows, 32), self.groups)](
             keys, self.codes, self.planes, self.scales, self.plan.bases,
-            rows, self.bits, self.groups, 32, False, self.fit_steps, num_warps=4,
+            rows, self.bits, self.groups, 32, False, self.fit_steps, self.fp4, num_warps=4,
         )
 
     def append(self, keys, slots):
         rows = keys.size(0)
         _encode[(rows, self.groups)](
             keys, self.codes, self.planes, self.scales, slots,
-            rows, self.bits, self.groups, 1, True, self.fit_steps, num_warps=2,
+            rows, self.bits, self.groups, 1, True, self.fit_steps, self.fp4, num_warps=2,
         )
 
     def encode_query(self, q):
@@ -207,7 +273,7 @@ class QuantizedKeys:
                 self.query_codes, self.query_scales, self.codes, self.planes, self.scales,
                 gates, self.plan.bases, lengths, lengths if candidates is None else candidates,
                 scores, gates.stride(0), width, scale, block, self.bits, self.groups,
-                mapping_kind, coarse, num_warps=warps, enable_fp_fusion=False,
+                mapping_kind, coarse, self.fp4, num_warps=warps, enable_fp_fusion=False,
             )
             return scores
 

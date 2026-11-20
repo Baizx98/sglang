@@ -274,13 +274,24 @@ def benchmark(replay, indexer, args, identity, previous_replay=None):
 
     formats = {}
     variants = [
-        (int(bits), int(groups), 0) for bits, groups in (name.split("x") for name in args.quant_formats)
+        (int(bits), int(groups), 0, False)
+        for bits, groups in (name.split("x") for name in args.quant_formats)
     ]
-    variants.extend((4, groups, steps) for steps in (args.fit_int4 or []) for groups in (1, 2))
-    for bits, groups, fit_steps in variants:
-        state, code_us = timed_build(lambda: QuantizedKeys(raw, bits, groups, fit_steps))
+    variants.extend((4, groups, steps, False) for steps in (args.fit_int4 or []) for groups in (1, 2))
+    if args.fp4:
+        variants.extend((4, groups, 0, True) for groups in (1, 2))
+    for bits, groups, fit_steps, fp4 in variants:
+        if args.direct_paged_build:
+            state, code_us = timed_build(lambda: QuantizedKeys.from_paged(
+                plan, slots, pages, lengths, bits, groups, fit_steps, fp4,
+            ))
+            initialization_us = code_us
+        else:
+            state, code_us = timed_build(lambda: QuantizedKeys(raw, bits, groups, fit_steps, fp4))
+            initialization_us = build_us + code_us
         fit = f"fit{fit_steps}" if fit_steps else ""
-        name = f"int{bits}{fit}_g{groups}"
+        codec = "fp" if fp4 else "int"
+        name = f"{codec}{bits}{fit}_g{groups}"
         formats[name] = state
         for tile in args.quant_tiles:
             dtypes = (torch.float32, torch.float16) if args.fp16_scores else (torch.float32,)
@@ -289,7 +300,7 @@ def benchmark(replay, indexer, args, identity, previous_replay=None):
                 output_name = f"{name}_b{tile}" + ("_f16" if dtype == torch.float16 else "")
                 logical_key_bytes[output_name] = tokens * (8 * bits + 2 * groups)
                 score_methods[output_name] = (
-                    scorer, workspace, False, state.storage_bytes, build_us + code_us,
+                    scorer, workspace, False, state.storage_bytes, initialization_us,
                 )
 
     staged = {"projection_legacy": legacy_projection, "projection_q_only_native": q_only_native}
@@ -537,6 +548,8 @@ if __name__ == "__main__":
     parser.add_argument("--exact-tiles", type=int, nargs="+", default=[128, 256])
     parser.add_argument("--fused-query", action="store_true")
     parser.add_argument("--fp16-scores", action="store_true")
+    parser.add_argument("--fp4", action="store_true")
+    parser.add_argument("--direct-paged-build", action="store_true")
     parser.add_argument("--fit-int4", type=int, choices=(1, 2, 4), nargs="+")
     parser.add_argument("--temporal", type=float, nargs="+")
     parser.add_argument("--temporal-segments", type=int, choices=(32,64,128), nargs="+", default=[32,64])

@@ -63,6 +63,10 @@ def read_format(state, slots):
     if state.bits == 8:
         return raw
     nibble = torch.stack((raw & 15, raw >> 4), dim=2).flatten(1)
+    if state.fp4:
+        levels = torch.tensor([0, 8, 16, 24, 32, 48, 64, 96], dtype=torch.int32, device=raw.device)
+        value = levels[nibble & 7]
+        return torch.where((nibble & 8) != 0, -value, value)
     if state.bits > 4:
         width = state.bits - 4
         word = state.planes[slots.long()].int()
@@ -82,8 +86,16 @@ def verify_formats():
     owner = slab(keys, length)
     live = locations(owner, length)
     next_slots = owner.plan.bases + owner.lengths
+    table, lens = page_layout(length, max(length))
+    permutation = torch.randperm(keys.size(0), device="cuda", generator=generator)
+    shuffled = torch.empty_like(keys)
+    shuffled.index_copy_(0, permutation, keys)
+    table = permutation[table.clamp_min(0).long()].int().masked_fill(table < 0, -1)
     for bits, groups in ((4, 1), (4, 2), (5, 1), (5, 2), (6, 1), (8, 1), (8, 2)):
         state = QuantizedKeys(owner, bits, groups)
+        paged = QuantizedKeys.from_paged(owner.plan, shuffled, table, lens, bits, groups)
+        for name in ("codes", "planes", "scales"):
+            assert torch.equal(getattr(state,name)[live.long()], getattr(paged,name)[live.long()])
         for reference, slots in ((keys, live), (new, next_slots)):
             if reference is new:
                 state.append(new, next_slots)
@@ -128,6 +140,22 @@ def verify_formats():
                 errors.append((raw.view_as(reconstructed).float() - reconstructed).square().sum(dim=2))
             assert (errors[1] <= errors[0] + 1e-5).all()
     print("INT4 two-step scale fit reduces or preserves per-group reconstruction error and supports append")
+
+    for groups in (1, 2):
+        state = QuantizedKeys.from_paged(owner.plan, shuffled, table, lens, 4, groups, fp4=True)
+        state.append(new, next_slots)
+        levels = torch.tensor([0, 8, 16, 24, 32, 48, 64, 96], dtype=torch.float32, device=keys.device)
+        for raw, slots in ((keys, live), (new, next_slots)):
+            grouped = raw.float().view(raw.size(0), groups, -1)
+            scale = (grouped.abs().amax(-1).clamp_min(1e-20) / 96).bfloat16()
+            normalized = grouped / scale.float()[...,None]
+            nearest = (normalized.abs()[...,None] - levels).abs().argmin(-1)
+            expected = torch.where(normalized < 0, -levels[nearest], levels[nearest]).view_as(raw).int()
+            assert torch.equal(state.scales[slots.long()],scale)
+            assert torch.equal(read_format(state,slots),expected)
+        score, _ = state.prepare(lens, .125, 128)
+        assert torch.isfinite(score(q,gate)[:, :min(length)]).all()
+    print("FP4 E2M1 integer scoring, paged bootstrap and append passed")
 
     static = StaticExponentKeys(owner)
     compressed, _ = static.prepare(owner.lengths, .125, 128)
