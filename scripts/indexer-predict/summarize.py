@@ -91,8 +91,8 @@ def run(args):
     args.output.mkdir(parents=True, exist_ok=False)
     methods = defaultdict(list)
     with (args.output / "cells.csv").open("x") as cell_file, (args.output / "requests.csv").open("x") as req_file:
-        cell_writer = csv.DictWriter(cell_file, FIELDS)
-        req_writer = csv.DictWriter(req_file, REQUEST_FIELDS)
+        cell_writer = csv.DictWriter(cell_file, FIELDS, lineterminator="\n")
+        req_writer = csv.DictWriter(req_file, REQUEST_FIELDS, lineterminator="\n")
         cell_writer.writeheader()
         req_writer.writeheader()
         for row, requests in rows(args.inputs):
@@ -103,7 +103,7 @@ def run(args):
     with (args.output / "stages.csv").open("x") as stream:
         stage_fields = ("panel", "length_bucket", "batch", "layer", "step", "split", "M",
                         "stage", "median_us", "mad_us", "source_file", "source_line")
-        writer = csv.DictWriter(stream, stage_fields)
+        writer = csv.DictWriter(stream, stage_fields, lineterminator="\n")
         writer.writeheader()
         for source in args.inputs:
             for line, text in enumerate(source.read_text().splitlines(), 1):
@@ -124,7 +124,7 @@ def run(args):
             "mean_retained_token_fraction", "minimum_slack", "mean_true_recall",
             "mean_extra_miss_pp", "source_file", "source_line",
         )
-        writer = csv.DictWriter(stream, segment_fields)
+        writer = csv.DictWriter(stream, segment_fields, lineterminator="\n")
         writer.writeheader()
         for source in args.inputs:
             with source.open() as results:
