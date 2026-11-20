@@ -106,7 +106,7 @@ def run(args):
             cuda / "include/cccl", ROOT / ".venv/lib/python3.12/site-packages/nvidia/cu13/include",
         )))
         env["LIBRARY_PATH"] = str(cuda / "lib")
-        env["FLASHINFER_CUDA_ARCH_LIST"] = "8.6;8.9"
+        env["FLASHINFER_CUDA_ARCH_LIST"] = "8.6 8.9"
     launcher = "lookahead_quality_server.py" if quality else "capture_server.py"
     command = [
         sys.executable, str(HERE / launcher),
