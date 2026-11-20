@@ -84,3 +84,7 @@ bash scripts/indexer-predict/run_frozen.sh test data/indexer-predict/frozen-run
 `--fp16-scores --prefix-histogram-bits 9` 为匹配 `--prefix-modes` 的低位格式增加完整路径对照。评分 CTA 直接从同一批 FP16 分数累积 radix 前缀直方图。合并得到第 M−1 名所属桶，再扫描分数并压实其所属桶及更高分位置。超容量的请求走原密集选择。选中分数与原低位分数的最高分多重集合相同，截止同分可能改变逻辑 ID，所以额外覆盖损失仍须实测。与原 FlashInfer 同格式路径的配对计时由摘要导出，另报定长直方图和压实缓冲空间。
 
 `prefix_topm_audit.py --prefix-bits 9 --score-histogram --check-graph` 在真实冻结的 FP16 格式上验证融合、压实、结果与 CUDA Graph。默认冻结矩阵继续使用已登记的原选择器。
+
+## SM86 原生 INT4 评分
+
+`--native-int4 --quant-formats 4x1 --quant-tiles 128` 增加配对评分实现，可加 `--fit-int4 2` 和 `--fp16-scores`。Q 的 INT8 整数分成带符号的高半字节和无符号的低半字节，在同一缓存表示上执行两次 `m16n8k64`，再合成原整数点积。连续扫描保持原 BF16 scale、16 头归约和 FP16/FP32 输出。每条请求增加 1024 B Q 片段及一次打包 kernel，均计入全路径。逐格要求与旧 INT4 分数逐位一致，配对使用同一个 FlashInfer 选择器。FlashInfer 在同分边界可选不同逻辑位置。`nibble_scan_audit.py` 在冻结路由采用单组线性 INT4 的层步上验证两种输出格式、分数逐位一致和 CUDA Graph。该原型通过可选参数测量，冻结矩阵保持原路由。
