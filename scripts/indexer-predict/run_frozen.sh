@@ -5,7 +5,7 @@ script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 repo=$(cd "$script_dir/../.." && pwd)
 cd "$repo"
 
-stage=${1:?usage: run_frozen.sh {calibration|test} RUN_DIRECTORY [DATA_DIRECTORY]}
+stage=${1:?choose calibration or test}
 run=${2:?provide an output directory}
 data=${3:-data/indexer-predict}
 books="$data/pq-codebooks-v1"
