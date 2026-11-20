@@ -33,15 +33,17 @@ def _encode(keys, codes, planes, scales, slots,
     bounded = tl.minimum(tl.maximum(quantized, -max_code), max_code)
     if bits < 8:
         biased = bounded.to(tl.int32) + (1 << (bits - 1))
-        lo, hi = tl.split(tl.reshape(biased & 15, (block, width, 2)))
+        # The dense nibble stream stores the four most significant bits.
+        # The extra stream can then be omitted by a cheaper first-pass scan.
+        lo, hi = tl.split(tl.reshape(biased >> (bits - 4), (block, width, 2)))
         packed = (lo | (hi << 4)).to(tl.uint8)
         if bits > 4:
-            # Keep the dense nibble stream aligned and store the remaining
-            # bits separately as bytes of eight 1-bit or four 2-bit fields.
             residual_bits: tl.constexpr = bits - 4
             elements: tl.constexpr = 8 // residual_bits
             bytes_per_group: tl.constexpr = (64 // groups) // elements
-            residual = tl.reshape(biased >> 4, (block, bytes_per_group, elements))
+            residual = tl.reshape(
+                biased & ((1 << residual_bits) - 1), (block, bytes_per_group, elements),
+            )
             shifts = tl.arange(0, elements) * residual_bits
             high = tl.sum(residual << shifts[None, None, :], 2).to(tl.uint8)
             offsets = dst[:, None] * (64 // elements) + g * bytes_per_group
@@ -71,21 +73,27 @@ def _encode_query(q, q_codes, q_scales, stride: tl.constexpr, head_stride: tl.co
 
 
 @triton.jit
-def _scan(q, q_scales, k, planes, k_scales, gates, bases, lengths, out,
+def _scan(q, q_scales, k, planes, k_scales, gates, bases, lengths, mapping, out,
           gate_stride: tl.constexpr, width: tl.constexpr, scale: tl.constexpr,
-          block: tl.constexpr, bits: tl.constexpr, groups: tl.constexpr):
+          block: tl.constexpr, bits: tl.constexpr, groups: tl.constexpr,
+          sparse: tl.constexpr, coarse: tl.constexpr):
     row = tl.program_id(1)
     tile = tl.program_id(0)
     token = tile * block + tl.arange(0, block)
     length = tl.load(lengths + row)
-    if tile * block < length:
-        live = token < length
-        slot = tl.multiple_of(tl.load(bases + row), 128) + token
+    if sparse or tile * block < length:
+        if sparse:
+            logical = tl.load(mapping + row * width + token)
+        else:
+            logical = token
+        live = (logical >= 0) & (logical < length)
+        slot = tl.multiple_of(tl.load(bases + row), 128) + logical
         heads = row * 16 + tl.arange(0, 16)
         d = tl.arange(0, 64 // groups)
         low_bits: tl.constexpr = 8 if bits == 8 else 4
         row_bytes: tl.constexpr = 64 * low_bits // 8
         packed_width: tl.constexpr = row_bytes // groups
+        factor: tl.constexpr = 1 if bits <= 4 or bits == 8 else 1 << (bits - 4)
         residual_bits: tl.constexpr = bits - 4 if (bits > 4 and bits < 8) else 1
         elements: tl.constexpr = 8 // residual_bits
         bytes_per_group: tl.constexpr = (64 // groups) // elements
@@ -96,21 +104,27 @@ def _scan(q, q_scales, k, planes, k_scales, gates, bases, lengths, out,
                              mask=live[:, None], other=0)
             if bits < 8:
                 encoded = packed.to(tl.int32)
-                if bits == 4:
-                    key = tl.interleave(((encoded & 15) - 8).to(tl.int8),
-                                        ((encoded >> 4) - 8).to(tl.int8))
+                if bits == 4 or coarse:
+                    key = tl.interleave((((encoded & 15) - 8) * factor).to(tl.int8),
+                                        (((encoded >> 4) - 8) * factor).to(tl.int8))
                 else:
-                    low = tl.interleave(encoded & 15, encoded >> 4)
-                    high_offset = slot[:, None] * (64 // elements) + g * bytes_per_group
-                    high = tl.load(planes + high_offset + d[None, :] // elements,
-                                   mask=live[:, None], other=0).to(tl.int32)
-                    residual = (high >> ((d[None, :] % elements) * residual_bits))
-                    low |= (residual & ((1 << residual_bits) - 1)) << 4
-                    key = (low - (1 << (bits - 1))).to(tl.int8)
+                    main = tl.interleave(encoded & 15, encoded >> 4)
+                    offset = slot[:, None] * (64 // elements) + g * bytes_per_group
+                    extra = tl.load(planes + offset + tl.arange(0, bytes_per_group),
+                                    mask=live[:, None], other=0).to(tl.int32)
+                    shifts = tl.arange(0, elements) * residual_bits
+                    fields = (extra[:, :, None] >> shifts[None, None, :]) & ((1 << residual_bits) - 1)
+                    residual = tl.reshape(fields, (block, 64 // groups))
+                    code = (main << residual_bits) | residual
+                    key = (code - (1 << (bits - 1))).to(tl.int8)
             else:
                 key = packed
             head = tl.load(q + heads[:, None] * 64 + g * (64 // groups) + d[None, :])
             dot = tl.dot(head, tl.trans(key), out_dtype=tl.int32).to(tl.float32)
+            if coarse:
+                # Replace the missing residual by the center of its bin.
+                q_total = tl.sum(head.to(tl.int32), axis=1).to(tl.float32)
+                dot += q_total[:, None] * ((factor - 1) / 2)
             qs = tl.load(q_scales + heads * groups + g)
             ks = tl.load(k_scales + slot * groups + g, mask=live, other=0).to(tl.float32)
             total += dot * qs[:, None] * ks[None, :]
@@ -159,21 +173,37 @@ class QuantizedKeys:
             rows, self.bits, self.groups, 1, True, num_warps=2,
         )
 
-    def prepare(self, lengths, scale, block=256, warps=4, score_dtype=torch.float32):
-        width = triton.cdiv(self.plan.width, block) * block
+    def encode_query(self, q):
+        _encode_query[(self.batch, 16, self.groups)](
+            q, self.query_codes, self.query_scales, q.stride(0), q.stride(1), self.groups,
+            num_warps=2,
+        )
+
+    def prepare_scan(self, lengths, scale, block=256, warps=4, score_dtype=torch.float32,
+                     shortlist_width=None, coarse=False):
+        if shortlist_width is not None and shortlist_width % block:
+            raise ValueError("shortlist width must be divisible by the scan block size")
+        if coarse and self.bits not in (5, 6):
+            raise ValueError("coarse representation requires five or six bits")
+        width = shortlist_width or triton.cdiv(self.plan.width, block) * block
         scores = torch.empty((self.batch, width), dtype=score_dtype, device=lengths.device)
 
-        def score(q, gates):
-            _encode_query[(self.batch, 16, self.groups)](
-                q, self.query_codes, self.query_scales, q.stride(0), q.stride(1), self.groups,
-                num_warps=2,
-            )
+        def scan(gates, candidates=None):
             _scan[(width // block, self.batch)](
                 self.query_codes, self.query_scales, self.codes, self.planes, self.scales,
-                gates, self.plan.bases, lengths, scores,
-                gates.stride(0), width, scale, block, self.bits, self.groups,
-                num_warps=warps, enable_fp_fusion=False,
+                gates, self.plan.bases, lengths, lengths if candidates is None else candidates,
+                scores, gates.stride(0), width, scale, block, self.bits, self.groups,
+                shortlist_width is not None, coarse, num_warps=warps, enable_fp_fusion=False,
             )
             return scores
 
-        return score, scores.nbytes + self.query_codes.nbytes + self.query_scales.nbytes
+        return scan, scores.nbytes
+
+    def prepare(self, lengths, scale, block=256, warps=4, score_dtype=torch.float32):
+        scan, score_bytes = self.prepare_scan(lengths, scale, block, warps, score_dtype)
+
+        def score(q, gates):
+            self.encode_query(q)
+            return scan(gates)
+
+        return score, score_bytes + self.query_codes.nbytes + self.query_scales.nbytes

@@ -29,6 +29,7 @@ from bench import TRACE, Trace, load_indexer, measure_graph, page_layout
 from flashinfer import top_k_ragged_transform
 from horizonkv_layer_replay import initialize
 from lossless import StaticExponentKeys
+from progressive import prepare_progressive, validate as validate_progressive
 from projection import _normalize_heads
 from quantized import QuantizedKeys
 from refine_bench import reconstruct_layer0_input
@@ -386,6 +387,29 @@ def benchmark(replay, indexer, args, identity):
                     predicted_set_intersection=intersections(selected, gold).tolist(),
                     true_top2048_intersection=intersections(selected, target_ids).tolist(),
                 )
+        if args.progressive:
+            state = formats.get("int6_g1")
+            if state is None:
+                raise ValueError("--progressive needs --quant-formats to include 6x1")
+            reference, _ = state.prepare(lengths, scale, block=128)
+            for multiplier in args.progressive:
+                mode = f"int6_progressive_{multiplier:g}:flashinfer"
+                impl = prepare_progressive(state, q_only, lengths, scale, m, multiplier, torch.float16)
+                selected = validate_progressive(impl, reference, fast_q, fast_gate, lengths, m)
+                key_record = score_methods["int6_g1_b" + str(args.quant_tiles[0])]
+                calls[mode] = impl.call
+                logical_cols = triton.cdiv(plan.width, 128) * 128 + impl.shortlist
+                rows[mode] = dict(
+                    exact=False, baseline=False, score_equal=None,
+                    index_key_bytes=state.storage_bytes, score_dtype="torch.float16",
+                    logical_key_bytes=impl.logical_key_bytes,
+                    logical_score_write_bytes=2 * logical_cols * len(replay.lengths),
+                    workspace_bytes_before_selector=impl.graph_workspace_bytes,
+                    known_cute_workspace_bytes=None, initialize_wall_us=key_record[4],
+                    predicted_set_intersection=intersections(selected, gold).tolist(),
+                    true_top2048_intersection=intersections(selected, target_ids).tolist(),
+                    shortlist_width=impl.shortlist,
+                )
         # Ensure an identical strongest denominator is available when comparing
         # methods based on a request-local contiguous slab and direct addressing.
         exact_names = [name for name, rec in rows.items() if rec.get("baseline")]
@@ -488,6 +512,7 @@ if __name__ == "__main__":
     parser.add_argument("--exact-tiles", type=int, nargs="+", default=[128, 256])
     parser.add_argument("--fused-query", action="store_true")
     parser.add_argument("--fp16-scores", action="store_true")
+    parser.add_argument("--progressive", type=float, nargs="+")
     parser.add_argument("--segment-audit", type=int, nargs="+")
     parser.add_argument("--trials", type=int, default=11)
     parser.add_argument("--iterations", type=int, default=12)

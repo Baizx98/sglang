@@ -13,7 +13,7 @@ import statistics
 
 K = 2048
 FIELDS = (
-    "length_bucket", "batch", "layer", "step", "split", "M", "method",
+    "panel", "length_bucket", "batch", "layer", "step", "split", "M", "method",
     "status", "error", "exact", "baseline", "median_us", "mad_us", "same_layout_baseline",
     "same_layout_baseline_us", "all_baseline", "all_baseline_us", "speedup_same_layout",
     "speedup_all", "mean_true_recall", "mean_delta_pp", "worst_delta_pp",
@@ -22,7 +22,7 @@ FIELDS = (
     "total_valid_history_tokens", "logical_key_bytes", "logical_score_write_bytes", "any_bf16_cutoff_tie", "source_file", "source_line",
 )
 REQUEST_FIELDS = (
-    "length_bucket", "batch", "layer", "step", "split", "M", "method", "request",
+    "panel", "length_bucket", "batch", "layer", "step", "split", "M", "method", "request",
     "history_tokens", "exact_overlap_count", "observed_overlap_count", "extra_miss_count",
     "topm_bf16_overlap_count", "source_file", "source_line",
 )
@@ -34,7 +34,7 @@ def rows(paths):
             for line, payload in enumerate(stream, 1):
                 record = json.loads(payload)
                 prefix = dict(
-                    length_bucket=record["bucket"], batch=record["batch"],
+                    panel=source.parent.name, length_bucket=record["bucket"], batch=record["batch"],
                     layer=record["layer"], step=record["step"], split=record["split"],
                     M=record["width"], source_file=str(source), source_line=line,
                 )
@@ -99,9 +99,9 @@ def run(args):
             cell_writer.writerow(row)
             req_writer.writerows(requests)
             if requests:
-                methods[row["split"], row["M"], row["method"]].append(row)
+                methods[row["panel"], row["split"], row["M"], row["method"]].append(row)
     with (args.output / "stages.csv").open("x") as stream:
-        stage_fields = ("length_bucket", "batch", "layer", "step", "split", "M",
+        stage_fields = ("panel", "length_bucket", "batch", "layer", "step", "split", "M",
                         "stage", "median_us", "mad_us", "source_file", "source_line")
         writer = csv.DictWriter(stream, stage_fields)
         writer.writeheader()
@@ -112,22 +112,56 @@ def run(args):
                     if stage in record["methods"]:
                         continue
                     writer.writerow(dict(
-                        length_bucket=record["bucket"], batch=record["batch"], layer=record["layer"],
+                        panel=source.parent.name, length_bucket=record["bucket"], batch=record["batch"], layer=record["layer"],
                         step=record["step"], split=record["split"], M=record["width"],
                         stage=stage, median_us=timing["median_us"], mad_us=timing["mad_us"],
                         source_file=str(source), source_line=line,
                     ))
+    with (args.output / "segments.csv").open("x") as stream:
+        segment_fields = (
+            "panel", "length_bucket", "batch", "layer", "step", "split", "M",
+            "kind", "bound", "segment", "budget_fraction", "mean_skipped_token_fraction",
+            "mean_retained_token_fraction", "minimum_slack", "mean_true_recall",
+            "mean_extra_miss_pp", "source_file", "source_line",
+        )
+        writer = csv.DictWriter(stream, segment_fields)
+        writer.writeheader()
+        for source in args.inputs:
+            with source.open() as results:
+                for line, text in enumerate(results, 1):
+                    record = json.loads(text)
+                    for outcome in record.get("segment_audit", []):
+                        entry = dict(
+                            panel=source.parent.name, length_bucket=record["bucket"],
+                            batch=record["batch"], layer=record["layer"], step=record["step"],
+                            split=record["split"], M=record["width"], kind=outcome["kind"],
+                            segment=outcome["segment"], source_file=str(source), source_line=line,
+                        )
+                        if outcome["kind"] == "bound_oracle_threshold":
+                            entry.update(
+                                bound=outcome["method"], minimum_slack=outcome["minimum_slack"],
+                                mean_skipped_token_fraction=statistics.mean(outcome["skipped_token_fraction"]),
+                            )
+                        else:
+                            overlap = statistics.mean(outcome["true_top2048_intersection"])
+                            reference = statistics.mean(record["exact_candidate_intersection"])
+                            entry.update(
+                                budget_fraction=outcome["fraction"],
+                                mean_retained_token_fraction=statistics.mean(outcome["retained_token_fraction"]),
+                                mean_true_recall=overlap / K, mean_extra_miss_pp=(reference - overlap) * 100 / K,
+                            )
+                        writer.writerow(entry)
     groups = [
-        dict(split=split, M=m, method=name, cells=len(results),
+        dict(panel=panel, split=split, M=m, method=name, cells=len(results),
              speedup_same_layout=statistics.geometric_mean(row["speedup_same_layout"] for row in results),
              speedup_all=statistics.geometric_mean(row["speedup_all"] for row in results),
              mean_delta_pp=statistics.mean(row["mean_delta_pp"] for row in results),
              worst_delta_pp=max(row["worst_delta_pp"] for row in results))
-        for (split, m, name), results in sorted(methods.items())
+        for (panel, split, m, name), results in sorted(methods.items())
     ]
     provenance = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in args.inputs}
     report = dict(sources=provenance, groups=groups,
-                  aggregate="per condition geometric-mean latency ratio; separate split and M; only validated calls")
+                  aggregate="per condition geometric-mean latency ratio; separate panel, split and M; only validated calls")
     (args.output / "summary.json").write_text(json.dumps(report, indent=2) + "\n")
 
 

@@ -68,7 +68,7 @@ def read_format(state, slots):
         word = state.planes[slots.long()].int()
         fields = torch.arange(8 // width, device=word.device) * width
         high = ((word[:, :, None] >> fields) & ((1 << width) - 1)).flatten(1)
-        nibble |= high << 4
+        nibble = (nibble << width) | high
     return nibble - (1 << (state.bits - 1))
 
 
@@ -105,6 +105,13 @@ def verify_formats():
                 est += dots * q_scales[row, :, g, None] * native_scales[:, g].float()
             score = (est.bfloat16().float().mul(.125).relu() * gate[row, :, None]).sum(0)
             torch.testing.assert_close(measured[row, :n], score, atol=1e-5, rtol=1e-5)
+        if bits > 4 and bits < 8:
+            shortlist = torch.arange(128, dtype=torch.int32, device="cuda")[None, :].expand(4, -1).contiguous()
+            compressed, _ = state.prepare_scan(owner.lengths, .125, 128, shortlist_width=128)
+            state.encode_query(q)
+            assert torch.equal(compressed(gate, shortlist), measured[:, :128])
+            coarse, _ = state.prepare_scan(owner.lengths, .125, 128, coarse=True)
+            assert torch.isfinite(coarse(gate)[:, :min(length)]).all()
         print(f"INT{bits} x {groups}: packed codes, scales, append and integer-score semantics verified")
 
     static = StaticExponentKeys(owner)
