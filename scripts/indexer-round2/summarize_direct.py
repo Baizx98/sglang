@@ -2,6 +2,7 @@
 
 import argparse
 import csv
+import hashlib
 import itertools
 import json
 import statistics
@@ -9,14 +10,14 @@ from pathlib import Path
 
 from summarize_full import LAYOUTS, summarize
 
-POLICY = json.loads(Path(__file__).with_name("int4-direct-policy.json").read_text())
-METHODS = [POLICY[name] for name in ("primary", "selector_sensitivity",
-                                    "serving_projection_control", "intermediate_refinement_ablation")]
+DEFAULT_POLICY = Path(__file__).with_name("int4-direct-policy.json")
+METHOD_FIELDS = ("primary", "selector_sensitivity", "serving_projection_control",
+                 "auxiliary_projection_control", "intermediate_refinement_ablation")
 
 
-def build_summary(rows):
+def build_summary(rows, methods):
     summary = {}
-    for name in METHODS:
+    for name in methods:
         selected = [row for row in rows if row["candidate"] == name]
         if not selected:
             continue
@@ -53,19 +54,45 @@ def build_summary(rows):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("input", type=Path)
+    parser.add_argument("--policy", type=Path, default=DEFAULT_POLICY)
     args = parser.parse_args()
+    policy = json.loads(args.policy.read_text())
+    registered = policy["acceptance"]
+    methods = [policy[name] for name in METHOD_FIELDS if name in policy]
+    provenance = json.loads(args.input.with_suffix(".metadata.json").read_text())
+    policy_digest = hashlib.sha256(args.policy.read_bytes()).hexdigest()
+    if not any(Path(name).name == args.policy.name and digest == policy_digest
+               for name, digest in provenance["source_sha256"].items()):
+        raise ValueError("the submitted policy does not match the measured policy hash")
+    run_args = provenance["args"]
+    for field, recorded in (("layer", "layer"), ("decode_step", "step"),
+                            ("request_offset", "request_offset"), ("seed", "seed"),
+                            ("trials", "trials"), ("graph_iterations", "graph_iterations"),
+                            ("warmups", "warmups")):
+        if registered[field] != run_args[recorded]:
+            raise ValueError(f"{recorded} differs from the registered policy")
     cases = [json.loads(line) for line in args.input.read_text().splitlines()]
     measured = [(case["input"]["length_bucket"], case["input"]["batch"], case["input"]["physical_layout"])
                 for case in cases]
-    expected = list(itertools.product((32768, 65536, 131072), (4, 16), LAYOUTS))
+    expected = list(itertools.product(
+        registered["length_buckets"], registered["batch_sizes"], registered["source_slot_layouts"],
+    ))
     if sorted(expected) != sorted(measured):
         raise ValueError(f"expected exactly the frozen 18 cells, found {measured}")
-    rows = [row for row in summarize(cases) if row["candidate"] in METHODS]
+    rows = [row for row in summarize(cases) if row["candidate"] in methods]
     with args.input.with_suffix(".csv").open("w") as stream:
         writer = csv.DictWriter(stream, fieldnames=rows[0].keys())
         writer.writeheader()
         writer.writerows(rows)
-    payload = build_summary(rows)
+    payload = build_summary(rows, methods)
+    pair_checks = {}
+    for case in cases:
+        for methods_pair, matches in case.get("direct_pair_exact_sets", {}).items():
+            counts = pair_checks.setdefault(methods_pair, {"same_set_rows": 0, "rows": 0})
+            counts["same_set_rows"] += matches
+            counts["rows"] += case["input"]["batch"]
+    if pair_checks:
+        payload["paired_selector_and_projection"] = pair_checks
     args.input.with_suffix(".summary.json").write_text(json.dumps(payload, indent=2) + "\n")
 
 

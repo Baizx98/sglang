@@ -146,6 +146,10 @@ def benchmark_case(inputs, projections, args):
         calls["int4_direct_flashinfer_native_projection"] = direct.prepare_direct(
             inputs.project, selectors["flashinfer_topk"], scale,
         )
+        if args.direct_native_vllm:
+            calls["int4_direct_vllm_native_projection"] = direct.prepare_direct(
+                inputs.project, fixed_selector, scale,
+            )
         slab_info["int4_direct"] = {
             "bytes": direct.storage_bytes,
             "initial_encode_from_bf16_slab_wall_us": direct_wall,
@@ -174,13 +178,25 @@ def benchmark_case(inputs, projections, args):
                 match = (value >= 0) & (sorted_reference.gather(1, at) == value)
                 overlaps.append(match.sum(1).tolist())
             check["native_overlap_by_request"] = overlaps
-        return check
+        return check, result[0] if hasattr(call, "approx_scores") else None
 
     checks = {}
+    direct_outputs = {}
     projected_outputs = {name: compare_projection(native, project())
                          for name, project in projections.items()}
     for name, call in calls.items():
-        checks[name] = verify(call)
+        checks[name], result = verify(call)
+        if result is not None:
+            direct_outputs[name] = result.sort(dim=1).values
+    direct_pair_checks = {}
+    for left, right in (
+        ("int4_direct_flashinfer", "int4_direct_vllm"),
+        ("int4_direct_flashinfer", "int4_direct_flashinfer_native_projection"),
+        ("int4_direct_vllm", "int4_direct_vllm_native_projection"),
+    ):
+        if left in direct_outputs and right in direct_outputs:
+            match = (direct_outputs[left] == direct_outputs[right]).all(dim=1)
+            direct_pair_checks[f"{left}_vs_{right}"] = int(match.sum())
     timings = previous.measure_graph(
         {**calls, **stages}, args.trials, args.graph_iterations, args.seed, args.warmups,
     )
@@ -192,7 +208,7 @@ def benchmark_case(inputs, projections, args):
         "slots": previous.page_layout_stats(inputs),
         "raw_index_k_bytes": raw_cache.nbytes,
         "old_lossless_bytes": cuda_alloc, "slab": slab_info,
-        "timings": timings, "checks": checks,
+        "timings": timings, "checks": checks, "direct_pair_exact_sets": direct_pair_checks,
     }
 
 
@@ -208,6 +224,9 @@ def parse_args():
     parser.add_argument("--growth", type=int, default=64)
     parser.add_argument("--int4", action="store_true", help="also measure the approximate INT4 paths")
     parser.add_argument("--int4-direct", action="store_true", help="select directly from the INT4 scan")
+    parser.add_argument("--int4-direct-policy", type=Path,
+                        default=THIS / "int4-direct-policy.json",
+                        help="registered direct-selection policy and acceptance matrix")
     parser.add_argument("--int4-ablate-2560", action="store_true",
                         help="also measure BF16 refinement with a 2560-candidate shortlist")
     parser.add_argument("--seed", type=int, default=previous.SEED)
@@ -223,6 +242,13 @@ def main():
     args.skip_flashinfer = False
     args.flashinfer_deterministic = False
     args.ampere_cute = True
+    args.direct_native_vllm = False
+    if args.int4_direct:
+        args.int4_direct_policy = args.int4_direct_policy.resolve()
+        direct_policy = json.loads(args.int4_direct_policy.read_text())
+        args.direct_native_vllm = (
+            direct_policy["serving_projection_control"] == "int4_direct_vllm_native_projection"
+        )
     if args.output.exists():
         raise FileExistsError(args.output)
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -237,12 +263,13 @@ def main():
                THIS / "full-policy.json",
                ROUND1 / "optimize.py", ROUND1 / "bench.py", ROUND1 / "vllm_baseline.py"]
     if args.int4_direct:
-        sources.append(THIS / "int4-direct-policy.json")
+        sources.append(args.int4_direct_policy)
     metadata = {
         "args": vars(args), "gpu": str(torch.cuda.get_device_properties(0)),
         "gpu_uuid": os.environ.get("CUDA_VISIBLE_DEVICES"),
         "git": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=REPO, text=True).strip(),
-        "source_sha256": {str(p.relative_to(REPO)): hashlib.sha256(p.read_bytes()).hexdigest() for p in sources},
+        "source_sha256": {str(p.relative_to(REPO) if p.is_relative_to(REPO) else p):
+                          hashlib.sha256(p.read_bytes()).hexdigest() for p in sources},
         "torch": torch.__version__, "cuda": torch.version.cuda, "flashinfer": flashinfer_version,
         "timed_scope": "attention_input -> projections, normalization, MRoPE and Hadamard -> "
                        "write current key into the respective cache -> score all history -> select Top-2048",

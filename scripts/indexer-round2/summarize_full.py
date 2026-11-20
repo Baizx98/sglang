@@ -17,6 +17,7 @@ CANDIDATES = (
     "slab_lossless_fused_epilogue", "int4_scan_bf16_refine_4096", "int4_scan_bf16_refine_8192",
     "int4_direct_flashinfer", "int4_direct_vllm", "int4_scan_bf16_refine_2560",
     "int4_direct_flashinfer_native_projection",
+    "int4_direct_vllm_native_projection",
 )
 POLICY = json.loads(Path(__file__).with_name("full-policy.json").read_text())
 POLICY_NAMES = ("frozen_independent_layout", "frozen_unchanged_layout",

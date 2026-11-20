@@ -44,6 +44,19 @@
 
 数据位于 `data/indexer-round2/results/int4-direct-frozen/full.{jsonl,csv,summary.json,metadata.json}`。
 
+独立复验在 [int4-direct-holdout-policy.json](../int4-direct-holdout-policy.json) 固定前一矩阵更快的 vLLM 方案，B4 用 persistent，B16 用 Ampere CuTe。复验改用层 47、步 4、请求偏移 0。B4 的请求与前一矩阵分开，B16 沿用每个长度桶的全部 16 个捕获请求，改变评估层和步。原生投影加同一 vLLM 选择器作为对照。
+
+| 留出复验 | 对原布局强基线 | 对同等独立布局强基线 | 同布局 ≥1.5× 的格数 |
+| --- | ---: | ---: | ---: |
+| 固定 vLLM 直接选取，融合归一化 | 1.718× | 1.662× | 18/18 |
+| FlashInfer 直接选取，融合归一化 | 1.622× | 1.569× | 12/18 |
+| 固定 vLLM 直接选取，原生投影 | 1.418× | 1.371× | 6/18 |
+| FlashInfer 直接选取，原生投影 | 1.347× | 1.303× | 6/18 |
+
+固定 vLLM 加融合归一化的最小格加速为 1.513× 和 1.507×。128K/B16 连续槽为 259.33 µs，对照为 478.72 和 475.56 µs。该留出数据的 BF16 Top-2048 格均覆盖率为 60.531%，最低格为 57.285%，最低单请求为 54.688%，0/18 格与 BF16 全等。四条路径均在 18 格通过自身粗分选集检查，并在 180 个请求布局组合上返回同一选集。粗分误差会随层和步变化，任务质量使用独立在线生成证据。驻留的 INT4 Key 状态平均占原 BF16 Key 字节的 26.619%。
+
+复验数据位于 `data/indexer-round2/results/int4-direct-holdout/full.{jsonl,csv,summary.json,metadata.json}`。
+
 ## 周期刷新 Top-2048
 
 [periodic-policy.json](../periodic-policy.json) 使用同样 18 个输入条件，按真实步 0–4 更新每个请求的序列长度和当前 K。每个条件在同一五步窗口重测原生和第一轮无损基线，取五步均通过严格校验的最快方法。稳定的物理映射根据步 4 的容量分配，超过步 0 的位置初始清零并由逐步投影覆盖。周期 3 在步 0/3 刷新，周期 4 在步 0/4 刷新。两者的计时都包含两次完整刷新和三次复用。额外报告第一个完整周期和末尾片段。复用步仍用原生 K-only 路径写入当前 K，保留上一刷新步的逻辑 ID。图内引用已存在的设备索引，原型独立部署时每请求每层需要 8 KiB 锚点 ID。
@@ -66,6 +79,8 @@ scripts/indexer-round2/run_full.sh --int4 --output data/indexer-round2/results/f
 .venv/bin/python scripts/indexer-round2/summarize_full.py data/indexer-round2/results/full-rerun.jsonl
 scripts/indexer-round2/run_full.sh --int4-direct --int4-ablate-2560 --output data/indexer-round2/results/int4-direct-rerun/full.jsonl
 .venv/bin/python scripts/indexer-round2/summarize_direct.py data/indexer-round2/results/int4-direct-rerun/full.jsonl
+scripts/indexer-round2/run_full.sh --int4-direct --int4-direct-policy scripts/indexer-round2/int4-direct-holdout-policy.json --layer 47 --step 4 --request-offset 0 --output data/indexer-round2/results/int4-direct-holdout-rerun/full.jsonl
+.venv/bin/python scripts/indexer-round2/summarize_direct.py --policy scripts/indexer-round2/int4-direct-holdout-policy.json data/indexer-round2/results/int4-direct-holdout-rerun/full.jsonl
 INDEXER_FULL_TARGET="$PWD/scripts/indexer-round2/verify_slab.py" scripts/indexer-round2/run_full.sh
 INDEXER_FULL_TARGET="$PWD/scripts/indexer-round2/verify_direct.py" scripts/indexer-round2/run_full.sh
 INDEXER_FULL_TARGET="$PWD/scripts/indexer-round2/periodic_full.py" scripts/indexer-round2/run_full.sh --output data/indexer-round2/results/periodic-rerun.jsonl

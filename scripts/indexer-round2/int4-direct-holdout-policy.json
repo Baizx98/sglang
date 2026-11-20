@@ -1,0 +1,25 @@
+{
+  "acceptance": {
+    "length_buckets": [32768, 65536, 131072],
+    "batch_sizes": [4, 16],
+    "source_slot_layouts": ["contiguous", "shuffle_128_token_blocks", "shuffle_1_token_blocks"],
+    "layer": 47,
+    "decode_step": 4,
+    "request_offset": 0,
+    "seed": 20261014,
+    "trials": 11,
+    "graph_iterations": 12,
+    "warmups": 8
+  },
+  "primary": "int4_direct_vllm",
+  "selector_sensitivity": "int4_direct_flashinfer",
+  "serving_projection_control": "int4_direct_vllm_native_projection",
+  "auxiliary_projection_control": "int4_direct_flashinfer_native_projection",
+  "selector": {
+    "batch_4": "vLLM persistent Top-2048",
+    "batch_16": "vLLM Ampere CuTe Top-2048"
+  },
+  "designation": "Fixed vLLM won over the registered FlashInfer choice on layer-36 step-2 development data. It is tested unchanged here.",
+  "quality": "Report own coarse-score exact selection and original BF16 Top-2048 coverage independently. B16 uses the same captured request universe as the earlier matrix; the layer and step change.",
+  "scope": "Record full Indexer time, current INT4 Key encoding/writes, single INT4 slab state, same-condition original and equal-placement strongest old baselines."
+}
