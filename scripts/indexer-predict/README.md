@@ -68,3 +68,5 @@ bash scripts/indexer-predict/run_frozen.sh test data/indexer-predict/frozen-run
 ```
 
 `capture.py --quality-policy` 可用 PP2 服务运行真实长上下文 RULER 生成。请求需要实际参考答案，非空；每条以原生、精确 BF16 预测及低位预测三种模式在同一脚本上生成。策略 JSON 有 `candidate_width`、`append_reserve`、`default`、可选逐层 `layers` 和 `audit_layers`。逐层可配置 `method=native/bf16/quantized`，低位模式可给 `bits`、`groups`、`fit_steps`、`oversample`、`tile`、`half_scores`。服务实际执行候选内目标层选择并生成文本。它保留原生 BF16 Key 作实际精排，额外维持低位预测缓冲，服务时延不用于性能结论。
+
+`quality_cases.py` 用冻结路由为每个长度桶导出 RULER 生成策略及持出请求。默认每桶按 token 哈希选择一条独立请求，M3072，仅已校准的目标层启用预测。紧凑路径使用 FlashInfer 选择器，替代计时选择器在边界同分时可能产生不同候选。该配置适合实际输出的诊断，较大任务集需要单独报告。

@@ -35,9 +35,14 @@ class CompactState:
         self.lengths = history.clone()
         self.plan = Plan.from_lengths(self.lengths, POLICY["append_reserve"])
         self.reservation = int(self.plan.capacities[0])
+        codebook = None
+        if mode.get("codebook"):
+            data = torch.load(mode["codebook"], weights_only=True, map_location="cpu")
+            codebook = data["mapping"].to(buffer.device), data["packed"].to(buffer.device)
         self.key = QuantizedKeys.from_paged(
             self.plan, buffer, table, self.lengths, int(mode["bits"]),
             int(mode.get("groups", 1)), int(mode.get("fit_steps", 0)), bool(mode.get("fp4", False)),
+            codebook,
         )
         self.project = QueryProjection(indexer, 1, buffer.device)
         self.score_dtype = torch.float16 if mode.get("half_scores", False) else torch.float32
