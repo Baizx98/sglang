@@ -17,7 +17,7 @@ from flashinfer import top_k_ragged_transform
 from progressive import prepare_progressive
 from quantized import QuantizedKeys
 from query import QueryProjection
-from slab_index import IndexSlab, Plan
+from slab_index import Plan
 from sglang.srt.layers.attention.keye_topk.ampere_indexer import keye_indexer_score_paged
 from sglang.srt.layers.attention.keye_topk.keye_indexer import KeyeIndexer
 
@@ -35,8 +35,10 @@ class CompactState:
         self.lengths = history.clone()
         self.plan = Plan.from_lengths(self.lengths, POLICY["append_reserve"])
         self.reservation = int(self.plan.capacities[0])
-        raw = IndexSlab(self.plan, buffer, table, self.lengths, packed=False, exception_reserve=0)
-        self.key = QuantizedKeys(raw, int(mode["bits"]), int(mode.get("groups", 1)), int(mode.get("fit_steps", 0)))
+        self.key = QuantizedKeys.from_paged(
+            self.plan, buffer, table, self.lengths, int(mode["bits"]),
+            int(mode.get("groups", 1)), int(mode.get("fit_steps", 0)), bool(mode.get("fp4", False)),
+        )
         self.project = QueryProjection(indexer, 1, buffer.device)
         self.score_dtype = torch.float16 if mode.get("half_scores", False) else torch.float32
         self.offsets = torch.zeros_like(self.lengths)
