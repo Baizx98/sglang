@@ -36,7 +36,7 @@ case "$stage" in
         fi
         bench --capture "$data/capture-64-128k-test" --split test \
             --length 65536 131072 --batch 4 16 --output "$run/test-shorter"
-        bench --capture "$data/capture-near256-remaining" --split test \
+        bench --capture "$data/capture-near256-remaining" "$data/capture-near256-test" --split test \
             --length 262144 --batch 4 16 --output "$run/test-near256"
         "$python" "$script_dir/policy.py" test --policy "$run/policy.json" \
             --output "$run/holdout.json" --inputs \
