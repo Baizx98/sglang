@@ -114,6 +114,21 @@ def verify_formats():
             assert torch.isfinite(coarse(gate)[:, :min(length)]).all()
         print(f"INT{bits} x {groups}: packed codes, scales, append and integer-score semantics verified")
 
+    for groups in (1, 2):
+        default = QuantizedKeys(owner, 4, groups)
+        fitted = QuantizedKeys(owner, 4, groups, fit_steps=2)
+        for raw, slots in ((keys, live), (new, next_slots)):
+            if raw is new:
+                default.append(new, slots)
+                fitted.append(new, slots)
+            errors = []
+            for state in (default, fitted):
+                values = read_format(state, slots).view(-1, groups, 64 // groups).float()
+                reconstructed = values * state.scales[slots.long(), :, None].float()
+                errors.append((raw.view_as(reconstructed).float() - reconstructed).square().sum(dim=2))
+            assert (errors[1] <= errors[0] + 1e-5).all()
+    print("INT4 two-step scale fit reduces or preserves per-group reconstruction error and supports append")
+
     static = StaticExponentKeys(owner)
     compressed, _ = static.prepare(owner.lengths, .125, 128)
     oracle = torch.empty_like(compressed(q, gate))

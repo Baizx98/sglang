@@ -291,9 +291,14 @@ def benchmark(replay, indexer, args, identity):
         )
 
     formats = {}
-    for bits, groups in (tuple(map(int, name.split("x"))) for name in args.quant_formats):
-        state, code_us = timed_build(lambda: QuantizedKeys(raw, bits, groups))
-        name = f"int{bits}_g{groups}"
+    variants = [
+        (int(bits), int(groups), 0) for bits, groups in (name.split("x") for name in args.quant_formats)
+    ]
+    variants.extend((4, groups, steps) for steps in (args.fit_int4 or []) for groups in (1, 2))
+    for bits, groups, fit_steps in variants:
+        state, code_us = timed_build(lambda: QuantizedKeys(raw, bits, groups, fit_steps))
+        fit = f"fit{fit_steps}" if fit_steps else ""
+        name = f"int{bits}{fit}_g{groups}"
         formats[name] = state
         for tile in args.quant_tiles:
             dtypes = (torch.float32, torch.float16) if args.fp16_scores else (torch.float32,)
@@ -512,6 +517,7 @@ if __name__ == "__main__":
     parser.add_argument("--exact-tiles", type=int, nargs="+", default=[128, 256])
     parser.add_argument("--fused-query", action="store_true")
     parser.add_argument("--fp16-scores", action="store_true")
+    parser.add_argument("--fit-int4", type=int, choices=(1, 2, 4), nargs="+")
     parser.add_argument("--progressive", type=float, nargs="+")
     parser.add_argument("--segment-audit", type=int, nargs="+")
     parser.add_argument("--trials", type=int, default=11)

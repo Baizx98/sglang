@@ -10,7 +10,7 @@ import triton.language as tl
 @triton.jit
 def _encode(keys, codes, planes, scales, slots,
             rows: tl.constexpr, bits: tl.constexpr, groups: tl.constexpr,
-            block: tl.constexpr, append: tl.constexpr):
+            block: tl.constexpr, append: tl.constexpr, fit_steps: tl.constexpr):
     r = tl.program_id(0) * block + tl.arange(0, block)
     g = tl.program_id(1)
     d = tl.arange(0, 64 // groups)
@@ -29,6 +29,13 @@ def _encode(keys, codes, planes, scales, slots,
         valid = r < rows
     key = tl.load(keys + logical, mask=valid[:, None], other=0).to(tl.float32)
     scale = (tl.maximum(tl.max(tl.abs(key), 1), 1e-20) / max_code).to(tl.bfloat16)
+    for _ in tl.static_range(fit_steps):
+        quantized = tl.extra.cuda.libdevice.rint(tl.div_rn(key, scale.to(tl.float32)[:, None]))
+        code = tl.minimum(tl.maximum(quantized, -max_code), max_code)
+        correlation = tl.sum(key * code, 1)
+        power = tl.sum(code * code, 1)
+        optimum = tl.maximum(tl.div_rn(correlation, tl.maximum(power, 1.0)), 1.0e-20)
+        scale = tl.where(power > 0.0, optimum.to(tl.bfloat16), scale)
     quantized = tl.extra.cuda.libdevice.rint(tl.div_rn(key, scale.to(tl.float32)[:, None]))
     bounded = tl.minimum(tl.maximum(quantized, -max_code), max_code)
     if bits < 8:
@@ -137,12 +144,13 @@ def _scan(q, q_scales, k, planes, k_scales, gates, bases, lengths, mapping, out,
 
 
 class QuantizedKeys:
-    def __init__(self, raw_slab, bits, groups):
+    def __init__(self, raw_slab, bits, groups, fit_steps=0):
         if bits not in (4, 5, 6, 8) or groups not in (1, 2):
             raise ValueError("Index Key supports 4, 5, 6 or 8 bits and 1 or 2 groups")
         self.plan = raw_slab.plan
         self.bits = bits
         self.groups = groups
+        self.fit_steps = fit_steps
         self.batch = raw_slab.lengths.numel()
         device = raw_slab.lengths.device
         low_bytes = 64 if bits == 8 else 32
@@ -163,14 +171,14 @@ class QuantizedKeys:
         rows = keys.size(0)
         _encode[(triton.cdiv(rows, 32), self.groups)](
             keys, self.codes, self.planes, self.scales, self.plan.bases,
-            rows, self.bits, self.groups, 32, False, num_warps=4,
+            rows, self.bits, self.groups, 32, False, self.fit_steps, num_warps=4,
         )
 
     def append(self, keys, slots):
         rows = keys.size(0)
         _encode[(rows, self.groups)](
             keys, self.codes, self.planes, self.scales, slots,
-            rows, self.bits, self.groups, 1, True, num_warps=2,
+            rows, self.bits, self.groups, 1, True, self.fit_steps, num_warps=2,
         )
 
     def encode_query(self, q):
