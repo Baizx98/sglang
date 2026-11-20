@@ -15,6 +15,8 @@ CANDIDATES = (
     "fixed_layout_lossless_fused_epilogue", "slab_bf16", "slab_bf16_fused_norm",
     "slab_bf16_fused_epilogue", "slab_lossless", "slab_lossless_fused_norm",
     "slab_lossless_fused_epilogue", "int4_scan_bf16_refine_4096", "int4_scan_bf16_refine_8192",
+    "int4_direct_flashinfer", "int4_direct_vllm", "int4_scan_bf16_refine_2560",
+    "int4_direct_flashinfer_native_projection",
 )
 POLICY = json.loads(Path(__file__).with_name("full-policy.json").read_text())
 POLICY_NAMES = ("frozen_independent_layout", "frozen_unchanged_layout",
@@ -78,10 +80,19 @@ def summarize(data):
             details = checks[candidate]["native"]
             slabs = case["slab"]
             slab_key = "slab_lossless" if candidate.startswith("slab_lossless") else "slab_bf16"
-            allocated = slabs[slab_key] if candidate.startswith("slab") else slabs.get("int4") if candidate.startswith("int4") else None
+            if candidate.startswith("slab"):
+                allocated = slabs[slab_key]
+            elif candidate.startswith("int4_direct"):
+                allocated = slabs["int4_direct"]
+            elif candidate.startswith("int4"):
+                allocated = slabs["int4"]
+            else:
+                allocated = None
             projection = ("fused_epilogue" if candidate.endswith("fused_epilogue")
                           else "fused_norm"
-                          if candidate.endswith("fused_norm") or candidate.startswith("int4") else None)
+                          if candidate.endswith("fused_norm") or (
+                              candidate.startswith("int4") and not candidate.endswith("native_projection")
+                          ) else None)
             proj_check = case["projection_check"][projection] if projection else None
             case_rows[candidate] = {
                 "length_bucket": metadata["length_bucket"], "batch": metadata["batch"],
@@ -89,8 +100,13 @@ def summarize(data):
                 "exact": exact(checks[candidate]),
                 "all_native_sets_equal": all(result["set_overlap"] == result["total_selected"]
                                              for result in details),
+                "coarse_topk_exact": all(item["valid"] for item in checks[candidate]["coarse_topk"])
+                if "coarse_topk" in checks[candidate] else None,
                 "topk_overlap": min(result["set_overlap"] / result["total_selected"]
                                     for result in details),
+                "worst_request_overlap": min(min(values) / 2048
+                                             for values in checks[candidate]["native_overlap_by_request"])
+                if "native_overlap_by_request" in checks[candidate] else None,
                 "strict_missed": max(report["missing_strictly_above_threshold"] for report in details),
                 "native_name": native, "native_us": values[native],
                 "tuned_original_name": tuned, "tuned_original_us": values[tuned],
@@ -107,6 +123,8 @@ def summarize(data):
                 "raw_index_bytes": case["raw_index_k_bytes"],
                 "slab_resident_bytes": allocated["bytes"] if allocated else None,
                 "slab_init_wall_us": allocated.get("initial_build_wall_median_us") if allocated else None,
+                "workspace_bytes_before_selector": allocated.get("workspace_bytes_before_selector")
+                if allocated else None,
                 "native_project_us": values["project_native"],
                 "candidate_project_us": values[f"project_{projection or 'native'}"],
                 "query_different_bf16": proj_check["query"]["different_bf16"] if proj_check else 0,

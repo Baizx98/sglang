@@ -1,4 +1,4 @@
-"""Approximate full scan of 4-bit codes, followed by exact BF16 candidate scoring."""
+"""Approximate full scan of 4-bit codes with optional BF16 candidate scoring."""
 
 from __future__ import annotations
 
@@ -112,7 +112,7 @@ def _refine(
 
 
 class Int4Scan:
-    def __init__(self, raw_slab, packed_slab):
+    def __init__(self, raw_slab, packed_slab=None):
         self.plan = raw_slab.plan
         self.lengths = raw_slab.lengths
         self.packed_slab = packed_slab
@@ -132,19 +132,16 @@ class Int4Scan:
 
     @property
     def storage_bytes(self):
-        return self.packed_slab.storage_bytes + self.key_codes.nbytes + self.key_scales.nbytes
+        if self.packed_slab is None:
+            supporting_bytes = self.plan.bases.nbytes + self.plan.capacities.nbytes
+        else:
+            supporting_bytes = self.packed_slab.storage_bytes
+        return supporting_bytes + self.key_codes.nbytes + self.key_scales.nbytes
 
-    def prepare(self, project, scale, candidate_k):
-        from flashinfer import top_k_page_table_transform, top_k_ragged_transform
-
-        if min(self.lengths.tolist()) < candidate_k:
-            raise ValueError("this prototype assumes every active row has at least candidate_k tokens")
+    def prepare_coarse(self, scale):
         block = 256
         width = triton.cdiv(self.plan.width, block) * block
         scores = torch.empty((self.batch, width), dtype=torch.float32, device=self.lengths.device)
-        fine = torch.empty((self.batch, candidate_k), dtype=torch.float32, device=self.lengths.device)
-        fine_lens = torch.full_like(self.lengths, candidate_k)
-        keys, capacity = self.packed_slab.buffers()
 
         def coarse(q, k, gates):
             _prepare_step[(self.batch, 17)](
@@ -158,6 +155,33 @@ class Int4Scan:
                 num_warps=4,
             )
             return scores
+
+        return coarse, scores
+
+    def prepare_direct(self, project, selector, scale):
+        """Return logical Top-2048 from the approximate scores; keep only INT4 keys."""
+        if self.packed_slab is not None:
+            raise ValueError("direct selection must not retain an exact Key representation")
+        coarse, scores = self.prepare_coarse(scale)
+
+        def call():
+            return selector(coarse(*project()))
+
+        call.approx_scores = scores
+        call.workspace_bytes = scores.nbytes + self.query_codes.nbytes + self.query_scales.nbytes
+        return call
+
+    def prepare(self, project, scale, candidate_k):
+        from flashinfer import top_k_page_table_transform, top_k_ragged_transform
+
+        if self.packed_slab is None:
+            raise ValueError("BF16 refinement requires a persistent exact Key representation")
+        if min(self.lengths.tolist()) < candidate_k:
+            raise ValueError("this prototype assumes every active row has at least candidate_k tokens")
+        fine = torch.empty((self.batch, candidate_k), dtype=torch.float32, device=self.lengths.device)
+        fine_lens = torch.full_like(self.lengths, candidate_k)
+        keys, capacity = self.packed_slab.buffers()
+        coarse, _ = self.prepare_coarse(scale)
 
         def call():
             q, k, gates = project()

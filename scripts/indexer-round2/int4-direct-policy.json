@@ -1,0 +1,24 @@
+{
+  "acceptance": {
+    "length_buckets": [32768, 65536, 131072],
+    "batch_sizes": [4, 16],
+    "source_slot_layouts": ["contiguous", "shuffle_128_token_blocks", "shuffle_1_token_blocks"],
+    "layer": 36,
+    "decode_step": 2,
+    "request_offset": 8,
+    "seed": 20261014,
+    "trials": 11,
+    "graph_iterations": 12,
+    "warmups": 8
+  },
+  "primary": "int4_direct_flashinfer",
+  "selector_sensitivity": "int4_direct_vllm",
+  "serving_projection_control": "int4_direct_flashinfer_native_projection",
+  "intermediate_refinement_ablation": "int4_scan_bf16_refine_2560",
+  "projection": "fused norms after the same BF16 GEMM, with original MRoPE and Hadamard",
+  "keys": "one independent logical slab, 32 B INT4 codes and 2 B BF16 scale per reserved key. Encode and append current projected K during each step.",
+  "query": "INT8 per-head max-abs scaling, using the same quantizer as the reranking route",
+  "selection": "FlashInfer ragged Top-2048 on the approximate full scores, or fixed vLLM persistent B4 / Ampere CuTe B16 for the selector sensitivity",
+  "baseline_scope": "fastest correct SGLang, tuned dense and first-round lossless across old slot layouts, and their re-measured independent-slab counterparts",
+  "scope": "complete layer Indexer from attention_input to Top-2048, excluding admission and including current key writes. Selection recall and output validity are retained for every cell."
+}

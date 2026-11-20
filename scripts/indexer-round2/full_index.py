@@ -124,14 +124,35 @@ def benchmark_case(inputs, projections, args):
         calls[f"same_placement_old_lossless_{name}"] = lossless.prepare_packed_full(
             q, slab_raw, slab_pages, weights, lengths, scale, inputs.project, select,
         )
-    if args.int4:
+    if args.int4 or args.int4_ablate_2560:
         compact, wall = steady_init(lambda: Int4Scan(slabs[False], slabs[True]))
         slab_info["int4"] = {"bytes": compact.storage_bytes, "additional_encode_wall_us": wall}
-        for candidate_k in (4096, 8192):
+        candidate_sizes = [4096, 8192] if args.int4 else []
+        if args.int4_ablate_2560:
+            candidate_sizes.append(2560)
+        for candidate_k in candidate_sizes:
             call, coarse = compact.prepare(projections["fused_norm"], scale, candidate_k)
             calls[f"int4_scan_bf16_refine_{candidate_k}"] = call
             if candidate_k == 4096:
                 stages["int4_quantize_and_scan"] = lambda coarse=coarse: coarse(*native)
+    if args.int4_direct:
+        direct, direct_wall = steady_init(lambda: Int4Scan(slabs[False]))
+        calls["int4_direct_flashinfer"] = direct.prepare_direct(
+            projections["fused_norm"], selectors["flashinfer_topk"], scale,
+        )
+        calls["int4_direct_vllm"] = direct.prepare_direct(
+            projections["fused_norm"], fixed_selector, scale,
+        )
+        calls["int4_direct_flashinfer_native_projection"] = direct.prepare_direct(
+            inputs.project, selectors["flashinfer_topk"], scale,
+        )
+        slab_info["int4_direct"] = {
+            "bytes": direct.storage_bytes,
+            "initial_encode_from_bf16_slab_wall_us": direct_wall,
+            "initial_build_wall_median_us": statistics.median(direct_wall)
+            + slab_info["slab_bf16"]["initial_build_wall_median_us"],
+            "workspace_bytes_before_selector": calls["int4_direct_flashinfer"].workspace_bytes,
+        }
 
     def verify(call):
         result = [call().clone() for _ in range(3)]
@@ -141,6 +162,18 @@ def benchmark_case(inputs, projections, args):
         }
         if hasattr(call, "last_overflow"):
             check["overflow_rows"] = int(call.last_overflow.sum())
+        if hasattr(call, "approx_scores"):
+            approximate = previous.torch_select(call.approx_scores)
+            check["coarse_topk"] = [previous.assess(value, call.approx_scores, approximate)
+                                    for value in result]
+            sorted_reference = native_ids.sort(dim=-1).values
+            width = sorted_reference.shape[1]
+            overlaps = []
+            for value in result:
+                at = torch.searchsorted(sorted_reference, value.contiguous()).clamp_max(width - 1)
+                match = (value >= 0) & (sorted_reference.gather(1, at) == value)
+                overlaps.append(match.sum(1).tolist())
+            check["native_overlap_by_request"] = overlaps
         return check
 
     checks = {}
@@ -174,6 +207,9 @@ def parse_args():
     parser.add_argument("--request-offset", type=int, default=8)
     parser.add_argument("--growth", type=int, default=64)
     parser.add_argument("--int4", action="store_true", help="also measure the approximate INT4 paths")
+    parser.add_argument("--int4-direct", action="store_true", help="select directly from the INT4 scan")
+    parser.add_argument("--int4-ablate-2560", action="store_true",
+                        help="also measure BF16 refinement with a 2560-candidate shortlist")
     parser.add_argument("--seed", type=int, default=previous.SEED)
     parser.add_argument("--trials", type=int, default=11)
     parser.add_argument("--graph-iterations", type=int, default=12)
@@ -200,6 +236,8 @@ def main():
     sources = [Path(__file__), THIS / "slab_index.py", THIS / "projection.py", THIS / "int4_scan.py",
                THIS / "full-policy.json",
                ROUND1 / "optimize.py", ROUND1 / "bench.py", ROUND1 / "vllm_baseline.py"]
+    if args.int4_direct:
+        sources.append(THIS / "int4-direct-policy.json")
     metadata = {
         "args": vars(args), "gpu": str(torch.cuda.get_device_properties(0)),
         "gpu_uuid": os.environ.get("CUDA_VISIBLE_DEVICES"),

@@ -27,6 +27,23 @@
 
 4096 档在 18 格几何平均加速为 1.254×，最差一格保留 98.926% 的原选集，0/18 格精确。128K/B16 连续槽 307.63 µs，原布局最快基线 476.84 µs，约 1.550×。8192 档为 1.166×，最差一格覆盖率 99.982%，9/18 格精确。两档均按有损路线报告。任务质量另由实际生成验证。
 
+### 直接选择 INT4 分数
+
+[int4-direct-policy.json](../int4-direct-policy.json) 固定使用相同的 18 格、INT4/INT8 量化规则和带归一化融合的投影。每步在计算当前 Q 的 INT8 码时写入当前 K 的 INT4 码和 BF16 缩放因子。完整历史扫描后直接从粗分选择逻辑 Top-2048。主策略用 FlashInfer 的 ragged Top-K，与在线任务测试使用同一选择器。预设消融改用 B4 的 vLLM persistent 和 B16 的 Ampere CuTe。2560 候选消融使用原生 BF16 公式精排。
+
+直接路径持久状态为每预留槽 34 B，加每请求 8 B 的起始偏移和容量。BF16 所有历史 K 只在从已有缓存初始化时参与编码，稳态省去为二次精排准备的精确表示。Q 的 INT8 工作区、粗分和选择器工作区另计。每格校验从粗分返回的结果和原生 BF16 Top-2048，比较原有物理布局及同样允许独立布局的最快正确强基线。
+
+| 路径 | 对原布局强基线 | 对同等独立布局强基线 | BF16 选集最低格覆盖率 | 对自身粗分选择正确 |
+| --- | ---: | ---: | ---: | ---: |
+| FlashInfer 直接选取，融合归一化 | 1.610× | 1.556× | 83.899% | 18/18 |
+| 固定 vLLM 直接选取，融合归一化 | 1.723× | 1.665× | 83.899% | 18/18 |
+| FlashInfer 直接选取，原生投影 | 1.338× | 1.293× | 83.899% | 18/18 |
+| INT4 选 2560 候选后 BF16 精排 | 1.301× | 1.257× | 91.833% | 未测 |
+
+直接选取三条路径的原生 BF16 选集最低单请求覆盖率均为 82.129%，平均格覆盖率 84.394%。相对最强原布局基线，FlashInfer 主路径 12/18 格达到 1.5×，固定 vLLM 为 17/18。128K/B16 连续槽的 FlashInfer 直选为 261.97 µs，最强原布局基线和同布局基线分别为 478.04 和 470.78 µs。单层 Index Key 驻留由 267.17 MB 降至 71.03 MB，粗分及 Q 量化工作区占 8.39 MB，选择器工作区另计。全矩阵 INT4 驻留的平均比例为 26.62%。已有 BF16 表示重排与 INT4 初始化两项中位数之和为 0.178–1.737 ms。已实测 CUDA Graph 重放能编码并写入新的当前 K，码和缩放因子与完整重新编码一致。
+
+数据位于 `data/indexer-round2/results/int4-direct-frozen/full.{jsonl,csv,summary.json,metadata.json}`。
+
 ## 周期刷新 Top-2048
 
 [periodic-policy.json](../periodic-policy.json) 使用同样 18 个输入条件，按真实步 0–4 更新每个请求的序列长度和当前 K。每个条件在同一五步窗口重测原生和第一轮无损基线，取五步均通过严格校验的最快方法。稳定的物理映射根据步 4 的容量分配，超过步 0 的位置初始清零并由逐步投影覆盖。周期 3 在步 0/3 刷新，周期 4 在步 0/4 刷新。两者的计时都包含两次完整刷新和三次复用。额外报告第一个完整周期和末尾片段。复用步仍用原生 K-only 路径写入当前 K，保留上一刷新步的逻辑 ID。图内引用已存在的设备索引，原型独立部署时每请求每层需要 8 KiB 锚点 ID。
@@ -47,7 +64,10 @@
 ```bash
 scripts/indexer-round2/run_full.sh --int4 --output data/indexer-round2/results/full-rerun.jsonl
 .venv/bin/python scripts/indexer-round2/summarize_full.py data/indexer-round2/results/full-rerun.jsonl
+scripts/indexer-round2/run_full.sh --int4-direct --int4-ablate-2560 --output data/indexer-round2/results/int4-direct-rerun/full.jsonl
+.venv/bin/python scripts/indexer-round2/summarize_direct.py data/indexer-round2/results/int4-direct-rerun/full.jsonl
 INDEXER_FULL_TARGET="$PWD/scripts/indexer-round2/verify_slab.py" scripts/indexer-round2/run_full.sh
+INDEXER_FULL_TARGET="$PWD/scripts/indexer-round2/verify_direct.py" scripts/indexer-round2/run_full.sh
 INDEXER_FULL_TARGET="$PWD/scripts/indexer-round2/periodic_full.py" scripts/indexer-round2/run_full.sh --output data/indexer-round2/results/periodic-rerun.jsonl
 .venv/bin/python scripts/indexer-round2/summarize_periodic.py data/indexer-round2/results/periodic-rerun.jsonl
 ```
