@@ -221,18 +221,20 @@ def benchmark(replay, indexer, args, identity, previous_replay=None, codebook=No
     bf16, _ = prepare_slab_score(raw, scale, 128, 4)
     q_only_native = predictor_projection(indexer, replay.hidden, replay.positions)
     q_only_fused = predictor_projection(indexer, replay.hidden, replay.positions, fused=True)
-    q_only = q_only_fused if args.fused_query else q_only_native
 
     def legacy_projection():
         q, _, gate = indexer._get_q_k_w_bf16(replay.hidden, replay.positions, False)
         return q, gate
 
     default_q, default_gate = legacy_projection()
-    fast_q, fast_gate = q_only()
-    if not torch.equal(default_q, fast_q) or not torch.equal(default_gate, fast_gate):
-        raise RuntimeError("the selected Q-only projection changed Q or gate")
+    native_q, native_gate = q_only_native()
+    if not torch.equal(default_q, native_q) or not torch.equal(default_gate, native_gate):
+        raise RuntimeError("the Q-only projection changed Q or gate")
     fused_q, fused_gate = q_only_fused()
     fused_projection_exact = torch.equal(default_q, fused_q) and torch.equal(default_gate, fused_gate)
+    use_fused_projection = args.fused_query and fused_projection_exact
+    q_only = q_only_fused if use_fused_projection else q_only_native
+    fast_q, fast_gate = (fused_q, fused_gate) if use_fused_projection else (native_q, native_gate)
 
     def native(q, gate):
         return keye_indexer_score_paged(q, slots, pages, gate, lengths, scale)
@@ -420,7 +422,7 @@ def benchmark(replay, indexer, args, identity, previous_replay=None, codebook=No
             if [n + 1 for n in previous_replay.lengths] != replay.lengths:
                 raise ValueError("temporal scoring needs consecutive captured states")
             prev_q, prev_gate = predictor_projection(
-                indexer, previous_replay.hidden, previous_replay.positions, fused=args.fused_query,
+                indexer, previous_replay.hidden, previous_replay.positions,
             )()
             key_record = score_methods["int6_g1_b" + str(args.quant_tiles[0])]
             quantized_bytes = 8 * state.bits + 2 * state.groups
@@ -458,7 +460,7 @@ def benchmark(replay, indexer, args, identity, previous_replay=None, codebook=No
             exact_topm_ties=ties.tolist(), exact_candidate_intersection=gold_recall,
             fastest_bf16=best, fastest_equal_layout_bf16=matched,
             static12_active_exception_rows=static.exception_count,
-            fused_projection_exact=fused_projection_exact, fused_projection_selected=args.fused_query,
+            fused_projection_exact=fused_projection_exact, fused_projection_selected=use_fused_projection,
             methods=rows, timings=timings,
         )
         if args.segment_audit:

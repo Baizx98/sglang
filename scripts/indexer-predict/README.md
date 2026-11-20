@@ -51,8 +51,20 @@ INDEXER_FULL_TARGET="$PWD/scripts/indexer-predict/benchmark.py" \
 
 `--fit-int4 2` 比较在编码时拟合两轮最小平方尺度的 INT4 单组和双组，评分同普通 INT4。开启 `--progressive 1.25 1.5 2` 后，从 INT6 的高 4 位生成初选，再只读取入围位置的额外两位重评分。两次选择均计入。需要在 `--quant-formats` 中包含 `6x1`。加 `--exact-tuning` 可以对比掩码解码和 L2 缓存修饰符。无损停用任何造成预测集合差异的路径。
 
+`--fp4` 测试 E2M1。用 `pq_fit.py` 在校准输入上拟合 256 个共享二维码字，`--pair-pq` 测试 34 B/token（32 B 码字＋2 B scale）的表示。评分时读取 512 B 码本，把每个码字还原为两个 INT8 分量再计算点积。编码额外使用 64 KiB 查找表。`codec_coverage.py` 可比较格式对真实任务候选的影响，且不记录性能。`--direct-paged-build` 直接把真实物理页转成紧凑缓存，初始化不分配中间 BF16 slab。
+
 `temporal_oracle.py --rolling` 使用真实相邻步，给出上一轮阈值及段筛查的离线诊断，并检验只更新被评分段时的滚动误差。性能回放的 `--temporal 0.25 0.5 --temporal-segments 32` 使用已准备的真实上一轮段分数作为状态，在保留段上用**当前** Q 重扫。部分刷新与全扫刷新各自计时，完整周期的性能需按实际刷新次数核算。时间路由和全历史量化路由分别报告。
 
 `policy.py freeze` 只读取校准结果，按长度、层和 M 固定方法。用 `policy.py test` 检查预先指定的 held-out batch/step 矩阵和请求不重叠，再报告加速及额外漏项。试验门槛默认是额外漏项均值 ≤1 pp 与 P95 ≤3 pp。两个门槛都属于同状态候选覆盖，服务任务结果另计。
+
+采集结束且 A6000 空闲后，按以下顺序运行冻结矩阵。两次运行共用同一个输出根目录和实际码本。此项每格同时对拍 Q-only 融合，逐位一致时分子分母共用融合，否则共用原生 Q-only。
+
+```sh
+.venv/bin/python scripts/indexer-predict/pq_fit.py \
+  --capture data/indexer-predict/capture-64-128k-calibration \
+  --output data/indexer-predict/pq-codebooks-v1
+bash scripts/indexer-predict/run_frozen.sh calibration data/indexer-predict/frozen-run
+bash scripts/indexer-predict/run_frozen.sh test data/indexer-predict/frozen-run
+```
 
 `capture.py --quality-policy` 可用 PP2 服务运行真实长上下文 RULER 生成。请求需要实际参考答案，非空；每条以原生、精确 BF16 预测及低位预测三种模式在同一脚本上生成。策略 JSON 有 `candidate_width`、`append_reserve`、`default`、可选逐层 `layers` 和 `audit_layers`。逐层可配置 `method=native/bf16/quantized`，低位模式可给 `bits`、`groups`、`fit_steps`、`oversample`、`tile`、`half_scores`。服务实际执行候选内目标层选择并生成文本。它保留原生 BF16 Key 作实际精排，额外维持低位预测缓冲，服务时延不用于性能结论。
