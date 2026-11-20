@@ -157,6 +157,32 @@ def verify_formats():
         assert torch.isfinite(score(q,gate)[:, :min(length)]).all()
     print("FP4 E2M1 integer scoring, paged bootstrap and append passed")
 
+    coords = torch.arange(256, device=keys.device)
+    encoder = ((coords[:, None] >> 4) * 16 + (coords[None, :] >> 4)).flatten().byte()
+    decoder = (((coords >> 4) * 16 - 120).bitwise_and(255)
+               | (((coords & 15) * 16 - 120).bitwise_and(255) << 8)).short()
+    state = QuantizedKeys.from_paged(owner.plan, shuffled, table, lens, 4, 1,
+                                     codebook=(encoder, decoder))
+    state.append(new, next_slots)
+    for raw, slots in ((keys, live), (new, next_slots)):
+        scale = (raw.float().abs().amax(-1).clamp_min(1e-20) / 127).bfloat16()
+        ix = (raw.float() / scale.float()[:, None]).round().clamp(-127, 127).int() + 128
+        ix = ix.view(ix.size(0), 32, 2)
+        assert torch.equal(state.scales[slots.long(), 0], scale)
+        assert torch.equal(state.codes[slots.long()], encoder[ix[..., 0] * 256 + ix[..., 1]])
+    score, _ = state.prepare(lens, .125, 128)
+    result = score(q, gate)
+    for row, n in enumerate(length):
+        ids = (owner.plan.bases[row] + torch.arange(n, device=keys.device)).long()
+        pairs = decoder[state.codes[ids].long()].int()
+        codes = torch.stack((pairs.byte().view(torch.int8), (pairs >> 8).to(torch.int8)), -1)
+        q_codes = state.query_codes[row].float()
+        products = (q_codes @ codes.flatten(1).float().T) * state.query_scales[row]
+        logits = (products * state.scales[ids, 0].float()).bfloat16().float()
+        expected = (logits.mul(.125).relu() * gate[row, :, None]).sum(0)
+        torch.testing.assert_close(result[row, :n], expected, atol=1e-5, rtol=1e-5)
+    print("Pairwise PQ paged bootstrap, append and decoded integer scoring passed")
+
     static = StaticExponentKeys(owner)
     compressed, _ = static.prepare(owner.lengths, .125, 128)
     oracle = torch.empty_like(compressed(q, gate))

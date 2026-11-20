@@ -204,7 +204,7 @@ def timed_build(factory):
     return storage, statistics.median(samples)
 
 
-def benchmark(replay, indexer, args, identity, previous_replay=None):
+def benchmark(replay, indexer, args, identity, previous_replay=None, codebook=None):
     scale = indexer.softmax_scale
     reference_width = max(replay.lengths) + 1
     width = triton.cdiv(reference_width, 256) * 256
@@ -274,23 +274,26 @@ def benchmark(replay, indexer, args, identity, previous_replay=None):
 
     formats = {}
     variants = [
-        (int(bits), int(groups), 0, False)
+        (int(bits), int(groups), 0, False, None)
         for bits, groups in (name.split("x") for name in args.quant_formats)
     ]
-    variants.extend((4, groups, steps, False) for steps in (args.fit_int4 or []) for groups in (1, 2))
+    variants.extend((4, groups, steps, False, None)
+                    for steps in (args.fit_int4 or []) for groups in (1, 2))
     if args.fp4:
-        variants.extend((4, groups, 0, True) for groups in (1, 2))
-    for bits, groups, fit_steps, fp4 in variants:
+        variants.extend((4, groups, 0, True, None) for groups in (1, 2))
+    if codebook is not None:
+        variants.append((4, 1, 0, False, codebook))
+    for bits, groups, fit_steps, fp4, table in variants:
         if args.direct_paged_build:
             state, code_us = timed_build(lambda: QuantizedKeys.from_paged(
-                plan, slots, pages, lengths, bits, groups, fit_steps, fp4,
+                plan, slots, pages, lengths, bits, groups, fit_steps, fp4, table,
             ))
             initialization_us = code_us
         else:
-            state, code_us = timed_build(lambda: QuantizedKeys(raw, bits, groups, fit_steps, fp4))
+            state, code_us = timed_build(lambda: QuantizedKeys(raw, bits, groups, fit_steps, fp4, table))
             initialization_us = build_us + code_us
         fit = f"fit{fit_steps}" if fit_steps else ""
-        codec = "fp" if fp4 else "int"
+        codec = "pq" if table is not None else "fp" if fp4 else "int"
         name = f"{codec}{bits}{fit}_g{groups}"
         formats[name] = state
         for tile in args.quant_tiles:
@@ -298,7 +301,9 @@ def benchmark(replay, indexer, args, identity, previous_replay=None):
             for dtype in dtypes:
                 scorer, workspace = state.prepare(lengths, scale, tile, score_dtype=dtype)
                 output_name = f"{name}_b{tile}" + ("_f16" if dtype == torch.float16 else "")
-                logical_key_bytes[output_name] = tokens * (8 * bits + 2 * groups)
+                logical_key_bytes[output_name] = (
+                    tokens * (8 * bits + 2 * groups) + (table[1].nbytes if table is not None else 0)
+                )
                 score_methods[output_name] = (
                     scorer, workspace, False, state.storage_bytes, initialization_us,
                 )
@@ -330,7 +335,7 @@ def benchmark(replay, indexer, args, identity, previous_replay=None):
         calls, rows = {"legacy_full_sorted": legacy}, {}
         for name, (score, workspace, exact, storage, init_us) in score_methods.items():
             actual_scores = score(fast_q, fast_gate).clone()
-            baseline = name == "paged" or name.startswith(("bf16_", "lossless12"))
+            baseline = exact
             # Ignore padding beyond the common score domain.
             score_equal = (
                 torch.equal(actual_scores[:, :width], native_scores)
@@ -442,7 +447,7 @@ def benchmark(replay, indexer, args, identity, previous_replay=None):
         # Ensure an identical strongest denominator is available when comparing
         # methods based on a request-local contiguous slab and direct addressing.
         exact_names = [name for name, rec in rows.items() if rec.get("baseline")]
-        same_layout = [name for name in exact_names if name.startswith(("bf16_", "lossless12:"))]
+        same_layout = [name for name in exact_names if not name.startswith("paged:")]
         if not same_layout:
             raise RuntimeError("no validated BF16 implementation in the equal-layout denominator")
         timings = measure_graph(calls | staged, args.trials, args.iterations, args.seed, args.warmups)
@@ -479,6 +484,7 @@ def enforce_exclusive_gpu():
 def metadata(args):
     sources = [*HERE.glob("*.py"),
                ROOT / "scripts/indexer-round2/slab_index.py", ROOT / "scripts/indexer-optimization/optimize.py"]
+    books = [args.pair_pq / f"l{layer:02}.pt" for layer in args.layers] if args.pair_pq else []
     return dict(
         arguments={k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
         torch=torch.__version__, cuda=torch.version.cuda, triton=triton.__version__,
@@ -489,6 +495,7 @@ def metadata(args):
         ], text=True).splitlines()[0].strip(),
         git=subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
         source_sha256={p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in sources},
+        codebook_sha256={str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in books},
         scope="real previous-layer hidden state to M logical candidates; historical keys only; no prediction K or append",
         initialization="synchronized wall time, one untimed build and three timed repeats",
     )
@@ -506,6 +513,10 @@ def run(args):
     with (args.output / "results.jsonl").open("x") as stream:
         for layer in args.layers:
             indexer = load_indexer(layer)
+            codebook = None
+            if args.pair_pq is not None:
+                trained = torch.load(args.pair_pq / f"l{layer:02}.pt", weights_only=True)
+                codebook = trained["mapping"].cuda(), trained["packed"].cuda()
             for bucket, batch, step in itertools.product(args.length, args.batch, args.steps):
                 identity = dict(bucket=bucket, batch=batch, layer=layer, step=step, split=args.split)
                 if old is not None:
@@ -520,7 +531,7 @@ def run(args):
                         raise ValueError("temporal benchmark needs a capture and a positive step")
                     previous = captured.load(bucket, args.split, batch, layer, step - 1, args.offset)
                 enforce_exclusive_gpu()
-                for row in benchmark(replay, indexer, args, identity, previous):
+                for row in benchmark(replay, indexer, args, identity, previous, codebook):
                     enforce_exclusive_gpu()
                     stream.write(json.dumps(row) + "\n")
                     stream.flush()
@@ -549,6 +560,7 @@ if __name__ == "__main__":
     parser.add_argument("--fused-query", action="store_true")
     parser.add_argument("--fp16-scores", action="store_true")
     parser.add_argument("--fp4", action="store_true")
+    parser.add_argument("--pair-pq", type=Path)
     parser.add_argument("--direct-paged-build", action="store_true")
     parser.add_argument("--fit-int4", type=int, choices=(1, 2, 4), nargs="+")
     parser.add_argument("--temporal", type=float, nargs="+")
