@@ -139,6 +139,9 @@ def verify_formats():
         num_warps=4,
     )
     assert torch.equal(oracle, compressed(q, gate))
+    for cache in ("", ".cg"):
+        branchless, _ = static.prepare(owner.lengths, .125, 128, branched=False, cache_modifier=cache)
+        assert torch.equal(oracle, branchless(q, gate))
     print("Static exponent scores match the same-layout raw BF16 scorer")
 
 

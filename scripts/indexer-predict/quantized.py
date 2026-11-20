@@ -83,13 +83,16 @@ def _encode_query(q, q_codes, q_scales, stride: tl.constexpr, head_stride: tl.co
 def _scan(q, q_scales, k, planes, k_scales, gates, bases, lengths, mapping, out,
           gate_stride: tl.constexpr, width: tl.constexpr, scale: tl.constexpr,
           block: tl.constexpr, bits: tl.constexpr, groups: tl.constexpr,
-          sparse: tl.constexpr, coarse: tl.constexpr):
+          mapping_kind: tl.constexpr, coarse: tl.constexpr):
     row = tl.program_id(1)
     tile = tl.program_id(0)
     token = tile * block + tl.arange(0, block)
     length = tl.load(lengths + row)
-    if sparse or tile * block < length:
-        if sparse:
+    if mapping_kind != 0 or tile * block < length:
+        if mapping_kind == 2:
+            segment = tl.load(mapping + row * (width // block) + tile)
+            logical = segment * block + tl.arange(0, block)
+        elif mapping_kind == 1:
             logical = tl.load(mapping + row * width + token)
         else:
             logical = token
@@ -188,20 +191,23 @@ class QuantizedKeys:
         )
 
     def prepare_scan(self, lengths, scale, block=256, warps=4, score_dtype=torch.float32,
-                     shortlist_width=None, coarse=False):
+                     shortlist_width=None, coarse=False, block_selection=False):
         if shortlist_width is not None and shortlist_width % block:
             raise ValueError("shortlist width must be divisible by the scan block size")
+        if block_selection and shortlist_width is None:
+            raise ValueError("block selection requires a compact shortlist width")
         if coarse and self.bits not in (5, 6):
             raise ValueError("coarse representation requires five or six bits")
         width = shortlist_width or triton.cdiv(self.plan.width, block) * block
         scores = torch.empty((self.batch, width), dtype=score_dtype, device=lengths.device)
+        mapping_kind = 2 if block_selection else int(shortlist_width is not None)
 
         def scan(gates, candidates=None):
             _scan[(width // block, self.batch)](
                 self.query_codes, self.query_scales, self.codes, self.planes, self.scales,
                 gates, self.plan.bases, lengths, lengths if candidates is None else candidates,
                 scores, gates.stride(0), width, scale, block, self.bits, self.groups,
-                shortlist_width is not None, coarse, num_warps=warps, enable_fp_fusion=False,
+                mapping_kind, coarse, num_warps=warps, enable_fp_fusion=False,
             )
             return scores
 

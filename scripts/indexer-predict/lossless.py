@@ -80,11 +80,14 @@ def _append(current, slots, payload, exponents, masks, exceptions, bases, low: t
 
 
 @triton.jit
-def _decode(mantissa, exponents, masks, exceptions, bases, slot, live, low: tl.constexpr):
+def _decode(mantissa, exponents, masks, exceptions, bases, slot, live, low: tl.constexpr,
+            branched: tl.constexpr, cache_modifier: tl.constexpr):
     d = tl.arange(0, 64)
     p = tl.arange(0, 32)
-    ms = tl.load(mantissa + slot[:, None] * 64 + d[None, :], mask=live[:, None], other=0).to(tl.uint32)
-    exp = tl.load(exponents + slot[:, None] * 32 + p[None, :], mask=live[:, None], other=0).to(tl.uint32)
+    ms = tl.load(mantissa + slot[:, None] * 64 + d[None, :], mask=live[:, None], other=0,
+                 cache_modifier=cache_modifier).to(tl.uint32)
+    exp = tl.load(exponents + slot[:, None] * 32 + p[None, :], mask=live[:, None], other=0,
+                  cache_modifier=cache_modifier).to(tl.uint32)
     code = tl.interleave(exp & 15, exp >> 4)
     bits = (ms & 127) | ((ms & 128) << 8) | ((code + low) << 7)
     key = bits.to(tl.uint16).to(tl.bfloat16, bitcast=True)
@@ -93,7 +96,7 @@ def _decode(mantissa, exponents, masks, exceptions, bases, slot, live, low: tl.c
     bitmap = tl.load(masks + group, mask=live, other=0)
     shifted_one = 1 << lane.to(tl.uint32)
     bad = live & ((bitmap & shifted_one) != 0)
-    if tl.sum(bad.to(tl.int32), 0) != 0:
+    if not branched or tl.sum(bad.to(tl.int32), 0) != 0:
         prior = bitmap & (shifted_one - 1)
         rank = tl.extra.cuda.libdevice.popc(prior.to(tl.int32)).to(tl.int32)
         offset = tl.load(bases + group, mask=bad, other=0) + rank
@@ -107,7 +110,7 @@ def _decode(mantissa, exponents, masks, exceptions, bases, slot, live, low: tl.c
 def _restore(payload, exponents, masks, exceptions, bases, slots, out, rows: tl.constexpr, low: tl.constexpr):
     row = tl.program_id(0) * 32 + tl.arange(0, 32)
     slot = tl.load(slots + row, row < rows, other=0)
-    value = _decode(payload, exponents, masks, exceptions, bases, slot, row < rows, low)
+    value = _decode(payload, exponents, masks, exceptions, bases, slot, row < rows, low, True, "")
     d = tl.arange(0, 64)
     tl.store(out + row[:, None] * 64 + d[None, :], value, mask=row[:, None] < rows)
 
@@ -115,14 +118,16 @@ def _restore(payload, exponents, masks, exceptions, bases, slots, out, rows: tl.
 @triton.jit
 def _score(q, gates, lengths, key_bases, mantissa, exponents, masks, exceptions, bases, out,
            stride_q: tl.constexpr, stride_h: tl.constexpr, stride_gate: tl.constexpr,
-           width: tl.constexpr, block: tl.constexpr, low: tl.constexpr, scale: tl.constexpr):
+           width: tl.constexpr, block: tl.constexpr, low: tl.constexpr, scale: tl.constexpr,
+           branched: tl.constexpr, cache_modifier: tl.constexpr):
     batch = tl.program_id(1)
     first = tl.program_id(0) * block
     length = tl.load(lengths + batch)
     j = first + tl.arange(0, block)
     if first < length:
         kbase = tl.multiple_of(tl.load(key_bases + batch), 128)
-        key = _decode(mantissa, exponents, masks, exceptions, bases, kbase + j, j < length, low)
+        key = _decode(mantissa, exponents, masks, exceptions, bases,
+                      kbase + j, j < length, low, branched, cache_modifier)
         h = tl.arange(0, 16)
         d = tl.arange(0, 64)
         query = tl.load(q + batch * stride_q + h[:, None] * stride_h + d[None, :])
@@ -190,7 +195,7 @@ class StaticExponentKeys:
         )
         return out
 
-    def prepare(self, lengths, scale, block, warps=4):
+    def prepare(self, lengths, scale, block, warps=4, branched=True, cache_modifier=""):
         width = triton.cdiv(self.plan.width, block) * block
         batch = lengths.numel()
         result = torch.empty((batch, width), dtype=torch.float32, device=lengths.device)
@@ -200,7 +205,7 @@ class StaticExponentKeys:
                 query, gate, lengths, self.plan.bases, self.payload, self.exponents,
                 self.masks, self.exceptions, self.bases, result,
                 query.stride(0), query.stride(1), gate.stride(0), width, block,
-                self.low, scale, num_warps=warps,
+                self.low, scale, branched, cache_modifier, num_warps=warps,
             )
             return result
 

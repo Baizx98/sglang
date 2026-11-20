@@ -30,13 +30,13 @@ from flashinfer import top_k_ragged_transform
 from horizonkv_layer_replay import initialize
 from lossless import StaticExponentKeys
 from progressive import prepare_progressive, validate as validate_progressive
-from projection import _normalize_heads
 from quantized import QuantizedKeys
+from query import predictor_projection
 from refine_bench import reconstruct_layer0_input
 from segment_oracle import audit as audit_segments
 from slab_index import IndexSlab, Plan, _score_slab
+from temporal import prepare_temporal, validate_temporal
 from sglang.srt.layers.attention.keye_topk.ampere_indexer import keye_indexer_score_paged
-from sglang.srt.layers.attention.keye_topk.keye_indexer import _rotate_activation
 
 K = 2048
 
@@ -118,38 +118,6 @@ def existing_inputs(trace, bucket, batch, step, offset, indexer, config):
                   captured.captured, torch.stack(current), ids)
 
 
-def predictor_projection(indexer, hidden, positions, fused=False):
-    """Reuse native Q arithmetic while omitting the unused prediction K."""
-    batch = hidden.shape[0]
-    positions = positions if positions.ndim == 2 else positions.unsqueeze(0).expand(3, -1)
-    no_keys = torch.empty((batch, 0), dtype=torch.bfloat16, device=hidden.device)
-    normalized = torch.empty((batch, indexer.total_q_dim), dtype=torch.bfloat16, device=hidden.device)
-    rope = indexer.rotary_emb
-
-    def project():
-        q_gate, _ = indexer.q_proj(hidden)
-        if fused:
-            # Only Q-head programs are launched, so the K branch is inactive.
-            _normalize_heads[(batch, indexer.num_heads)](
-                q_gate, q_gate, indexer.q_norm.weight, indexer.k_norm.weight,
-                indexer.k_norm.bias, normalized, no_keys, positions, rope.cos_sin_cache,
-                q_gate.stride(0), q_gate.stride(0), indexer.q_norm.variance_epsilon,
-                indexer.k_norm.variance_epsilon, positions.stride(0),
-                *rope.mrope_section[:2], False, num_warps=2, enable_fp_fusion=False,
-            )
-            q = normalized
-        else:
-            q = q_gate[:, :indexer.total_q_dim].reshape(-1, indexer.head_dim)
-            q = indexer.q_norm(q).to(torch.bfloat16).view(batch, indexer.total_q_dim)
-        q, _ = indexer.rotary_emb(positions, q, no_keys)
-        q = _rotate_activation(q.reshape(-1, indexer.head_dim)).view(
-            batch, indexer.num_heads, indexer.head_dim,
-        )
-        return q, q_gate[:, indexer.total_q_dim:]
-
-    return project
-
-
 def prepare_slab_score(slab, scale, block, warps):
     lengths = slab.lengths
     width = triton.cdiv(slab.plan.width, block) * block
@@ -227,7 +195,7 @@ def timed_build(factory):
     return storage, (time.perf_counter() - begin) * 1e6
 
 
-def benchmark(replay, indexer, args, identity):
+def benchmark(replay, indexer, args, identity, previous_replay=None):
     scale = indexer.softmax_scale
     reference_width = max(replay.lengths) + 1
     width = triton.cdiv(reference_width, 256) * 256
@@ -284,11 +252,16 @@ def benchmark(replay, indexer, args, identity):
         static_mask_groups + static_exception_groups
     ) + 128 * static.exception_count
     for tile in args.exact_tiles:
-        scorer, workspace = static.prepare(lengths, scale, tile)
-        logical_key_bytes[f"static12_b{tile}"] = static_logical_bytes
-        score_methods[f"static12_b{tile}"] = (
-            scorer, workspace, True, static.storage_bytes, build_us + static_us,
-        )
+        variants = (("", True, ""), ("_m", False, ""), ("_cg", False, ".cg")) if args.exact_tuning else (("", True, ""),)
+        for suffix, branched, modifier in variants:
+            scorer, workspace = static.prepare(
+                lengths, scale, tile, branched=branched, cache_modifier=modifier,
+            )
+            name = f"static12_b{tile}{suffix}"
+            logical_key_bytes[name] = static_logical_bytes
+            score_methods[name] = (
+                scorer, workspace, True, static.storage_bytes, build_us + static_us,
+            )
 
     formats = {}
     variants = [
@@ -415,6 +388,37 @@ def benchmark(replay, indexer, args, identity):
                     true_top2048_intersection=intersections(selected, target_ids).tolist(),
                     shortlist_width=impl.shortlist,
                 )
+        if args.temporal:
+            state = formats.get("int6_g1")
+            if previous_replay is None or state is None:
+                raise ValueError("--temporal needs previous capture and --quant-formats 6x1")
+            if [n + 1 for n in previous_replay.lengths] != replay.lengths:
+                raise ValueError("temporal scoring needs consecutive captured states")
+            prev_q, prev_gate = predictor_projection(
+                indexer, previous_replay.hidden, previous_replay.positions, fused=args.fused_query,
+            )()
+            key_record = score_methods["int6_g1_b" + str(args.quant_tiles[0])]
+            quantized_bytes = 8 * state.bits + 2 * state.groups
+            for segment in args.temporal_segments:
+                dense, _ = state.prepare(lengths, scale, block=segment)
+                for fraction in args.temporal:
+                    label = f"int6_temporal_{segment}_{fraction:g}:flashinfer"
+                    impl = prepare_temporal(state, q_only, prev_q, prev_gate, lengths, scale,
+                                            fraction, segment, m, torch.float16)
+                    selected, kept = validate_temporal(impl, dense, fast_q, fast_gate, lengths, segment, m)
+                    calls[label] = impl.partial
+                    calls[f"temporal_refresh_{segment}"] = impl.refresh
+                    rows[label] = dict(
+                        exact=False, baseline=False, score_equal=None,
+                        index_key_bytes=state.storage_bytes, score_dtype="torch.float16",
+                        logical_key_bytes=quantized_bytes * sum(kept),
+                        logical_score_write_bytes=2 * len(replay.lengths) * impl.shortlist_tokens,
+                        workspace_bytes_before_selector=impl.workspace_bytes,
+                        known_cute_workspace_bytes=None, initialize_wall_us=key_record[4],
+                        predicted_set_intersection=intersections(selected, gold).tolist(),
+                        true_top2048_intersection=intersections(selected, target_ids).tolist(),
+                        kept_tokens_by_request=kept, shortlist_width=impl.shortlist_tokens,
+                    )
         # Ensure an identical strongest denominator is available when comparing
         # methods based on a request-local contiguous slab and direct addressing.
         exact_names = [name for name, rec in rows.items() if rec.get("baseline")]
@@ -489,8 +493,13 @@ def run(args):
                     replay = existing_inputs(old, bucket, batch, step, args.offset, indexer, config)
                 else:
                     replay = captured.load(bucket, args.split, batch, layer, step, args.offset)
+                previous = None
+                if args.temporal:
+                    if old is not None or step == 0:
+                        raise ValueError("temporal benchmark needs a capture and a positive step")
+                    previous = captured.load(bucket, args.split, batch, layer, step - 1, args.offset)
                 enforce_exclusive_gpu()
-                for row in benchmark(replay, indexer, args, identity):
+                for row in benchmark(replay, indexer, args, identity, previous):
                     enforce_exclusive_gpu()
                     stream.write(json.dumps(row) + "\n")
                     stream.flush()
@@ -514,10 +523,13 @@ if __name__ == "__main__":
     parser.add_argument("--candidates", type=int, nargs="+", default=[3072, 8192])
     parser.add_argument("--quant-formats", nargs="+", default=["4x1", "4x2", "5x1", "6x1", "8x1", "8x2"])
     parser.add_argument("--quant-tiles", type=int, nargs="+", default=[128, 256])
+    parser.add_argument("--exact-tuning", action="store_true")
     parser.add_argument("--exact-tiles", type=int, nargs="+", default=[128, 256])
     parser.add_argument("--fused-query", action="store_true")
     parser.add_argument("--fp16-scores", action="store_true")
     parser.add_argument("--fit-int4", type=int, choices=(1, 2, 4), nargs="+")
+    parser.add_argument("--temporal", type=float, nargs="+")
+    parser.add_argument("--temporal-segments", type=int, choices=(32,64,128), nargs="+", default=[32,64])
     parser.add_argument("--progressive", type=float, nargs="+")
     parser.add_argument("--segment-audit", type=int, nargs="+")
     parser.add_argument("--trials", type=int, default=11)
