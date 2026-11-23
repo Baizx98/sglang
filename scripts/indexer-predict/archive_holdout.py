@@ -14,6 +14,7 @@ import statistics
 ROOT = Path("data/indexer-predict")
 ORIGINAL = ROOT / "frozen-run-v1"
 UPDATED = ROOT / "frozen-native-int4-v1"
+WARP = ROOT / "frozen-native-warp-v1"
 PERCENTILE = 0.95
 
 
@@ -37,8 +38,9 @@ def audit(root):
     assert len(holdout["results"]) == len(expected) and {i(r) for r in holdout["results"]} == expected
     assert all(r["status"] == "valid" for r in holdout["results"])
     routes = {(r["length_bucket"], r["layer"], r["M"]): r["method"] for r in policy["routes"]}
+    prior_root = UPDATED if root == WARP else ORIGINAL
     prior = {(r["length_bucket"], r["layer"], r["M"]): r["method"]
-             for r in json.loads((ORIGINAL / "policy.json").read_text())["routes"]}
+             for r in json.loads((prior_root / "policy.json").read_text())["routes"]}
     source = {p: list(records(Path(p))) for p in {r["source"] for r in holdout["results"]}}
     cells, requests = [], []
     anchor, cohort_ids = {}, {}
@@ -106,16 +108,17 @@ def audit(root):
     return cells, requests, anchor, holdout["summary"]
 
 
-def ablations():
-    parents = ("certified-isolated-v1", "prefix-isolated-v1", "native-int4-isolated-v1",
-               "native-int4-fused-query-calibration-v1", "frozen-native-int4-v1")
+def ablations(native_warp):
+    parents = (("native-warp-calibration-v1", WARP.name) if native_warp else
+               ("certified-isolated-v1", "prefix-isolated-v1", "native-int4-isolated-v1",
+                "native-int4-fused-query-calibration-v1", UPDATED.name))
     for suite in parents:
         path = ROOT / suite
         for file in sorted(path.glob("**/results.jsonl")):
             for line, raw in enumerate(records(file), 1):
                 ablations = [(tag, s["control"], s["fused"])
                              for tag, s in raw["full_path_ablations"].items()
-                             if tag.startswith(("native4_", "prefix_histogram_"))]
+                             if tag.startswith(("native4_", "native8_", "prefix_histogram_"))]
                 ablations.extend(("certified", raw["fastest_equal_layout_bf16"], name)
                                  for name in raw["timings"] if name.startswith("certified_int"))
                 for tag, control, method in ablations:
@@ -142,29 +145,29 @@ def quality():
             )}, expected_answer="|".join(expected), prompt_sha256=case["input_ids_sha256"], source_file=str(file))
 
 
-def run(output):
-    output.mkdir(parents=True, exist_ok=False)
-    base_cells, base_requests, base_anchor, base_summary = audit(ORIGINAL)
-    new_cells, new_requests, new_anchor, new_summary = audit(UPDATED)
-    assert base_anchor == new_anchor, "the implementation replacement must preserve the holdout and BF16 reference"
-    all_cells, all_requests = base_cells + new_cells, base_requests + new_requests
-    write_csv(output, "cells.csv", all_cells)
-    write_csv(output, "requests.csv", all_requests)
-    ablation_rows, quality_rows = list(ablations()), list(quality())
-    write_csv(output, "ablations.csv", ablation_rows)
-    write_csv(output, "ruler.csv", quality_rows)
+def run(output, native_warp):
+    original = audit(ORIGINAL)
+    runs = {ORIGINAL: original, UPDATED: audit(UPDATED)}
+    if native_warp:
+        runs[WARP] = audit(WARP)
+    assert all(result[2] == original[2] for result in runs.values()), (
+        "the implementation replacement must preserve the holdout and BF16 reference"
+    )
+    selected = {WARP: runs[WARP]} if native_warp else runs
+    all_cells, all_requests = [], []
+    ablation_rows, quality_rows = list(ablations(native_warp)), list(quality())
     stats = {}
-    for path, cells, requests, summary in (
-        (ORIGINAL, base_cells, base_requests, base_summary), (UPDATED, new_cells, new_requests, new_summary),
-    ):
+    for path, (cells, requests, _, summary) in selected.items():
         values = sorted(r["extra_miss_pp"] for r in requests)
         assert summary["cells"] == len(cells) and summary["request_rows"] == len(requests)
         assert math.isclose(summary["geomean_speedup"], statistics.geometric_mean(c["speedup"] for c in cells))
         assert summary["p95_extra_miss_pp"] == values[math.ceil(PERCENTILE*len(values)) - 1]
         assert summary["mean_extra_miss_pp"] == statistics.mean(values)
         stats[path.name] = summary
-    files = {ORIGINAL / "policy.json", ORIGINAL / "holdout.json", UPDATED / "policy.json", UPDATED / "holdout.json"}
-    for run in (ORIGINAL, UPDATED):
+        all_cells.extend(cells)
+        all_requests.extend(requests)
+    files = {root / name for root in runs for name in ("policy.json", "holdout.json")}
+    for run in runs:
         policy = json.loads((run / "policy.json").read_text())
         files.update(Path(f) for f in policy["source_sha256"])
         impl = policy.get("implementation_replacement", {})
@@ -175,6 +178,11 @@ def run(output):
     files.update(file.parent / "metadata.json" for file in list(files) if file.name == "results.jsonl")
     source = {str(f):hashlib.sha256(f.read_bytes()).hexdigest() for f in sorted(files)}
     exporter = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+    output.mkdir(parents=True, exist_ok=False)
+    write_csv(output, "cells.csv", all_cells)
+    write_csv(output, "requests.csv", all_requests)
+    write_csv(output, "ablations.csv", ablation_rows)
+    write_csv(output, "ruler.csv", quality_rows)
     (output / "provenance.json").write_text(json.dumps(
         dict(summary=stats, export_script_sha256=exporter, source_sha256=source), indent=2,
     ) + "\n")
@@ -183,4 +191,6 @@ def run(output):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("output", type=Path)
-    run(parser.parse_args().output)
+    parser.add_argument("--native-warp", action="store_true")
+    args = parser.parse_args()
+    run(args.output, args.native_warp)
