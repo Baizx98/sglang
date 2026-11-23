@@ -92,3 +92,5 @@ bash scripts/indexer-predict/run_frozen.sh test data/indexer-predict/frozen-run
 `--native-int4-fused-query` 让 Q 投影后处理直接输出 MMA 片段，省掉独立 Q 打包与中间 INT8 Q 写回，基准逐格对拍两种实现。使用原校准队列的结果运行 `policy.py replace-native-int4`，对校准更快且满足原覆盖门槛的单组线性 INT4 路由替换实现。输出带旧策略及新校准文件的哈希。将新策略保存到单独结果根目录后运行 `run_frozen.sh test-native-int4 <结果根目录>`，可在原持出队列完整复测。原策略模型生成适配器与这一计时入口独立。
 
 `--native-int8` 为单组 INT8 增加同序归约的 warp 扫描。每个 warp 按 8 个位置加载 K，两次 S8×S8 `m16n8k32` 合成 64 维点积，然后在 warp 内完成 BF16 舍入、ReLU 与 gate 加权。保留 INT8 Q 表示，原 Key 载荷与工作区不增加。用 `--quant-tiles 128 --fp16-scores --quant-formats 8x1` 校准相同真实队列，`policy.py replace-native-int8` 在原策略上登记符合条件的实现替换，`run_frozen.sh test-native-warp <结果根目录>` 同时测量已登记的 INT4/INT8 路线。两个原生变体均与原低位 scorer 对拍 FP16/FP32 分数位模式。
+
+`quality_cases.py` 可将登记的原生实现导出到质量服务配置。服务在 SM86 启用原生整数评分，在其他 GPU 上使用同一表示的 Triton scorer。`verify_server_mma.py` 用真实持出张量调用服务的候选生成与 Key 追加入口，检查原生分数位模式、选中分数及当前保留位置。这个验证不做时延统计。

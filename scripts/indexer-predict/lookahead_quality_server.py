@@ -14,6 +14,7 @@ ROOT = HERE.parents[1]
 sys.path[:0] = [str(ROOT / name) for name in ("scripts/indexer-round2", "scripts/indexer-optimization")]
 
 from flashinfer import top_k_ragged_transform
+from nibble_scan import prepare_scan as prepare_warp_scan, query_fragments
 from progressive import prepare_progressive
 from quantized import QuantizedKeys
 from query import QueryProjection
@@ -44,15 +45,26 @@ class CompactState:
             int(mode.get("groups", 1)), int(mode.get("fit_steps", 0)), bool(mode.get("fp4", False)),
             codebook,
         )
-        self.project = QueryProjection(indexer, 1, buffer.device)
         self.score_dtype = torch.float16 if mode.get("half_scores", False) else torch.float32
         self.offsets = torch.zeros_like(self.lengths)
         self.width = int(mode.get("width", M))
         self.oversample = float(mode.get("oversample", 0))
-        self.scan, _ = self.key.prepare(
-            self.lengths, indexer.softmax_scale, block=int(mode.get("tile", 128)),
-            score_dtype=self.score_dtype,
-        )
+        requested_mma = mode.get("native_mma", 0)
+        self.native_mma = requested_mma if requested_mma and torch.cuda.get_device_capability(buffer.device) == (8, 6) else 0
+        self.project = QueryProjection(indexer, 1, buffer.device, full_epilogue=bool(self.native_mma))
+        if self.native_mma:
+            if self.oversample or self.native_mma != self.key.bits:
+                raise ValueError("a native MMA scorer requires a matching dense integer Key format")
+            fragments = query_fragments(self.key) if self.native_mma == 4 else None
+            self.query_codes = fragments if fragments is not None else self.key.query_codes
+            self.scan, _ = prepare_warp_scan(
+                self.key, self.lengths, indexer.softmax_scale, self.score_dtype, packed_query=fragments,
+            )
+        else:
+            self.scan, _ = self.key.prepare(
+                self.lengths, indexer.softmax_scale, block=int(mode.get("tile", 128)),
+                score_dtype=self.score_dtype,
+            )
         if self.oversample:
             # Query input changes each Decode step. Scoring, buffers and the
             # physical layout are prepared once per request/layer reservation.
@@ -69,7 +81,14 @@ class CompactState:
             self.inputs = None
             return output
         current = self.lengths[:, None]
-        scores = self.scan(*self.project(hidden, positions))
+        if self.native_mma:
+            gates = self.project.encode_into(
+                hidden, positions, self.query_codes, self.key.query_scales, self.key.groups,
+                packed_nibbles=self.native_mma == 4,
+            )
+            scores = self.scan(gates)
+        else:
+            scores = self.scan(*self.project(hidden, positions))
         shortlist = top_k_ragged_transform(scores, self.offsets, self.lengths, self.width - 1)
         return torch.cat((current, shortlist), dim=1)
 
@@ -138,7 +157,8 @@ def prediction(self, *, previous_x, current_x, previous_indices, exact_indices,
         index = torch.searchsorted(ref, ids.contiguous()).clamp_max(2047)
         entry = dict(rid=rid, layer=layer_id, context=count, width=width,
                      true_intersection=int((ref.gather(1, index) == ids).sum()),
-                     unique=int(ids.unique().numel()))
+                     unique=int(ids.unique().numel()),
+                     native_mma=state.native_mma if mode == "compact" and route["method"] == "quantized" else 0)
         with (AUDIT / f"shadow-layer{layer_id:02}.jsonl").open("a") as fp:
             fp.write(json.dumps(entry) + "\n")
     return selected

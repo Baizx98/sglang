@@ -12,6 +12,12 @@ def layer_policy(row, codebooks):
     if row["exact"]:
         return {"method": "bf16"}
     name, _ = row["method"].split(":")
+    native_mma = 0
+    for suffix, bits in (("_native4_fused_q", 4), ("_native8", 8)):
+        if name.endswith(suffix):
+            name = name.removesuffix(suffix)
+            native_mma = bits
+            break
     progressive = re.fullmatch(r"int6_progressive_([\d.]+)", name)
     if progressive:
         return dict(method="quantized", bits=6, groups=1, tile=128,
@@ -22,6 +28,10 @@ def layer_policy(row, codebooks):
     category, bits, fit, groups, tile, half = match.groups()
     route = dict(method="quantized", bits=int(bits), groups=int(groups), tile=int(tile),
                  fit_steps=int(fit or 0), half_scores=bool(half), fp4=category == "fp")
+    if native_mma:
+        if category != "int" or route["bits"] != native_mma or route["groups"] != 1 or route["tile"] != 128:
+            raise ValueError(f"unsupported native MMA format {row['method']}")
+        route["native_mma"] = native_mma
     if category == "pq":
         route["codebook"] = str((codebooks / f"l{row['layer']:02}.pt").resolve(strict=True))
     return route
