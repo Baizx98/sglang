@@ -1,4 +1,4 @@
-"""SM86 dense INT4 Key scan using two native nibble MMA instructions."""
+"""SM86 dense integer Key scans with a warp-local score epilogue."""
 
 from __future__ import annotations
 
@@ -32,9 +32,9 @@ def _load_scan():
                 "-arch=sm_86", source, "-o", work,
             ], check=True)
             work.replace(artifact)
-    native = ctypes.CDLL(str(artifact)).nibble_scan
+    native = ctypes.CDLL(str(artifact)).warp_scan
     native.argtypes = ([ctypes.c_void_p] * 9 + [ctypes.c_int] * 3
-                       + [ctypes.c_float, ctypes.c_int, ctypes.c_void_p])
+                       + [ctypes.c_float, ctypes.c_int, ctypes.c_int, ctypes.c_void_p])
     native.restype = ctypes.c_int
     return native
 
@@ -44,28 +44,33 @@ def query_fragments(state):
 
 
 def prepare_scan(state, lengths, scale, score_dtype, *, packed_query=None):
-    if state.bits != 4 or state.groups != 1 or state.fp4 or state.pair_pq:
-        raise ValueError("native nibble MMA requires one signed linear INT4 Key group")
+    if state.bits not in (4, 8) or state.groups != 1 or state.fp4 or state.pair_pq:
+        raise ValueError("native MMA requires one signed linear INT4 or INT8 Key group")
+    if state.bits != 4 and packed_query is not None:
+        raise ValueError("packed Q fragments are used only for the INT4 Key scan")
     if score_dtype not in (torch.float32, torch.float16):
-        raise ValueError("native nibble MMA outputs FP16 or FP32 scores")
+        raise ValueError("native MMA outputs FP16 or FP32 scores")
     if torch.cuda.get_device_capability(lengths.device) != (8, 6):
-        raise ValueError("native nibble MMA is compiled for SM86")
+        raise ValueError("native MMA is compiled for SM86")
     native = _load_scan()
     width = ((state.plan.width + 127) // 128) * 128
     args = (state.query_scales, state.codes, state.scales)
-    packed = query_fragments(state) if packed_query is None else packed_query
+    packed = packed_query
+    if state.bits == 4 and packed is None:
+        packed = query_fragments(state)
     query = state.query_codes.data_ptr() if packed_query is None else None
     scores = torch.empty((state.batch, width), device=lengths.device, dtype=score_dtype)
 
     def scan(gates):
         if gates.dtype != torch.bfloat16 or gates.stride(1) != 1:
-            raise ValueError("native nibble MMA requires adjacent BF16 gates per row")
+            raise ValueError("native MMA requires adjacent BF16 gates per row")
         stream = torch.cuda.current_stream(lengths.device).cuda_stream
-        buffers = (packed, *args, gates, state.plan.bases, lengths, scores)
-        error = native(query, *(t.data_ptr() for t in buffers), state.batch, width, gates.stride(0),
-                       scale, score_dtype == torch.float16, stream)
+        buffers = (*args, gates, state.plan.bases, lengths, scores)
+        error = native(query, packed.data_ptr() if packed is not None else None,
+                       *(t.data_ptr() for t in buffers), state.batch, width, gates.stride(0),
+                       scale, score_dtype == torch.float16, state.bits, stream)
         if error:
-            raise RuntimeError(f"native nibble scan launch returned CUDA error {error}")
+            raise RuntimeError(f"native MMA scan launch returned CUDA error {error}")
         return scores
 
-    return scan, packed.nbytes + scores.nbytes
+    return scan, scores.nbytes + (packed.nbytes if packed is not None else 0)

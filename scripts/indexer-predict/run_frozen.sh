@@ -5,7 +5,7 @@ script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 repo=$(cd "$script_dir/../.." && pwd)
 cd "$repo"
 
-stage=${1:?choose calibration, test or test-native-int4}
+stage=${1:?choose calibration, test, test-native-int4 or test-native-warp}
 run=${2:?provide an output directory}
 data=${3:-data/indexer-predict}
 books="$data/pq-codebooks-v1"
@@ -29,18 +29,25 @@ case "$stage" in
         "$python" "$script_dir/policy.py" freeze --output "$run/policy.json" --inputs \
             "$run/calibration-shorter/results.jsonl" "$run/calibration-near256/results.jsonl"
         ;;
-    test|test-native-int4)
+    test|test-native-int4|test-native-warp)
         if [[ ! -s "$run/policy.json" ]]; then
             echo "Calibration policy is required before measuring the frozen holdouts." >&2
             exit 1
         fi
         extra=()
-        if [[ "$stage" == test-native-int4 ]]; then
-            extra=(--native-int4 --native-int4-fused-query)
-        fi
+        near_extra=()
+        case "$stage" in
+            test-native-int4)
+                extra=(--native-int4 --native-int4-fused-query)
+                ;;
+            test-native-warp)
+                extra=(--native-int4 --native-int4-fused-query --native-int8)
+                near_extra=(--native-int8)
+                ;;
+        esac
         bench --capture "$data/capture-64-128k-test" --split test "${extra[@]}" \
             --length 65536 131072 --batch 4 16 --output "$run/test-shorter"
-        bench --capture "$data/capture-near256-remaining" "$data/capture-near256-test" --split test \
+        bench --capture "$data/capture-near256-remaining" "$data/capture-near256-test" --split test "${near_extra[@]}" \
             --length 262144 --batch 4 16 --output "$run/test-near256"
         "$python" "$script_dir/policy.py" test --policy "$run/policy.json" \
             --output "$run/holdout.json" --inputs \

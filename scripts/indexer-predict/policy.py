@@ -106,8 +106,11 @@ def freeze(args):
         stream.write(json.dumps(result, indent=2) + "\n")
 
 
-def replace_native_int4(args):
+def replace_native(args):
     policy = json.loads(args.policy.read_text())
+    bits = 4 if args.mode == "replace-native-int4" else 8
+    pattern = r"int4(?:fit\d+)?_g1_b128(?:_f16)?:flashinfer" if bits == 4 else r"int8_g1_b128(?:_f16)?:flashinfer"
+    suffix = "_native4_fused_q" if bits == 4 else "_native8"
     calibrated = defaultdict(list)
     for _, _, record in read(args.inputs):
         if record["split"] != "calibration" or not set(record["request_ids"]).issubset(policy["calibration_request_ids"]):
@@ -116,13 +119,13 @@ def replace_native_int4(args):
     replacements = []
     for route in policy["routes"]:
         old = route["method"]
-        if not re.fullmatch(r"int4(?:fit\d+)?_g1_b128(?:_f16)?:flashinfer", old):
+        if not re.fullmatch(pattern, old):
             continue
         key = tuple(str(route[field]) for field in ("length_bucket", "layer", "M"))
         records = calibrated[key]
         if not records:
-            raise ValueError(f"missing calibration for INT4 route {key}")
-        new = old.replace(":", "_native4_fused_q:")
+            raise ValueError(f"missing calibration for INT{bits} route {key}")
+        new = old.replace(":", f"{suffix}:")
         updated = summarize(records, new)
         previous = summarize(records, old)
         gates = policy["cutoffs"]
@@ -133,7 +136,10 @@ def replace_native_int4(args):
         route.update(method=new, quality_calibration=updated)
         replacements.append(dict(route=key, prior_method=old, method=new, prior_calibration=previous))
     if not replacements:
-        raise ValueError("no score-preserving INT4 implementation passed the calibration checks")
+        raise ValueError(f"no score-preserving INT{bits} implementation passed the calibration checks")
+    if "implementation_replacement" in policy:
+        history = policy.setdefault("prior_implementation_replacements", [])
+        history.append(policy["implementation_replacement"])
     policy["implementation_replacement"] = dict(
         base_policy_sha256=hashlib.sha256(args.policy.read_bytes()).hexdigest(),
         calibration_sha256={str(path):hashlib.sha256(path.read_bytes()).hexdigest() for path in args.inputs},
@@ -215,11 +221,13 @@ if __name__ == "__main__":
     p_test.add_argument("--policy", type=Path, required=True)
     p_test.add_argument("--expect-batch", type=int, nargs="+", default=[4, 16])
     p_test.add_argument("--expect-step", type=int, nargs="+", default=[2, 4])
-    p_replace = subs.add_parser("replace-native-int4")
-    p_replace.add_argument("--policy", type=Path, required=True)
-    for sub in (p_freeze, p_replace, p_test):
+    p_replace = [subs.add_parser(f"replace-native-int{bits}") for bits in (4, 8)]
+    for cmd in p_replace:
+        cmd.add_argument("--policy", type=Path, required=True)
+    for sub in (p_freeze, *p_replace, p_test):
         sub.add_argument("--inputs", type=Path, nargs="+", required=True)
         sub.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-    handlers = {"freeze": freeze, "replace-native-int4": replace_native_int4, "test": test}
+    handlers = {"freeze": freeze, "replace-native-int4": replace_native,
+                "replace-native-int8": replace_native, "test": test}
     handlers[args.mode](args)

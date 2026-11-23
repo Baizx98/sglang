@@ -30,7 +30,7 @@ from certified_device import CertifiedRows
 from flashinfer import top_k_ragged_transform
 from horizonkv_layer_replay import initialize
 from lossless import StaticExponentKeys
-from nibble_scan import prepare_scan as prepare_nibble_scan, query_fragments
+from nibble_scan import prepare_scan as prepare_warp_scan, query_fragments
 from prefix_topm import PrefixTopM
 from progressive import prepare_progressive, validate as validate_progressive
 from quantized import QuantizedKeys
@@ -301,7 +301,7 @@ def benchmark(replay, indexer, args, identity, previous_replay=None, codebook=No
                 scorer, workspace, True, static.storage_bytes, static_init_us,
             )
 
-    formats, compact_history_scores, prefix_states, nibble_controls = {}, {}, {}, {}
+    formats, compact_history_scores, prefix_states, warp_controls = {}, {}, {}, {}
 
     def score_from_hidden(scan, state, fused):
         if fused:
@@ -373,28 +373,29 @@ def benchmark(replay, indexer, args, identity, previous_replay=None, codebook=No
                 score_methods[output_name] = (
                     scorer, workspace, False, state.storage_bytes, initialization_us,
                 )
-                if args.native_int4 and name.startswith("int4") and groups == 1 and tile == 128:
-                    nibble, native_bytes = prepare_nibble_scan(state, lengths, scale, dtype)
+                native_bits = (args.native_int4 and name.startswith("int4")) or (args.native_int8 and bits == 8)
+                if native_bits and groups == 1 and tile == 128:
+                    warp_scan, native_bytes = prepare_warp_scan(state, lengths, scale, dtype)
 
-                    def native_scorer(q, gate, state=state, scan=nibble):
+                    def native_scorer(q, gate, state=state, scan=warp_scan):
                         state.encode_query(q)
                         return scan(gate)
 
-                    native_name = f"{output_name}_native4"
+                    native_name = f"{output_name}_native{bits}"
                     if use_compact_projection:
-                        def native_history(scan=nibble, state=state):
+                        def native_history(scan=warp_scan, state=state):
                             return score_from_hidden(scan, state, True)
 
                         compact_history_scores[native_name] = native_history
-                    nibble_controls[native_name] = output_name
+                    warp_controls[native_name] = output_name
                     logical_key_bytes[native_name] = logical_key_bytes[output_name]
                     score_methods[native_name] = (
                         native_scorer, native_bytes + state.query_codes.nbytes + state.query_scales.nbytes,
                         False, state.storage_bytes, initialization_us,
                     )
-                    if use_compact_projection and args.native_int4_fused_query:
+                    if bits == 4 and use_compact_projection and args.native_int4_fused_query:
                         fragments = query_fragments(state)
-                        ready, ready_bytes = prepare_nibble_scan(state, lengths, scale, dtype, packed_query=fragments)
+                        ready, ready_bytes = prepare_warp_scan(state, lengths, scale, dtype, packed_query=fragments)
 
                         def fused_nibble_history(state=state, packed=fragments, scan=ready):
                             gate = full_projection.encode_into(
@@ -405,7 +406,7 @@ def benchmark(replay, indexer, args, identity, previous_replay=None, codebook=No
 
                         fused_name = f"{native_name}_fused_q"
                         compact_history_scores[fused_name] = fused_nibble_history
-                        nibble_controls[fused_name] = native_name
+                        warp_controls[fused_name] = native_name
                         logical_key_bytes[fused_name] = logical_key_bytes[output_name]
                         score_methods[fused_name] = (
                             native_scorer, ready_bytes + state.query_scales.nbytes,
@@ -460,15 +461,15 @@ def benchmark(replay, indexer, args, identity, previous_replay=None, codebook=No
         calls, rows = {"legacy_full_sorted": legacy}, {}
         for name, (score, workspace, exact, storage, init_us) in score_methods.items():
             actual_scores = score(fast_q, fast_gate).clone()
-            if name in nibble_controls:
-                control_score = score_methods[nibble_controls[name]][0]
+            if name in warp_controls:
+                control_score = score_methods[warp_controls[name]][0]
                 view = torch.int16 if actual_scores.dtype == torch.float16 else torch.int32
                 if not torch.equal(actual_scores.view(view), control_score(fast_q, fast_gate).view(view)):
-                    raise RuntimeError(f"native nibble MMA changed the INT4 scores for {name}")
+                    raise RuntimeError(f"native MMA changed the integer Key scores for {name}")
             compact_scores = compact_history_scores.get(name)
             if compact_scores is not None:
                 compact_result = compact_scores()
-                if name in nibble_controls:
+                if name in warp_controls:
                     compact_result, reference = compact_result.view(view), actual_scores.view(view)
                 else:
                     reference = actual_scores
@@ -644,9 +645,10 @@ def benchmark(replay, indexer, args, identity, previous_replay=None, codebook=No
         )
         if measure:
             ablations = {}
-            for name, control in nibble_controls.items():
+            for name, control in warp_controls.items():
                 if f"{control}:flashinfer" in calls and f"{name}:flashinfer" in calls:
-                    ablations[f"native4_{control}"] = dict(control=f"{control}:flashinfer", fused=f"{name}:flashinfer")
+                    prefix = "native8" if name.startswith("int8_") else "native4"
+                    ablations[f"{prefix}_{control}"] = dict(control=f"{control}:flashinfer", fused=f"{name}:flashinfer")
             for name in prefix_states:
                 control = f"{name}:flashinfer"
                 fused = f"{name}:prefix{args.prefix_histogram_bits}"
@@ -794,6 +796,7 @@ if __name__ == "__main__":
     parser.add_argument("--fp16-scores", action="store_true")
     parser.add_argument("--native-int4", action="store_true")
     parser.add_argument("--native-int4-fused-query", action="store_true")
+    parser.add_argument("--native-int8", action="store_true")
     parser.add_argument("--fp4", action="store_true")
     parser.add_argument("--pair-pq", type=Path)
     parser.add_argument("--direct-paged-build", action="store_true")
@@ -813,8 +816,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
     if args.prefix_histogram_bits and not args.fp16_scores:
         parser.error("the prefix histogram is only available for --fp16-scores")
-    if args.native_int4 and 128 not in args.quant_tiles:
-        parser.error("the native INT4 comparison requires --quant-tiles 128")
+    if (args.native_int4 or args.native_int8) and 128 not in args.quant_tiles:
+        parser.error("native integer MMA requires --quant-tiles 128")
     if args.native_int4_fused_query and not args.native_int4:
         parser.error("--native-int4-fused-query requires --native-int4")
     torch.set_num_threads(4)

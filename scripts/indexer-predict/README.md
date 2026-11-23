@@ -90,3 +90,5 @@ bash scripts/indexer-predict/run_frozen.sh test data/indexer-predict/frozen-run
 `--native-int4 --quant-formats 4x1 --quant-tiles 128` 增加配对评分实现，可加 `--fit-int4 2` 和 `--fp16-scores`。Q 的 INT8 整数分成带符号的高半字节和无符号的低半字节，在同一缓存表示上执行两次 `m16n8k64`，再合成原整数点积。连续扫描保持原 BF16 scale、16 头归约和 FP16/FP32 输出。每条请求增加 1024 B Q 片段及一次打包 kernel，均计入全路径。逐格要求与旧 INT4 分数逐位一致，配对使用同一个 FlashInfer 选择器。FlashInfer 在同分边界可选不同逻辑位置。`nibble_scan_audit.py` 在冻结路由采用单组线性 INT4 的层步上验证两种输出格式、分数逐位一致和 CUDA Graph。该原型通过可选参数测量，冻结矩阵保持原路由。
 
 `--native-int4-fused-query` 让 Q 投影后处理直接输出 MMA 片段，省掉独立 Q 打包与中间 INT8 Q 写回，基准逐格对拍两种实现。使用原校准队列的结果运行 `policy.py replace-native-int4`，对校准更快且满足原覆盖门槛的单组线性 INT4 路由替换实现。输出带旧策略及新校准文件的哈希。将新策略保存到单独结果根目录后运行 `run_frozen.sh test-native-int4 <结果根目录>`，可在原持出队列完整复测。原策略模型生成适配器与这一计时入口独立。
+
+`--native-int8` 为单组 INT8 增加同序归约的 warp 扫描。每个 warp 按 8 个位置加载 K，两次 S8×S8 `m16n8k32` 合成 64 维点积，然后在 warp 内完成 BF16 舍入、ReLU 与 gate 加权。保留 INT8 Q 表示，原 Key 载荷与工作区不增加。用 `--quant-tiles 128 --fp16-scores --quant-formats 8x1` 校准相同真实队列，`policy.py replace-native-int8` 在原策略上登记符合条件的实现替换，`run_frozen.sh test-native-warp <结果根目录>` 同时测量已登记的 INT4/INT8 路线。两个原生变体均与原低位 scorer 对拍 FP16/FP32 分数位模式。
