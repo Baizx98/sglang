@@ -5,7 +5,7 @@ script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 repo=$(cd "$script_dir/../.." && pwd)
 cd "$repo"
 
-stage=${1:?choose calibration or test}
+stage=${1:?choose calibration, test or test-native-int4}
 run=${2:?provide an output directory}
 data=${3:-data/indexer-predict}
 books="$data/pq-codebooks-v1"
@@ -29,12 +29,16 @@ case "$stage" in
         "$python" "$script_dir/policy.py" freeze --output "$run/policy.json" --inputs \
             "$run/calibration-shorter/results.jsonl" "$run/calibration-near256/results.jsonl"
         ;;
-    test)
+    test|test-native-int4)
         if [[ ! -s "$run/policy.json" ]]; then
             echo "Calibration policy is required before measuring the frozen holdouts." >&2
             exit 1
         fi
-        bench --capture "$data/capture-64-128k-test" --split test \
+        extra=()
+        if [[ "$stage" == test-native-int4 ]]; then
+            extra=(--native-int4 --native-int4-fused-query)
+        fi
+        bench --capture "$data/capture-64-128k-test" --split test "${extra[@]}" \
             --length 65536 131072 --batch 4 16 --output "$run/test-shorter"
         bench --capture "$data/capture-near256-remaining" "$data/capture-near256-test" --split test \
             --length 262144 --batch 4 16 --output "$run/test-near256"

@@ -39,7 +39,11 @@ def _load_scan():
     return native
 
 
-def prepare_scan(state, lengths, scale, score_dtype):
+def query_fragments(state):
+    return torch.empty((state.batch, 16, 8, 2), device=state.query_codes.device, dtype=torch.int32)
+
+
+def prepare_scan(state, lengths, scale, score_dtype, *, packed_query=None):
     if state.bits != 4 or state.groups != 1 or state.fp4 or state.pair_pq:
         raise ValueError("native nibble MMA requires one signed linear INT4 Key group")
     if score_dtype not in (torch.float32, torch.float16):
@@ -49,15 +53,16 @@ def prepare_scan(state, lengths, scale, score_dtype):
     native = _load_scan()
     width = ((state.plan.width + 127) // 128) * 128
     args = (state.query_scales, state.codes, state.scales)
-    packed = torch.empty((state.batch, 16, 8, 2), device=lengths.device, dtype=torch.int32)
+    packed = query_fragments(state) if packed_query is None else packed_query
+    query = state.query_codes.data_ptr() if packed_query is None else None
     scores = torch.empty((state.batch, width), device=lengths.device, dtype=score_dtype)
 
     def scan(gates):
         if gates.dtype != torch.bfloat16 or gates.stride(1) != 1:
             raise ValueError("native nibble MMA requires adjacent BF16 gates per row")
         stream = torch.cuda.current_stream(lengths.device).cuda_stream
-        buffers = (state.query_codes, packed, *args, gates, state.plan.bases, lengths, scores)
-        error = native(*(t.data_ptr() for t in buffers), state.batch, width, gates.stride(0),
+        buffers = (packed, *args, gates, state.plan.bases, lengths, scores)
+        error = native(query, *(t.data_ptr() for t in buffers), state.batch, width, gates.stride(0),
                        scale, score_dtype == torch.float16, stream)
         if error:
             raise RuntimeError(f"native nibble scan launch returned CUDA error {error}")

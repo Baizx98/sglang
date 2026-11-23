@@ -124,7 +124,9 @@ extern "C" int nibble_scan(const int8_t* q, void* packed, const float* query_sca
                            void* output, int batch, int width, int gate_stride, float scale,
                            int half_output, cudaStream_t stream) {
     auto* fragments = static_cast<QueryFragment*>(packed);
-    pack_query<<<batch, 128, 0, stream>>>(q, fragments);
+    if (q != nullptr) {
+        pack_query<<<batch, 128, 0, stream>>>(q, fragments);
+    }
     const dim3 grid(width / 128, batch);
     if (half_output) {
         scan<<<grid, 256, 0, stream>>>(fragments, query_scales, keys, key_scales, gates, bases,

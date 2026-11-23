@@ -8,6 +8,7 @@ import hashlib
 import json
 import math
 from pathlib import Path
+import re
 import statistics
 
 
@@ -105,6 +106,43 @@ def freeze(args):
         stream.write(json.dumps(result, indent=2) + "\n")
 
 
+def replace_native_int4(args):
+    policy = json.loads(args.policy.read_text())
+    calibrated = defaultdict(list)
+    for _, _, record in read(args.inputs):
+        if record["split"] != "calibration" or not set(record["request_ids"]).issubset(policy["calibration_request_ids"]):
+            raise ValueError("the implementation replacement requires the original calibration cohort")
+        calibrated[bucket_key(record)].append(record)
+    replacements = []
+    for route in policy["routes"]:
+        old = route["method"]
+        if not re.fullmatch(r"int4(?:fit\d+)?_g1_b128(?:_f16)?:flashinfer", old):
+            continue
+        key = tuple(str(route[field]) for field in ("length_bucket", "layer", "M"))
+        records = calibrated[key]
+        if not records:
+            raise ValueError(f"missing calibration for INT4 route {key}")
+        new = old.replace(":", "_native4_fused_q:")
+        updated = summarize(records, new)
+        previous = summarize(records, old)
+        gates = policy["cutoffs"]
+        if (updated["geomean_speedup"] <= previous["geomean_speedup"]
+                or updated["mean_extra_miss_pp"] > gates["mean_extra_miss_pp"]
+                or updated["p95_extra_miss_pp"] > gates["p95_extra_miss_pp"]):
+            continue
+        route.update(method=new, quality_calibration=updated)
+        replacements.append(dict(route=key, prior_method=old, method=new, prior_calibration=previous))
+    if not replacements:
+        raise ValueError("no score-preserving INT4 implementation passed the calibration checks")
+    policy["implementation_replacement"] = dict(
+        base_policy_sha256=hashlib.sha256(args.policy.read_bytes()).hexdigest(),
+        calibration_sha256={str(path):hashlib.sha256(path.read_bytes()).hexdigest() for path in args.inputs},
+        replacements=replacements,
+    )
+    with args.output.open("x") as stream:
+        stream.write(json.dumps(policy, indent=2) + "\n")
+
+
 def test(args):
     policy = json.loads(args.policy.read_text())
     route = {
@@ -177,8 +215,11 @@ if __name__ == "__main__":
     p_test.add_argument("--policy", type=Path, required=True)
     p_test.add_argument("--expect-batch", type=int, nargs="+", default=[4, 16])
     p_test.add_argument("--expect-step", type=int, nargs="+", default=[2, 4])
-    for sub in (p_freeze, p_test):
+    p_replace = subs.add_parser("replace-native-int4")
+    p_replace.add_argument("--policy", type=Path, required=True)
+    for sub in (p_freeze, p_replace, p_test):
         sub.add_argument("--inputs", type=Path, nargs="+", required=True)
         sub.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-    (freeze if args.mode == "freeze" else test)(args)
+    handlers = {"freeze": freeze, "replace-native-int4": replace_native_int4, "test": test}
+    handlers[args.mode](args)

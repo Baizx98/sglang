@@ -12,7 +12,7 @@ def _normalize_heads(
     q_eps: tl.constexpr, k_eps: tl.constexpr,
     position_stride: tl.constexpr, section_t: tl.constexpr, section_h: tl.constexpr,
     epilogue: tl.constexpr, exact_rope: tl.constexpr = False,
-    scales_out=None, quant_groups: tl.constexpr = 0,
+    scales_out=None, quant_groups: tl.constexpr = 0, packed_nibbles: tl.constexpr = False,
 ):
     row = tl.program_id(0)
     head = tl.program_id(1)
@@ -69,7 +69,17 @@ def _normalize_heads(
             scale = tl.maximum(tl.max(tl.abs(grouped), 1), 1e-20) / 127.0
             codes = tl.extra.cuda.libdevice.rint(tl.div_rn(grouped, scale[:, None]))
             codes = tl.minimum(tl.maximum(codes, -127), 127).to(tl.int8)
-            tl.store(q_out + out_head * 64 + dim, tl.reshape(codes, (64,)))
+            if packed_nibbles:
+                tl.static_assert(quant_groups == 1)
+                words = tl.reshape(codes, (8, 8)).to(tl.uint32)
+                shift = 4 * tl.arange(0, 8)
+                high = tl.sum(((words >> 4) & 15) << shift[None, :], 1)
+                low = tl.sum((words & 15) << shift[None, :], 1)
+                base = out_head * 16 + 2 * tl.arange(0, 8)
+                tl.store(q_out + base, high)
+                tl.store(q_out + base + 1, low)
+            else:
+                tl.store(q_out + out_head * 64 + dim, tl.reshape(codes, (64,)))
             tl.store(scales_out + out_head * quant_groups + tl.arange(0, quant_groups), scale)
         else:
             tl.store(q_out + out_head * 64 + dim, values)
