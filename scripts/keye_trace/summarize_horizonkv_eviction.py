@@ -101,7 +101,9 @@ def aggregate(run, rng):
                 continue
             prior_layer = layers.get(("calibration", *group, layer), calibration)
             chosen = best(prior_layer, *REAL_ONLY, *STEP_PRED)
-            for role, policy in (("baseline", baseline), ("step+prediction", combined), ("layer-calibrated", chosen)):
+            layer_baseline = best(prior_layer, *REAL_ONLY)
+            for role, policy in (("baseline", baseline), ("step+prediction", combined),
+                                 ("layer-calibrated-baseline", layer_baseline), ("layer-calibrated", chosen)):
                 row = values[policy]
                 detail.append(dict(header, layer=layer, bucket=bucket, role=role, policy=policy,
                                    h2d_saved_fraction=1 - row[3]/values[baseline][3],
