@@ -56,14 +56,16 @@ def validate(row, events, output_ids):
         eligible = np.zeros(len(segments), dtype=np.int64)
         for path in sorted(events.glob(f"{rid}__layer{layer:02d}__*.npz")):
             with np.load(path, allow_pickle=False) as chunk:
-                for i, context in enumerate(chunk["context_len"]):
-                    assert chunk["step"][i] == cursor and context == prompt + cursor + 1
-                    exact = validate_ids(chunk["true_topk"][i], context, 2048)
+                contexts, indices, exact_ids = chunk["context_len"], chunk["step"], chunk["true_topk"]
+                predicted = chunk["predicted_topm"] if layer else None
+                if not layer:
+                    assert "predicted_topm" not in chunk.files
+                for i, context in enumerate(contexts):
+                    assert indices[i] == cursor and context == prompt + cursor + 1
+                    exact = validate_ids(exact_ids[i], context, 2048)
                     if layer:
-                        candidates = validate_ids(chunk["predicted_topm"][i], context, 3072)
+                        candidates = validate_ids(predicted[i], context, 3072)
                         assert candidates[0] == context - 1
-                    else:
-                        assert "predicted_topm" not in chunk.files
                     counts += np.bincount(labels[exact[exact < context - 1]],
                                           minlength=len(segments))
                     eligible += [max(0, min(context - 1, s["end"]) - s["start"])
@@ -115,6 +117,7 @@ def collect(args, rows):
         KEYE_LOOKAHEAD_RID_PREFIX="unused-agent-shadow-prefix",
         KEYE_SM80_PREFILL_SCORE_CHUNK="64", OMP_NUM_THREADS="4",
         OPENBLAS_NUM_THREADS="4", PYTHONUNBUFFERED="1",
+        SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION="false",
     )
     env.update(options)
     command = [
@@ -174,6 +177,9 @@ def collect(args, rows):
                 rid=rid, dataset=row["dataset"], session_id=row["session_id"],
                 turn=row["turn"], finish_reason=finish, generation_ids=ids, **checked))
             print(f"{i+1}/{total} {rid}: {checked['decode_steps']} validated steps", flush=True)
+            if (root / "pause-after-turn").is_file() and i + 1 < total:
+                save(root / "state.json", dict(status="paused", completed=i + 1, total=total))
+                return
         summary = Counter()
         for row in rows:
             result = json.loads((completed / f"{row['rid']}.json").read_text())
