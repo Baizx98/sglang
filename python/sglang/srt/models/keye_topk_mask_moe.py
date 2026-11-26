@@ -125,6 +125,10 @@ class KeyeTopKMaskMoeModel(Qwen3MoeModel):
                 pp_proxy_tensors=None):
         tracing = bool(os.getenv("KEYE_LOOKAHEAD_TRACE_DIR"))
         decode = forward_batch.forward_mode.is_decode()
+        if os.getenv("KEYE_AGENT_TRACE_DIR") and not decode:
+            from sglang.srt.layers.attention.keye_topk.agent_trace import flush
+
+            flush()
         if tracing and decode and not self.pp_group.is_first_rank:
             # Preserve the actual preceding layer's attention input and exact
             # selection across the PP boundary, rather than dropping layer 24.

@@ -335,6 +335,13 @@ class KeyeTopKMaskAttention(nn.Module):
                     layer_id=self.layer_id,
                 )
             exact_topk_indices = topk_indices
+            if os.getenv("KEYE_AGENT_TRACE_DIR") and forward_batch.forward_mode.is_decode():
+                from sglang.srt.layers.attention.keye_topk.agent_trace import record_selection
+
+                record_selection(
+                    self.sa_indexer, previous_x, topk_indices, positions,
+                    forward_batch, self.layer_id,
+                )
             if (
                 lookahead_active
                 and previous_x is not None
