@@ -112,22 +112,43 @@ def run_mode(root, rows, capacity, steps, mode, port, batch_size):
 def read_pair(root, rows, steps, batch_size, output_paths):
     metadata = {row["rid"]: row for row in rows}
     totals, by_layer, actual_active_batch = {}, [], Counter()
+    expected = {(rid, step) for rid in metadata for step in range(steps)}
+    excluded = Counter()
     for layer in range(48):
-        counters = []
-        demand_by_mode = []
+        layer_events = {}
         for mode in ("baseline", "prefetch"):
             path = output_paths[mode] / f"layer{layer:02d}.jsonl"
-            events = read_jsonl(path)
-            counts = Counter()
-            demand = {}
-            for event in events:
+            by_key = {}
+            for event in read_jsonl(path):
                 rid, step = event["rid"], event["step"]
                 key = (rid, step)
-                assert key not in demand and event["layer"] == layer
+                assert key not in by_key and event["layer"] == layer
                 assert event["context"] == metadata[rid]["prompt_tokens"] + step + 1
-                positions = [pos for pos, _, _ in event["demand"]]
-                assert len(set(positions)) == len(positions)
-                demand[key] = (sorted(positions), event["current_selected"])
+                by_key[key] = event
+                actual_active_batch[event["active_batch"]] += 1
+            assert by_key.keys() == expected, (mode, layer, len(by_key), len(expected))
+            layer_events[mode] = by_key
+        matched = set()
+        for key in expected:
+            a = layer_events["baseline"][key]
+            b = layer_events["prefetch"][key]
+            if a["active_batch"] != batch_size or b["active_batch"] != batch_size:
+                excluded["outside_requested_batch_in_either_path"] += 1
+                continue
+            demands = [sorted(pos for pos, _, _ in event["demand"]) for event in (a, b)]
+            assert all(len(d) == len(set(d)) for d in demands)
+            if demands[0] != demands[1] or a["current_selected"] != b["current_selected"]:
+                raise ValueError(f"Exact Top-k differs between A and B at layer {layer}, key={key}")
+            matched.add(key)
+        per_request = Counter(rid for rid, _ in matched)
+        if any(per_request[rid] < min(8, steps) for rid in metadata):
+            raise ValueError(f"Too few paired B{batch_size} frames at layer {layer}: {per_request}")
+        counters = []
+        for mode, by_key in layer_events.items():
+            counts = Counter()
+            for key in sorted(matched):
+                event = by_key[key]
+                step = event["step"]
                 counts.update(state for _, _, state in event["demand"])
                 counts["predicted_eviction_wasted"] += sum(e[-1] for e in event["prefetch_evictions"])
                 counts["prefetch_evicted_demand"] += len(
@@ -138,28 +159,22 @@ def read_pair(root, rows, steps, batch_size, output_paths):
                     counts[field] += event[field]
                 counts["exposed_transfer_ms"] += event["exposed_transfer_ms"] or 0.0
                 counts["prefetch_events"] += int(bool(event["prefetch"]))
-                counts["demand_rows"] += len(positions)
+                counts["demand_rows"] += len(event["demand"])
                 if step == steps - 1:
                     counts["unused_at_end"] += event["unused_resident"]
                 if mode == "baseline":
                     assert not event["prefetch"] and not event["prefetch_bytes"]
-            expected = {(rid, step) for rid in metadata for step in range(steps)}
-            assert demand.keys() == expected, (mode, layer, len(demand), len(expected))
             counters.append(counts)
-            demand_by_mode.append(demand)
             totals.setdefault(mode, Counter()).update(counts)
-            actual_active_batch.update(event["active_batch"] for event in events)
-        if demand_by_mode[0] != demand_by_mode[1]:
-            raise ValueError(f"Exact Top-k differs between A and B at layer {layer}")
-        by_layer.append(dict(layer=layer, baseline=counters[0], prefetch=counters[1]))
+        by_layer.append(dict(layer=layer, baseline=counters[0], prefetch=counters[1],
+                             matched_frames=len(matched)))
     if not totals["prefetch"]["prefetch_events"]:
         raise ValueError("Predictive path issued no actual H2D transfers")
     for count in totals.values():
         count["hit_rate"] = (count["resident"] + count["prefetch_ready"]) / count["demand_rows"]
-    if set(actual_active_batch) != {batch_size}:
-        raise ValueError(f"Actual batch differs from requested B{batch_size}: {actual_active_batch}")
     save(root / "comparison.json", dict(totals=totals, by_layer=by_layer, steps=steps,
-         active_batch_counts=actual_active_batch, exact_demand_equal=True, output_ids_equal=True))
+         requested_batch=batch_size, active_batch_counts=actual_active_batch,
+         excluded_frames=excluded, exact_demand_equal=True, output_ids_equal=True))
     return totals
 
 
@@ -215,15 +230,29 @@ def main():
         return
     compare(args, args.run / "pilot-8k-b1-c4096", requests["8192"][:1], 4096, 8, 1)
     if not args.pilot_only:
+        conditions = []
         for length in (32768, 131072):
             for batch in (1, 4):
                 for capacity in (2048, 4096):
-                    compare(args, args.run / f"{length}-b{batch}-c{capacity}",
-                            requests[str(length)][:batch], capacity, 32, batch)
+                    # Overlapping PP prefill can leave only a short full-batch
+                    # decode window. Preserve all ramp rows for auditing.
+                    conditions.append((f"{length}-b{batch}-c{capacity}",
+                                       requests[str(length)][:batch], capacity,
+                                       128 if batch > 1 else 32, batch))
         if args.agent_inputs:
             bridge = [dict(row, rid="ab__" + row["rid"]) for row in read_jsonl(args.agent_inputs)
                       if row.get("split") == "pilot"]
-            compare(args, args.run / "agent-bridge-b1-c4096", bridge, 4096, 32, 1)
+            conditions.append(("agent-bridge-b1-c4096", bridge, 4096, 32, 1))
+        failures = {}
+        for name, rows, capacity, steps, batch in conditions:
+            try:
+                compare(args, args.run / name, rows, capacity, steps, batch)
+            except Exception as exc:
+                failures[name] = repr(exc)
+                print(f"{name}: {exc!r}", file=sys.stderr, flush=True)
+        save(args.run / "formal-status.json", dict(
+            status="partial" if failures else "complete", failures=failures,
+            verified=[name for name, *_ in conditions if name not in failures]))
 
 
 if __name__ == "__main__":
