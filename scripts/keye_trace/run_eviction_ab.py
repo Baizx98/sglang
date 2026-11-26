@@ -37,20 +37,21 @@ def freeze(source, output):
     return frozen
 
 
-def run_mode(root, rows, capacity, steps, mode, port):
+def run_mode(root, rows, capacity, steps, mode, port, batch_size):
     root.mkdir()
     mode_env = dict(
         CUDA_VISIBLE_DEVICES=",".join(GPUS), KEYE_SM80_DSA="1", KEYE_SM80_EXACT_TOPK="1",
         KEYE_HORIZON_STORAGE="lru", KEYE_HORIZON_CACHE_TOKENS=str(capacity),
         KEYE_EVICTION_AB_DIR=str(root), KEYE_EVICTION_AB_MODE=mode,
-        KEYE_EVICTION_AB_MAX_REQUESTS=str(len(rows)), KEYE_SM80_PREFILL_SCORE_CHUNK="64",
+        KEYE_EVICTION_AB_MAX_REQUESTS=str(batch_size), KEYE_SM80_PREFILL_SCORE_CHUNK="64",
         OMP_NUM_THREADS="4", OPENBLAS_NUM_THREADS="4", PYTHONUNBUFFERED="1",
         SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION="false",
     )
     env = {k: v for k, v in os.environ.items() if not k.startswith(("KEYE_", "SGLANG_"))}
     env.update(mode_env)
     max_prompt = max(row["prompt_tokens"] for row in rows)
-    total_tokens = sum(row["prompt_tokens"] + steps + 128 for row in rows)
+    waves = [rows[i:i + batch_size] for i in range(0, len(rows), batch_size)]
+    total_tokens = max(sum(row["prompt_tokens"] + steps + 128 for row in wave) for wave in waves)
     # The checkpoint uses four KV heads by 128 BF16 features across 48 layers.
     host_main_bytes = (total_tokens + 2112) * 4 * 128 * 2 * 2 * 48
     available_kib = next(int(line.split()[1]) for line in Path("/proc/meminfo").read_text()
@@ -60,11 +61,11 @@ def run_mode(root, rows, capacity, steps, mode, port):
     command = [
         sys.executable, "-m", "sglang.launch_server", "--model-path", MODEL,
         "--trust-remote-code", "--host", "127.0.0.1", "--port", str(port),
-        "--tp-size", "1", "--pp-size", "2", "--pp-max-micro-batch-size", str(len(rows)),
+        "--tp-size", "1", "--pp-size", "2", "--pp-max-micro-batch-size", str(batch_size),
         "--attention-backend", "keye_sa",
         "--context-length", str(max_prompt + steps + 128),
         "--max-total-tokens", str(total_tokens + 2048),
-        "--max-running-requests", str(len(rows)), "--chunked-prefill-size", "4096",
+        "--max-running-requests", str(batch_size), "--chunked-prefill-size", "4096",
         "--mem-fraction-static", "0.90", "--disable-cuda-graph",
         "--disable-custom-all-reduce", "--disable-radix-cache", "--disable-overlap-schedule",
         "--dtype", "bfloat16", "--random-seed", str(SEED), "--skip-server-warmup",
@@ -89,12 +90,12 @@ def run_mode(root, rows, capacity, steps, mode, port):
                 time.sleep(3)
         else:
             raise TimeoutError(f"{mode} Keye server readiness")
-        ids = [r["input_ids"] for r in rows]
-        rids = [r["rid"] for r in rows]
+        response = []
         start = time.perf_counter()
-        response = post(url + "/generate", dict(
-            input_ids=ids, rid=rids, sampling_params=dict(
-                temperature=0, max_new_tokens=steps + 1, ignore_eos=True)))
+        for wave in waves:
+            response.extend(post(url + "/generate", dict(
+                input_ids=[r["input_ids"] for r in wave], rid=[r["rid"] for r in wave],
+                sampling_params=dict(temperature=0, max_new_tokens=steps + 1, ignore_eos=True))))
         elapsed = time.perf_counter() - start
         save(root / "response.json", dict(response=response, wall_seconds=elapsed))
         return response
@@ -144,8 +145,6 @@ def read_pair(root, rows, steps, batch_size, output_paths):
                     assert not event["prefetch"] and not event["prefetch_bytes"]
             expected = {(rid, step) for rid in metadata for step in range(steps)}
             assert demand.keys() == expected, (mode, layer, len(demand), len(expected))
-            if end_batch := Counter(event["step"] for event in events):
-                assert all(count == batch_size for count in end_batch.values())
             counters.append(counts)
             demand_by_mode.append(demand)
             totals.setdefault(mode, Counter()).update(counts)
@@ -175,7 +174,7 @@ def wait_gpu():
             time.sleep(20)
 
 
-def compare(args, root, rows, capacity, steps):
+def compare(args, root, rows, capacity, steps, batch_size):
     if (root / "comparison.json").exists():
         return
     root.mkdir(parents=True, exist_ok=True)
@@ -184,7 +183,7 @@ def compare(args, root, rows, capacity, steps):
         if args.wait_gpu:
             wait_gpu()
         mode_run = root / f"{mode}-{time.time_ns()}"
-        response = run_mode(mode_run, rows, capacity, steps, mode, args.port)
+        response = run_mode(mode_run, rows, capacity, steps, mode, args.port, batch_size)
         results[mode] = {r["meta_info"]["id"]: r["output_ids"] for r in response}
         output_paths[mode] = mode_run
         assert len(results[mode]) == len(rows) and all(
@@ -192,8 +191,9 @@ def compare(args, root, rows, capacity, steps):
     if results["baseline"] != results["prefetch"]:
         raise ValueError("A/B generated token trajectories differ")
     save(root / "evidence.json", dict(paths={k: str(v) for k, v in output_paths.items()},
-         source_inputs_sha256=hashlib.sha256((args.run / "ruler-requests.json").read_bytes()).hexdigest()))
-    totals = read_pair(root, rows, steps, len(rows), output_paths)
+         input_ids_sha256={r["rid"]: hashlib.sha256(json.dumps(r["input_ids"]).encode()).hexdigest()
+                           for r in rows}))
+    totals = read_pair(root, rows, steps, batch_size, output_paths)
     print(root, json.dumps(totals), flush=True)
 
 
@@ -205,6 +205,7 @@ def main():
     parser.add_argument("--wait-gpu", action="store_true")
     parser.add_argument("--pilot-only", action="store_true")
     parser.add_argument("--freeze-only", action="store_true")
+    parser.add_argument("--agent-inputs", type=Path)
     args = parser.parse_args()
     args.run = args.run.resolve()
     args.run.mkdir(parents=True, exist_ok=True)
@@ -212,13 +213,17 @@ def main():
     requests = json.loads(frozen.read_text()) if frozen.is_file() else freeze(args.ruler_source, frozen)
     if args.freeze_only:
         return
-    compare(args, args.run / "pilot-8k-b1-c4096", requests["8192"][:1], 4096, 8)
+    compare(args, args.run / "pilot-8k-b1-c4096", requests["8192"][:1], 4096, 8, 1)
     if not args.pilot_only:
         for length in (32768, 131072):
             for batch in (1, 4):
                 for capacity in (2048, 4096):
                     compare(args, args.run / f"{length}-b{batch}-c{capacity}",
-                            requests[str(length)][:batch], capacity, 32)
+                            requests[str(length)][:batch], capacity, 32, batch)
+        if args.agent_inputs:
+            bridge = [dict(row, rid="ab__" + row["rid"]) for row in read_jsonl(args.agent_inputs)
+                      if row.get("split") == "pilot"]
+            compare(args, args.run / "agent-bridge-b1-c4096", bridge, 4096, 32, 1)
 
 
 if __name__ == "__main__":
