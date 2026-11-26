@@ -165,7 +165,8 @@ def collect(args, rows):
         for i, row in enumerate(pending, start=existing):
             rid = row["rid"]
             save(root / "state.json", dict(status="running", completed=i, total=total, rid=rid))
-            post(url + "/flush_cache", {})
+            # Radix caching is disabled. The next request can queue while the
+            # PP scheduler retires the previous request's last microbatch.
             response = post(url + "/generate", dict(
                 input_ids=row["input_ids"], rid=rid,
                 sampling_params=dict(max_new_tokens=args.max_new_tokens, temperature=0)))
@@ -193,6 +194,9 @@ def collect(args, rows):
         save(root / "state.json", dict(status="complete", completed=total, total=total, **summary))
     except BaseException as exc:
         save(root / "failure.json", dict(error=str(exc), attempt=attempt))
+        state = json.loads((root / "state.json").read_text())
+        state["status"] = "failed"
+        save(root / "state.json", state)
         raise
     finally:
         if server.poll() is None:
