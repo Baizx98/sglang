@@ -774,6 +774,15 @@ class KeyeSparseAttnBackend(AttentionBackend):
             assert _has_flash_attn, "flash_attn is required for decode"
         topk_indices = kwargs["topk_indices"]
 
+        pool = forward_batch.token_to_kv_pool
+        studies = getattr(getattr(pool, "horizon_store", None), "studies", None)
+        mark = None
+        if studies is not None:
+            # The true Top-k is already queued and no current-KV writeback or
+            # demand-side CPU read is included in the prediction lead time.
+            mark = torch.cuda.Event(enable_timing=True)
+            mark.record()
+
         if os.getenv("KEYE_HORIZON_CAPACITY_DIR") or os.getenv("KEYE_HORIZON_COLD_WAVES"):
             from sglang.srt.layers.attention.keye_topk.capacity_trace import begin_layer
 
@@ -794,7 +803,6 @@ class KeyeSparseAttnBackend(AttentionBackend):
         metadata = self.forward_metadata
         q = q.view(-1, self.num_q_heads, self.head_dim)
 
-        pool = forward_batch.token_to_kv_pool
         k_cache = v_cache = None
         if not hasattr(pool, "horizon_store"):
             k_cache = pool.get_key_buffer(layer.layer_id)
@@ -817,9 +825,15 @@ class KeyeSparseAttnBackend(AttentionBackend):
                 with span(forward_batch, layer.layer_id, "kv_selection_to_cpu"):
                     cpu_slots = token_slots.cpu()
                     cpu_indices = topk_indices.cpu()
-                k_cache, v_cache, token_slots = pool.horizon_store.layers[layer.layer_id-pool.start_layer].stage(
-                    cpu_slots, forward_batch, layer.layer_id, cpu_indices
-                )
+                layer_offset = layer.layer_id - pool.start_layer
+                if studies is not None:
+                    k_cache, v_cache, token_slots = studies[layer_offset].consume(
+                        forward_batch, layer.layer_id, cpu_indices, cpu_slots, mark, k, v
+                    )
+                else:
+                    k_cache, v_cache, token_slots = pool.horizon_store.layers[layer_offset].stage(
+                        cpu_slots, forward_batch, layer.layer_id, cpu_indices
+                    )
             if os.getenv("KEYE_HORIZON_CAPACITY_DIR"):
                 from sglang.srt.layers.attention.keye_topk.capacity_trace import record
 

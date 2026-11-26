@@ -14,6 +14,7 @@ Two entry points, same core computation:
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
@@ -176,14 +177,24 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 element_size = torch._utils._element_size(
                     KeyeTokenToKVPool.index_k_with_scale_buffer_dtype
                 )
-                cell_size += indexer_size_per_token * num_layers * element_size
+                index_cell_size = indexer_size_per_token * num_layers * element_size
+                if os.getenv("KEYE_EVICTION_AB_DIR"):
+                    # Main KV lives in pinned DRAM. Size GPU memory for the
+                    # private hot partitions and the full Indexer cache.
+                    cache = int(os.environ["KEYE_HORIZON_CACHE_TOKENS"])
+                    requests = int(os.environ["KEYE_EVICTION_AB_MAX_REQUESTS"])
+                    self._fixed_device_kv_bytes = cell_size * cache * requests
+                    return index_cell_size
+                cell_size += index_cell_size
 
         return cell_size
 
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
-        max_total_num_tokens = available_bytes // self._cell_size
+        max_total_num_tokens = (
+            (available_bytes - getattr(self, "_fixed_device_kv_bytes", 0)) // self._cell_size
+        )
         max_total_num_tokens = max_total_num_tokens // page_size * page_size
         return MemoryPoolConfig(max_total_num_tokens=max_total_num_tokens)
 

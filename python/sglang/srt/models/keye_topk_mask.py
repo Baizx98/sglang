@@ -274,6 +274,11 @@ class KeyeTopKMaskAttention(nn.Module):
         if os.getenv("KEYE_LAYER_REPLAY_DIR"):
             from sglang.srt.layers.attention.keye_topk.layer_replay_capture import attention_input
             attention_input(self.layer_id, hidden_states)
+        ab_prefetch = os.getenv("KEYE_EVICTION_AB_MODE") == "prefetch"
+        if ab_prefetch:
+            from sglang.srt.layers.attention.keye_topk.eviction_study import issue
+
+            issue(self.layer_id, hidden_states, positions, forward_batch)
         # ---- 1. Compute Q, K, V ----
         with span(forward_batch, self.layer_id, "qkv_projection"):
             qkv, _ = self.qkv_proj(hidden_states)
@@ -360,7 +365,7 @@ class KeyeTopKMaskAttention(nn.Module):
                 if lookahead_topk_indices is not None:
                     topk_indices = lookahead_topk_indices
                 self.sa_indexer._last_sm80_scores = None
-            if rescore_active or lookahead_active:
+            if rescore_active or lookahead_active or ab_prefetch:
                 forward_batch._keye_lookahead_previous_x = hidden_states.detach()
                 # Keep the baseline exact set for the next layer's direct-reuse trace.
                 forward_batch._keye_lookahead_previous_indices = exact_topk_indices.detach()

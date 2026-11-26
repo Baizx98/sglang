@@ -123,8 +123,16 @@ class KeyeTopKMaskMoeModel(Qwen3MoeModel):
 
     def forward(self, input_ids, positions, forward_batch, input_embeds=None,
                 pp_proxy_tensors=None):
-        tracing = bool(os.getenv("KEYE_LOOKAHEAD_TRACE_DIR"))
+        ab_prefetch = os.getenv("KEYE_EVICTION_AB_MODE") == "prefetch"
+        tracing = bool(os.getenv("KEYE_LOOKAHEAD_TRACE_DIR")) or ab_prefetch
         decode = forward_batch.forward_mode.is_decode()
+        if ab_prefetch and decode:
+            if not hasattr(self, "_keye_ab_indexers"):
+                self._keye_ab_indexers = {
+                    i: self.layers[i].self_attn.sa_indexer
+                    for i in range(self.start_layer, self.end_layer)
+                }
+            forward_batch._keye_ab_indexers = self._keye_ab_indexers
         if os.getenv("KEYE_AGENT_TRACE_DIR") and not decode:
             from sglang.srt.layers.attention.keye_topk.agent_trace import flush
 

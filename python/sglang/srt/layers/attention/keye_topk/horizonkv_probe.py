@@ -388,6 +388,10 @@ class HostStore:
         )
         if capacity < 0 or (mode == "lru" and capacity == 0):
             raise ValueError("LRU cache token budget must be positive")
+        ab = bool(os.getenv("KEYE_EVICTION_AB_DIR"))
+        max_requests = int(os.getenv("KEYE_EVICTION_AB_MAX_REQUESTS", "1")) if ab else 1
+        if ab and (capacity <= 0 or max_requests <= 0):
+            raise ValueError("Eviction A/B requires positive per-request LRU and batch capacity")
         self.layers = [
             HostLayer(
                 pool.size + pool.page_size,
@@ -395,12 +399,19 @@ class HostStore:
                 pool.head_dim,
                 pool.dtype,
                 pool.device,
-                capacity,
+                capacity * max_requests,
             )
             for _ in range(pool.layer_num)
         ]
         self.start_layer = pool.start_layer
         self.device = pool.device
+        if ab:
+            from .eviction_study import LayerStudy
+
+            stream = torch.cuda.Stream(device=pool.device)
+            self.studies = [
+                LayerStudy(layer, capacity, max_requests, stream) for layer in self.layers
+            ]
         emit(
             {
                 "kind": "allocation",
