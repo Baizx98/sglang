@@ -1,5 +1,35 @@
 # Keye DSA Trace Pilot
 
+## HorizonKV §4.4 Main KV eviction
+
+`horizonkv_eviction_inputs.py` audits the held-out paired Keye trace. It
+reports historical Top-k overlap and the incremental Top-M signal within
+earlier true-consumption strata. The current locally produced token is
+excluded from these historical metrics.
+
+`horizonkv_eviction_replay.py` compiles the CPU two-tier replay and
+checks its fixed-prefetch protocol before reading real data. All policies
+share the same rank-interleaved prefixes of the recorded Top-M as prefetch
+requests. Historical demand is scored against a common phase boundary after
+prefetch, before the exact demand batch is installed. Only true consumption
+updates the histories of the proposed policies. `--check-only` executes the
+small protocol checks without touching trace data.
+
+Use private partitions for the current per-request HiSparse allocation.
+`--placement shared --group-by length --batch 4 16` aligns independent
+real requests into counterfactual shared waves. The replay budgets
+persistent HBM rows and uses the same separate temporary demand staging
+for every policy. `--issued-baseline` adds a one-step flat protection
+control limited to the scheduled prefix, leaving issued requests unchanged.
+
+`horizonkv_turn_reuse.py` studies exact token-prefix carryover in the
+segmented BFCL trajectories. Supply `--turn-trace` (the matched terminal
+Top-M capture) and `--prior-trace` (complete earlier turns) to the replay
+to test two causal turn priors from a cold persistent cache. Use
+`summarize_horizonkv_eviction.py` to extract calibration-frozen held-out
+comparisons, including matched no-prior ablations. The reported byte count
+uses a configurable modeled row size. CPU replay time is not Decode speed.
+
 ## HorizonKV 4.2 same-state predictive study (2026-11-12)
 
 For the authorized healthy-A6000 + L40S fallback, use `--tp-size 1 --pp-size 2`

@@ -25,26 +25,43 @@ COUNTERS = (
     "evictions", "prefetched_consumed", "unused_evicted", "unused_at_end",
     "displaced_demand", "rescued_demand", "reference_dense_state_bytes", "cpu_ms",
 )
-POLICIES = (
+STEP_POLICIES = (
     ("lru", 1, 0), ("lru-touch", 1, 0), ("lru2", 1, 0),
     ("lfu", 4, 0), ("lfu", 16, 0), ("lfu", 64, 0), ("pred", 1, 0),
     ("lru-pred", 1, 2), ("lru-pred", 1, 8),
     ("lfu-pred", 4, 0.5), ("lfu-pred", 4, 2),
     ("lfu-pred", 16, 0.5), ("lfu-pred", 16, 2),
 )
+POLICIES = tuple((*policy, 0) for policy in STEP_POLICIES)
+ISSUED_POLICIES = (
+    ("lru-issued", 1, 2, 0), ("lru-issued", 1, 8, 0),
+    ("lfu-issued", 4, 0.5, 0), ("lfu-issued", 4, 2, 0),
+    ("lfu-issued", 16, 0.5, 0), ("lfu-issued", 16, 2, 0),
+)
+TURN_POLICIES = (
+    ("turn", 1, 0, 0), ("role", 1, 0, 0),
+    *tuple((name, half, hint, bonus)
+           for half, bonus in itertools.product((4, 16), (0.5, 2))
+           for prior in ("turn", "role")
+           for name, hint in ((f"lfu-{prior}", 0),
+                              (f"lfu-pred-{prior}", 0.5), (f"lfu-pred-{prior}", 2))),
+)
 
 
 def policy_label(policy):
-    name, decay, bonus = policy
-    return f"{name}:{decay:g}:{bonus:g}"
+    name, decay, bonus, prior = policy
+    return f"{name}:{decay:g}:{bonus:g}" + (f":{prior:g}" if prior else "")
 
 
 def file_sha(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def frame(count, steps):
+def frame(count, steps, priors=()):
     data = [np.asarray([count, len(steps)], dtype="<i4").tobytes()]
+    for prior in priors or ((), ()):
+        data.append(np.asarray([len(prior)], dtype="<i4").tobytes())
+        data.append(np.asarray(prior, dtype="<f4").tobytes())
     for step in steps:
         for array in step:
             data.append(np.asarray([len(array)], dtype="<i4").tobytes())
@@ -53,7 +70,8 @@ def frame(count, steps):
 
 
 def call(executable, payload, configs, limit=0):
-    suffix = "".join(f"{capacity} {mode} {decay} {bonus} {limit}\n" for capacity, (mode, decay, bonus) in configs)
+    suffix = "".join(f"{capacity} {mode} {decay} {bonus} {prior} {limit}\n"
+                     for capacity, (mode, decay, bonus, prior) in configs)
     outcome = subprocess.run([executable], input=payload + suffix.encode(), capture_output=True, check=False)
     if outcome.returncode:
         raise RuntimeError(outcome.stderr.decode())
@@ -94,6 +112,10 @@ def verify_protocol(executable):
         b = call(executable, frame(3, [*frames[:timing], ([], [], [1], [], [])]), configs, timing)
         for x, y in zip(a, b, strict=True):
             assert all(x[k] == y[k] for k in COUNTERS if k != "cpu_ms")
+    events = [([0, 1], [0, 1], [], [], []), ([2], [2], [0], [], [])]
+    a, b = call(executable, frame(3, events, ([0.9, 0.1, 0], [0.1, 0.9, 0])),
+                [(2, policy) for policy in TURN_POLICIES[:2]])
+    assert a["demand_loads"] == 0 and b["demand_loads"] == 1
 
 
 def pack_steps(batch, prefetch_width):
@@ -128,10 +150,14 @@ def interleave(arrays):
 
 def replay_batch(executable, pack, args):
     group, bucket, layer, split, batch, members, partition, budget = pack
+    policies = POLICIES + TURN_POLICIES if args.turn_trace else POLICIES
+    if args.issued_baseline:
+        policies += ISSUED_POLICIES
     configs = [(round(ratio * K * len(partition)), policy)
-               for ratio, policy in itertools.product(args.capacity, POLICIES)]
+               for ratio, policy in itertools.product(args.capacity, policies)]
     count = sum(int(seq["current"][-1]) + 1 for seq in partition)
-    data = frame(count, list(pack_steps(partition, budget)))
+    priors = tuple(np.concatenate([seq[name] for seq in partition]) for name in ("turn_prior", "role_prior")) if args.turn_trace else ()
+    data = frame(count, list(pack_steps(partition, budget)), priors)
     results = call(executable, data, configs)
     rows = []
     for ((capacity, policy), stats) in zip(configs, results, strict=True):
@@ -144,6 +170,7 @@ def replay_batch(executable, pack, args):
             policy=policy_label(policy), family=policy[0], **stats,
             h2d_bytes=(stats["demand_loads"] + stats["prefetch_loads"]) * args.kv_bytes,
             repeated_h2d_bytes=stats["repeated_h2d"] * args.kv_bytes,
+            supplied_prior_bytes=sum(p.nbytes for p in priors),
         ))
     return rows
 
@@ -152,8 +179,17 @@ def replay_groups(args, executable, pool):
     source = {}
     grid = []
     for split in ("calibration", "test"):
-        cohorts = load_sequences(args.trace, args.layers, split, args.max_per_cell, args.seed, args.group_by)
+        if args.turn_trace:
+            from horizonkv_eviction_turn_inputs import load_terminal_sequences
+
+            cohorts = load_terminal_sequences(args.turn_trace, args.prior_trace, args.layers, split, args.seed)
+        else:
+            cohorts = load_sequences(args.trace, args.layers, split, args.max_per_cell, args.seed, args.group_by)
         for (group, bucket, layer), traces in sorted(cohorts.items()):
+            if args.only_bucket and bucket not in args.only_bucket:
+                continue
+            if args.only_dataset and group not in args.only_dataset:
+                continue
             for trace in traces:
                 source[str(trace["source"])] = trace["source_sha256"]
             for batch in args.batch:
@@ -196,15 +232,23 @@ def summarize(root):
         if key[0] != "test" or ("calibration", *key[1:]) not in counts:
             continue
         calib = counts[("calibration", *key[1:])]
-        baseline = min((p for p in calib if "pred" not in p), key=lambda p: (calib[p][0], p))
-        blended = min((p for p in calib if "-pred" in p), key=lambda p: (calib[p][0], p))
+        def best(*families):
+            return min((p for p in calib if p.split(":")[0] in families), key=lambda p: (calib[p][0], p))
+
+        baseline = best("lru", "lru-touch", "lru2", "lfu")
+        blended = best("lru-pred", "lfu-pred")
         tuned_lfu = min((p for p in calib if p.startswith("lfu:")), key=lambda p: (calib[p][0], p))
+        policies = [("baseline", baseline), ("lru-demand", "lru:1:0"), ("lfu", tuned_lfu),
+                    ("prediction", "pred:1:0"), ("combined", blended)]
+        if "turn:1:0" in calib:
+            policies += [(name, best(name)) for name in (
+                "turn", "role", "lfu-turn", "lfu-role", "lfu-pred-turn", "lfu-pred-role",
+            )]
         cohort = [("all", "all", "all", test)]
         cohort += [(*part[-3:], values) for part, values in sorted(by_bucket.items()) if part[:4] == key]
         for dataset, bucket, layer, values in cohort:
             reference = values[baseline]
-            for role, policy in (("baseline", baseline), ("lru-demand", "lru:1:0"), ("lfu", tuned_lfu),
-                                 ("prediction", "pred:1:0"), ("combined", blended)):
+            for role, policy in policies:
                 transferred, misses, requests, repeated = values[policy]
                 emitted.append(dict(batch=key[1], capacity_over_batch_k=key[2], prefetch_per_request=key[3],
                                     dataset=dataset, bucket=bucket, layer=layer, role=role, policy=policy,
@@ -220,6 +264,10 @@ def run(args):
     args.output.mkdir(parents=True, exist_ok=False)
     cpp = Path(__file__).with_suffix(".cpp")
     executable = (args.output / "replay").resolve()
+    sources = (cpp, Path(__file__), cpp.with_name("horizonkv_eviction_inputs.py"))
+    if args.turn_trace:
+        sources += tuple(cpp.with_name(name) for name in ("horizonkv_eviction_turn_inputs.py", "horizonkv_turn_reuse.py"))
+    source_sha = {x.name: file_sha(x) for x in sources}
     subprocess.run(["g++", "-O3", "-std=c++17", "-Wall", "-Wextra", str(cpp), "-o", str(executable)], check=True)
     verify_protocol(executable)
     if args.check_only:
@@ -230,7 +278,7 @@ def run(args):
         traces, partitions = replay_groups(args, executable, pool)
     summarize(args.output)
     metadata = dict(args=vars(args), trace_sha256=traces, partitions=partitions,
-                    code_sha256={x.name: file_sha(x) for x in (cpp, Path(__file__), cpp.with_name("horizonkv_eviction_inputs.py"))},
+                    code_sha256=source_sha,
                     compiler=subprocess.check_output(["g++", "--version"], text=True).splitlines()[0])
     (args.output / "metadata.json").write_text(json.dumps(metadata, indent=2, default=str) + "\n")
 
@@ -238,11 +286,16 @@ def run(args):
 if __name__ == "__main__":
     cli = argparse.ArgumentParser(description=__doc__)
     cli.add_argument("--trace", type=Path, default=DEFAULT_TRACE)
+    cli.add_argument("--turn-trace", type=Path)
+    cli.add_argument("--prior-trace", type=Path)
     cli.add_argument("--output", type=Path, required=True)
     cli.add_argument("--layers", type=int, nargs="+", default=[1, 12, 24, 47])
     cli.add_argument("--batch", type=int, nargs="+", default=[4])
     cli.add_argument("--capacity", type=float, nargs="+", default=[0.5, 1, 2])
     cli.add_argument("--prefetch", type=int, nargs="+", default=[0, 512, 2048])
+    cli.add_argument("--issued-baseline", action="store_true")
+    cli.add_argument("--only-bucket", type=int, nargs="+")
+    cli.add_argument("--only-dataset", nargs="+")
     cli.add_argument("--placement", choices=["private", "shared"], default="private")
     cli.add_argument("--group-by", choices=["dataset", "length"], default="dataset")
     cli.add_argument("--max-per-cell", type=int, default=8)
@@ -253,4 +306,6 @@ if __name__ == "__main__":
     opts = cli.parse_args()
     if min(opts.batch) < 1 or min(opts.capacity) <= 0 or not all(0 <= p <= 3071 for p in opts.prefetch):
         cli.error("expected positive batch and capacity and prefetch width from 0 to 3071")
+    if bool(opts.turn_trace) != bool(opts.prior_trace):
+        cli.error("--turn-trace and --prior-trace must be used together")
     run(opts)

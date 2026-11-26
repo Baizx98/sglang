@@ -39,6 +39,7 @@ struct Policy {
     std::string name;
     double half_life;
     double hint_bonus;
+    double prior_bonus;
 };
 
 class Replay {
@@ -47,7 +48,8 @@ class Replay {
     std::set<Key> order;
     int capacity, now = 0, stamp = 0;
     const Policy policy;
-    const bool lfu, predicted, frequent_pair, touch_prefetch, pure_prediction;
+    const bool lfu, predicted, issued_only, frequent_pair, touch_prefetch, pure_prediction;
+    const std::vector<float>& prior;
     std::vector<double> decay;
     Counts stats;
 
@@ -59,6 +61,7 @@ class Replay {
     Key rank(int id) const {
         const auto& r = rows[id];
         if (pure_prediction) return {r.prediction, r.arrival, id};
+        if (policy.name == "turn" || policy.name == "role") return {prior.at(id), r.arrival, id};
         const int last = touch_prefetch ? std::max(r.last_use, r.last_prefetch) : r.last_use;
         double value;
         if (lfu) value = frequency(r);
@@ -68,6 +71,7 @@ class Replay {
             if (!lfu) value = last < 0 ? now - 16 : r.last_step;
             value += policy.hint_bonus * r.prediction;
         }
+        if (policy.prior_bonus != 0) value += policy.prior_bonus * prior.at(id);
         return {value, last < 0 ? r.arrival : last, id};
     }
 
@@ -123,12 +127,13 @@ class Replay {
     void begin_step(const Step& step, const Step* previous) {
         if (!predicted && !lfu) return;
         if (predicted && previous) {
-            for (int id : previous->predicted) rows[id].prediction = 0;
+            for (int id : (issued_only ? previous->prefetch : previous->predicted)) rows[id].prediction = 0;
         }
         if (predicted) {
-            const double n = step.predicted.size();
-            for (size_t i = 0; i < step.predicted.size(); ++i) {
-                rows[step.predicted[i]].prediction = 1 - 0.5 * i / n;
+            const auto& hints = issued_only ? step.prefetch : step.predicted;
+            const double n = hints.size();
+            for (size_t i = 0; i < hints.size(); ++i) {
+                rows[hints[i]].prediction = issued_only ? 1 : 1 - 0.5 * i / n;
             }
         }
         std::vector<int> ids;
@@ -153,12 +158,13 @@ class Replay {
     }
 
 public:
-    Replay(int count, int budget, int steps, Policy p)
+    Replay(int count, int budget, int steps, Policy p, const std::vector<float>& values)
         : rows(count), capacity(budget), policy(std::move(p)),
-          lfu(policy.name == "lfu" || policy.name == "lfu-pred"),
-          predicted(policy.name.find("pred") != std::string::npos),
+          lfu(policy.name.rfind("lfu", 0) == 0),
+          predicted(policy.name.find("pred") != std::string::npos || policy.name.find("issued") != std::string::npos),
+          issued_only(policy.name.find("issued") != std::string::npos),
           frequent_pair(policy.name == "lru2"), touch_prefetch(policy.name == "lru-touch"),
-          pure_prediction(policy.name == "pred"), decay(steps, 1) {
+          pure_prediction(policy.name == "pred"), prior(values), decay(steps, 1) {
         if (lfu) {
             for (int i = 1; i < steps; ++i) decay[i] = std::exp2(-i / policy.half_life);
         }
@@ -221,12 +227,27 @@ std::vector<int32_t> read_ids(std::istream& in, int count) {
     return ids;
 }
 
+std::vector<float> read_prior(std::istream& in, int count) {
+    int n = read_number(in);
+    if (n != 0 && n != count) throw std::runtime_error("invalid prior width");
+    std::vector<float> prior(n);
+    if (n && !in.read(reinterpret_cast<char*>(prior.data()), n * sizeof(float))) {
+        throw std::runtime_error("truncated prior");
+    }
+    for (float score : prior) {
+        if (!(score >= 0 && score <= 1)) throw std::runtime_error("invalid prior score");
+    }
+    return prior;
+}
+
 int main() {
     try {
         std::ios::sync_with_stdio(false);
         int count = read_number(std::cin);
         int num_steps = read_number(std::cin);
         if (count <= 0 || num_steps <= 0) throw std::runtime_error("empty input");
+        const auto turn = read_prior(std::cin, count);
+        const auto role = read_prior(std::cin, count);
         std::vector<Step> steps(num_steps);
         for (auto& step : steps) {
             step.predicted = read_ids(std::cin, count);
@@ -237,13 +258,14 @@ int main() {
         }
         int capacity, limit;
         Policy policy;
-        while (std::cin >> capacity >> policy.name >> policy.half_life >> policy.hint_bonus >> limit) {
+        while (std::cin >> capacity >> policy.name >> policy.half_life >> policy.hint_bonus >> policy.prior_bonus >> limit) {
             if (limit == 0) limit = num_steps;
             if (capacity < 0 || policy.half_life <= 0 || limit < 1 || limit > num_steps) {
                 throw std::runtime_error("invalid policy parameters");
             }
             const auto start = std::chrono::steady_clock::now();
-            auto c = Replay(count, capacity, num_steps, policy).run(steps, limit);
+            const auto& prior = policy.name.find("role") != std::string::npos ? role : turn;
+            auto c = Replay(count, capacity, num_steps, policy, prior).run(steps, limit);
             const auto elapsed = std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - start).count();
             std::cout << c.requests << ' ' << c.demand_loads << ' ' << c.prefetch_loads << ' '
