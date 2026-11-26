@@ -73,7 +73,7 @@ def render(tokenizer, messages, turns):
         messages, tools=TOOLS, tokenize=False, add_generation_prompt=True
     )
     spans = []
-    schema_begin = prompt.index("<tools>") + len("<tools>")
+    schema_begin = prompt.index("<tools>\n") + len("<tools>")
     schema_end = prompt.index("</tools>", schema_begin)
     cursor = 0
     for message, origin in zip(messages, turns, strict=True):
@@ -107,6 +107,8 @@ def render(tokenizer, messages, turns):
         begin = segments[-1]["end"] if segments else 0
         end = begin + sum(1 for _ in group)
         segments.append(dict(role=role, source_turn=origin, start=begin, end=end))
+    if not any(segment["role"] == "tool_schema" for segment in segments):
+        raise ValueError("SWE-bench prompt has no labeled tool schema")
     return ids, segments
 
 

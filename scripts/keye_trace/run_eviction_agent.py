@@ -45,8 +45,12 @@ def validate(row, events, output_ids):
     steps = max(0, len(output_ids) - 1)
     manifest, activation = [], []
     labels = np.full(prompt + steps, len(row["segments"]), dtype=np.int32)
+    position = 0
     for i, span in enumerate(row["segments"]):
+        assert position == span["start"] < span["end"] <= prompt
         labels[span["start"]:span["end"]] = i
+        position = span["end"]
+    assert position == prompt
     segments = row["segments"] + [
         dict(role="current_turn_generated", source_turn=row["turn"], start=prompt, end=prompt + steps)
     ]
@@ -207,6 +211,8 @@ def main():
     parser.add_argument("--port", type=int, default=31326)
     parser.add_argument("--max-new-tokens", type=int, default=256)
     parser.add_argument("--pilot", action="store_true")
+    parser.add_argument("--reaudit", action="store_true",
+                        help="Rebuild segment counts from existing raw chunks and saved output IDs")
     args = parser.parse_args()
     args.run = args.run.resolve()
     rows = [r for path in args.inputs for r in read_jsonl(path)]
@@ -214,6 +220,14 @@ def main():
         rows = [r for r in rows if r.get("split") == "pilot"]
     if not rows or len(rows) != len({r["rid"] for r in rows}):
         raise ValueError("Expected a nonempty cohort with unique request IDs")
+    if args.reaudit:
+        for row in rows:
+            path = args.run / "turns" / f"{row['rid']}.json"
+            if path.exists():
+                result = json.loads(path.read_text())
+                result.update(validate(row, args.run / "events", result["generation_ids"]))
+                save(path, result)
+        return
     collect(args, rows)
 
 
