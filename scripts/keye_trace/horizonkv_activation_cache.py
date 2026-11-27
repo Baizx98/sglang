@@ -5,6 +5,7 @@ from collections import Counter, defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import csv
 import hashlib
+import io
 import json
 from pathlib import Path
 import subprocess
@@ -106,7 +107,8 @@ def arrays(row, layer, ruler):
     else:
         truth, predictions, contexts, steps = [], [], [], []
         for path in source:
-            with np.load(path, allow_pickle=False) as chunk:
+            # Read the compressed chunk sequentially before the ZIP reader seeks.
+            with np.load(io.BytesIO(path.read_bytes()), allow_pickle=False) as chunk:
                 truth.append(chunk["true_topk"])
                 if layer:
                     predictions.append(chunk["predicted_topm"])
